@@ -75,9 +75,9 @@ pub const Error = error{
     ReadFailed,
 };
 
-/// This API requires an output limit, so a request without one gets this.
-/// Thinking shares it. The smallest documented max output of any Claude model
-/// (Opus 4 and 4.1), so no model a connection can name refuses it.
+/// This API requires an output limit, so a request without one gets this, and
+/// thinking tokens count against it. It is the smallest documented max output
+/// of any Claude model (Opus 4 and 4.1), so every Claude model accepts it.
 const default_max_tokens = 32_000;
 const max_selected_tools = function_tools.max_selected_tools;
 const max_name_bytes = function_tools.max_name_bytes;
