@@ -3,8 +3,10 @@
 //! asks the credits endpoint in the background, as `/credits` does, and
 //! saves the new answer. A team with Token Pass starts a new session on the
 //! Token Pass default model when nothing else chose the model. Without a
-//! saved answer, the first prompt of a session waits up to
-//! `first_prompt_wait_ms` for the check.
+//! saved answer, `lia ask` waits up to `first_prompt_wait_ms` for the check
+//! before its prompt, and ACP waits in `initialize`. A check ACP starts for a
+//! sign-in it adopts later does not wait: its answer reaches the sessions
+//! that start after it arrives.
 const std = @import("std");
 const builtin = @import("builtin");
 const credentials = @import("../auth/credentials.zig");
@@ -20,8 +22,8 @@ const credits_lookup = @import("credits_lookup.zig");
 
 const Allocator = std.mem.Allocator;
 
-/// How long the first prompt of a session waits for a check whose answer lia
-/// has not saved before.
+/// How long `lia ask`, or ACP's `initialize`, waits for a check whose answer
+/// lia has not saved before.
 pub const first_prompt_wait_ms: i64 = 2_000;
 
 const Identity = [token_pass.identity_len]u8;
@@ -101,7 +103,7 @@ const answer_poll_ms: u64 = 10;
 
 /// For `lia ask` and ACP: the answer saved for the team, refreshed by a
 /// credits check that runs while the session works. Without a saved answer,
-/// `begin` waits for the check, as the first prompt in the app does.
+/// `begin` waits for the check as long as its caller allows.
 pub const Check = struct {
     lookup: credits_lookup.Lookup = .{},
     named: Named,

@@ -1732,8 +1732,9 @@ pub fn refreshPendingAuth(state: *ServerState) !PendingAuth {
     state.auth_adoption_deferred = outcome == .deferred;
     if (outcome == .adopted) {
         state.auth_pending = false;
-        // `initialize` found no credential, so it started no check.
-        if (state.token_pass_model_source) |source| startTokenPassCheck(state, state.alloc, source);
+        // `initialize` found no credential, so it started no check. The
+        // request adopting the sign-in does not wait for it.
+        if (state.token_pass_model_source) |source| startTokenPassCheck(state, state.alloc, source, 0);
     }
     return outcome;
 }
@@ -2237,9 +2238,9 @@ fn parseInitializeRequest(
 
 /// Asks whether the credential's team has Token Pass. A team with Token Pass
 /// starts new sessions on the Token Pass default when nothing chose the
-/// model. The check waits here only when lia has no saved answer, and
-/// `pollTokenPass` takes a later answer.
-fn startTokenPassCheck(state: *ServerState, alloc: Allocator, model_source: config_runtime.ModelSource) void {
+/// model. The check waits here up to `wait_ms` only when lia has no saved
+/// answer, and `pollTokenPass` takes a later answer.
+fn startTokenPassCheck(state: *ServerState, alloc: Allocator, model_source: config_runtime.ModelSource, wait_ms: i64) void {
     if (state.provider != .gateway) return;
     const source = state.credential_source orelse return;
     const api_key: ?[]const u8 = if (state.api_key.len > 0) state.api_key else null;
@@ -2253,7 +2254,7 @@ fn startTokenPassCheck(state: *ServerState, alloc: Allocator, model_source: conf
         alloc,
         state.cfg.provider_set.select(.gateway).credits orelse gateway_provider.unavailable_credits_provider,
         .{ .credential = api_key, .credential_source = source, .tenant = state.gateway_team },
-        token_pass_check.first_prompt_wait_ms,
+        wait_ms,
     );
     if (model_source != .compiled_default or state.process_model_override) return;
     state.token_pass_start = .{ .fast_mode = state.fast_mode, .ultrafast_mode = state.ultrafast_mode };
@@ -2458,7 +2459,10 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         (state.cfg.model_override == null or startup.fast_mode_source != .compiled_default);
     configureUltrafastStartup(state, &startup);
     state.token_pass_model_source = startup.model_source;
-    startTokenPassCheck(state, alloc, startup.model_source);
+    // Waits, unlike a check a later sign-in starts: `pollTokenPass` moves only
+    // sessions that start after the answer, so without it the first session
+    // could start on the builtin default.
+    startTokenPassCheck(state, alloc, startup.model_source, token_pass_check.first_prompt_wait_ms);
     state.effort = startup.effort;
     state.first_call_tool_choice = startup.first_call_tool_choice;
     state.context_enabled = startup.context_enabled;

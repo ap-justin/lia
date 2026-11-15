@@ -77,8 +77,13 @@ fn startModel(builtin_default: []const u8, has_pass: bool) []const u8 {
 /// null when it runs another model, which keeps its place. The caller
 /// decides that nothing else chose the session's model.
 pub fn startModelFor(current: []const u8, builtin_default: []const u8, has_pass: bool) ?[]const u8 {
-    if (!std.mem.eql(u8, current, builtin_default) and !std.mem.eql(u8, current, default_model)) return null;
+    if (!isStartModel(current, builtin_default)) return null;
     return startModel(builtin_default, has_pass);
+}
+
+/// Whether `model` is one of the two start models.
+pub fn isStartModel(model: []const u8, builtin_default: []const u8) bool {
+    return std.mem.eql(u8, model, builtin_default) or std.mem.eql(u8, model, default_model);
 }
 
 /// Whether lia offers Fast mode for a model that `supports_fast_mode`, where
