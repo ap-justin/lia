@@ -787,6 +787,10 @@ test {
     _ = @import("core/config/configured_provider.zig");
     _ = @import("gateway/chat_completions_protocol.zig");
     _ = @import("gateway/function_tools.zig");
+    _ = @import("gateway/anthropic_messages_protocol.zig");
+    _ = @import("gateway/configured_transport.zig");
+    _ = @import("gateway/request_deadlines.zig");
+    _ = @import("gateway/configured_responses.zig");
     _ = @import("core/shared/json_depth.zig");
     _ = @import("acp/prompt.zig");
     _ = @import("acp/server.zig");
