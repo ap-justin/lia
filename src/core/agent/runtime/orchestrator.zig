@@ -2785,21 +2785,33 @@ const UnselectedMcpCalls = struct {
     unresolved: []const ?[]u8,
 };
 
+/// What `advertiseUnselectedMcpCalls` may do with a step's tool list.
+const UnselectedMcpMode = enum {
+    /// Adds each live MCP tool a call names: a step without toolbox.
+    advertise,
+    /// Leaves the list as sent and only renames a server-qualified spelling
+    /// of a tool already on it: a step with toolbox, whose tools stay as
+    /// first sent (`Toolbox.tla` ToolsFixed). A call of an MCP tool not on
+    /// it keeps the toolbox answer.
+    rename_only,
+};
+
 /// Advertises live MCP tools the model called without loading them first, so
 /// those calls reach normal validation and MCP permission instead of failing
 /// as unselected. A server-qualified name (`server.tool`) is rewritten to the
 /// tool's exposed name first, so permissions, the transcript, and the call
 /// itself use the one name. A name written as an MCP reference (a `.` or `/`
-/// in it, or an `mcp_` prefix) that fits no tool, or more than one, is
-/// answered with the name format or the candidates. Other
+/// in it, or an `mcp_` prefix) that fits more than one tool is answered with
+/// the candidates, and with `.advertise` one that fits none is answered with
+/// the name format. Other
 /// names that do not resolve, including lookups that fail or are cancelled,
 /// keep the unsupported-tool path, where the turn's normal cancellation
-/// handling still applies. Only for a step without toolbox, whose tools stay
-/// as first sent (`Toolbox.tla` ToolsFixed).
+/// handling still applies.
 fn advertiseUnselectedMcpCalls(
     deps: *const AgentRuntimeDeps,
     arena: Allocator,
     calls: []const ToolCall,
+    mode: UnselectedMcpMode,
     selected: *std.ArrayList(agent_stream_provider.DynamicFunctionTool),
     advertised_tools: *[]const agent_stream_provider.DynamicFunctionTool,
     advertised_names: *[][]const u8,
@@ -2811,6 +2823,8 @@ fn advertiseUnselectedMcpCalls(
     for (rewritten, unresolved) |*call, *failure| {
         if (deps.tool_registry.lookup(call.name) != null) continue;
         if (containsString(advertised_names.*, call.name)) continue;
+        // Under toolbox only a qualified spelling can name a tool already sent.
+        if (mode == .rename_only and !tool_names.looksQualified(call.name)) continue;
         const found = resolve(deps.ctx, arena, call.name) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => {
@@ -2825,16 +2839,18 @@ fn advertiseUnselectedMcpCalls(
                 continue;
             },
             .missing => {
-                if (tool_names.looksQualified(call.name)) failure.* = try unknownMcpNameOutput(arena, call.name);
+                if (mode == .advertise and tool_names.looksQualified(call.name)) failure.* = try unknownMcpNameOutput(arena, call.name);
                 continue;
             },
             .server_unavailable => continue,
         };
         if (definition.mcp_binding == null) continue;
+        const sent = containsString(advertised_names.*, definition.name);
+        if (mode == .rename_only and !sent) continue;
         if (!std.mem.eql(u8, definition.name, call.name)) {
             debug_trace.logf("mcp", "qualified MCP tool name resolved from={s} to={s}", .{ call.name, definition.name });
             call.name = definition.name;
-            if (containsString(advertised_names.*, call.name)) continue;
+            if (sent) continue;
         }
         try runtime_gateway_step.recordSelectedDynamicTool(arena, selected, definition);
         const tool = for (selected.items) |item| {
@@ -2851,12 +2867,6 @@ fn advertiseUnselectedMcpCalls(
         debug_trace.logf("mcp", "loaded unselected MCP tool for direct call tool={s}", .{call.name});
     }
     return .{ .calls = rewritten, .unresolved = unresolved };
-}
-
-fn noUnresolvedMcpCalls(arena: Allocator, count: usize) ![]const ?[]u8 {
-    const unresolved = try arena.alloc(?[]u8, count);
-    @memset(unresolved, null);
-    return unresolved;
 }
 
 const mcp_name_format = "MCP tools are named mcp_<server>_<tool>, with each name's characters other than letters, digits, '_' and '-' replaced by '_'";
@@ -10590,18 +10600,17 @@ fn processQueuedPromptLoop(
 
         // With toolbox, a direct call of an MCP tool lia didn't send fails and
         // points the model at toolbox run: listing the tool now would change
-        // the tools every earlier request sent (`Toolbox.tla` ToolsFixed).
-        const unselected_mcp: UnselectedMcpCalls = if (toolbox.isAdvertised(config.advertised_tool_names))
-            .{ .calls = completion.tool_calls, .unresolved = try noUnresolvedMcpCalls(arena, completion.tool_calls.len) }
-        else
-            try advertiseUnselectedMcpCalls(
-                deps,
-                arena,
-                completion.tool_calls,
-                &selected_dynamic_tools,
-                &advertised_dynamic_tools,
-                &advertised_dynamic_tool_names,
-            );
+        // the tools every earlier request sent (`Toolbox.tla` ToolsFixed). A
+        // qualified spelling of a tool it did send still runs that tool.
+        const unselected_mcp = try advertiseUnselectedMcpCalls(
+            deps,
+            arena,
+            completion.tool_calls,
+            if (toolbox.isAdvertised(config.advertised_tool_names)) .rename_only else .advertise,
+            &selected_dynamic_tools,
+            &advertised_dynamic_tools,
+            &advertised_dynamic_tool_names,
+        );
         completion.tool_calls = unselected_mcp.calls;
         const prepared_tool_calls = try arena.alloc(
             PreparedToolCall,

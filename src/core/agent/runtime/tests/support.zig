@@ -447,6 +447,11 @@ pub const ToolExecutionOverride = struct {
     ) anyerror!ToolExecutionResult,
 };
 
+pub const McpToolSpelling = struct {
+    name: []const u8,
+    tool: tool_mcp_runtime.SelectedTool,
+};
+
 fn captureReviewAuthority(
     alloc: Allocator,
     review_turn: permission_auto_classifier.ReviewTurnContext,
@@ -481,6 +486,9 @@ pub const FakeAgentRuntimeDeps = struct {
     /// The live MCP tools a model call may name without selecting them first,
     /// and a turn may restore from history.
     resolvable_mcp_tools: []const tool_mcp_runtime.SelectedTool = &.{},
+    /// Other names the MCP lookup resolves, such as a server-qualified
+    /// `server.tool`, each to the tool it names.
+    mcp_tool_spellings: []const McpToolSpelling = &.{},
     /// Servers whose namespaced names look up as `.server_unavailable`.
     unavailable_mcp_servers: []const []const u8 = &.{},
     /// Every name looked up through `resolve_unselected_mcp_tool`, in order.
@@ -905,7 +913,7 @@ pub const FakeAgentRuntimeDeps = struct {
     }
 
     fn resolvesMcpTools(self: *const FakeAgentRuntimeDeps) bool {
-        return self.resolvable_mcp_tools.len > 0 or self.unavailable_mcp_servers.len > 0;
+        return self.resolvable_mcp_tools.len > 0 or self.mcp_tool_spellings.len > 0 or self.unavailable_mcp_servers.len > 0;
     }
 
     fn resolveUnselectedMcpTool(raw: *anyopaque, _: Allocator, name: []const u8) anyerror!tool_mcp_runtime.UnselectedLookup {
@@ -919,6 +927,9 @@ pub const FakeAgentRuntimeDeps = struct {
         }
         for (self.resolvable_mcp_tools) |tool| {
             if (std.mem.eql(u8, tool.name, name)) return .{ .resolved = tool };
+        }
+        for (self.mcp_tool_spellings) |spelling| {
+            if (std.mem.eql(u8, spelling.name, name)) return .{ .resolved = spelling.tool };
         }
         return .missing;
     }

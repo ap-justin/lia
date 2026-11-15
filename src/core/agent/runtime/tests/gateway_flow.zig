@@ -30,6 +30,7 @@ const tool_dispatch = @import("../../../tooling/tool_dispatch.zig");
 const model_tool_schema = @import("../../../tooling/model_tool_schema.zig");
 const prompt_context = @import("../prompt_context.zig");
 const runtime_orchestrator = @import("../orchestrator.zig");
+const runtime_gateway_step = @import("../gateway_step.zig");
 const cache_warmer = @import("../cache_warmer.zig");
 
 const test_support = @import("support.zig");
@@ -11839,4 +11840,86 @@ test "a server with no tool list is asked once per restore and the turn still ru
     try expectLookups(&second_hooks, &.{ "mcp_down_one", "mcp_fixture_alpha" });
     try expectToolsAfterFixed(alloc, gateway.request_bodies.items[0], second_gateway.request_bodies.items[0], &.{"mcp_fixture_alpha"});
     try std.testing.expectEqual(types.TurnPresentationOutcome.completed, second_hooks.finalized_outcome.?);
+}
+
+fn expectSameTools(alloc: Allocator, gateway: *const FakeGateway, earlier: usize, later: usize) !void {
+    const earlier_tools = try toolsJson(alloc, gateway.request_bodies.items[earlier]);
+    defer alloc.free(earlier_tools);
+    const later_tools = try toolsJson(alloc, gateway.request_bodies.items[later]);
+    defer alloc.free(later_tools);
+    try std.testing.expectEqualStrings(earlier_tools, later_tools);
+}
+
+/// A step with toolbox sent whose model calls `fixture.echo` directly, with
+/// `mcp_fixture_echo` on the request's tool list when `sent` (an ACP server's
+/// always-loaded tool).
+fn runToolboxQualifiedEchoCall(gateway: *FakeGateway, hooks: *FakeAgentRuntimeDeps, arena: Allocator, sent: bool) !void {
+    var initial: std.ArrayList(agent_stream_provider.DynamicFunctionTool) = .empty;
+    if (sent) try runtime_gateway_step.recordSelectedDynamicTool(arena, &initial, echo_tool);
+    hooks.permission_decisions = &.{.once};
+    hooks.resolvable_mcp_tools = &.{echo_tool};
+    hooks.mcp_tool_spellings = &.{.{ .name = "fixture.echo", .tool = echo_tool }};
+    hooks.exec_plans = &.{.{ .result = .{ .model_output = "called" } }};
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.advertised_tool_names = &.{ "read_file", "toolbox" };
+    config.advertised_functions = &.{ builtin_tools.read_file.model_schema, builtin_tools.toolbox.model_schema };
+    config.initial_dynamic_tools = initial.items;
+    var job = fixture.job();
+    job.permission_mode = .auto;
+    try runFakePrompt(gateway, hooks, config, job);
+}
+
+test "with toolbox sent, a qualified call of a tool the request sends runs that tool" {
+    const alloc = std.testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(alloc);
+    defer arena_state.deinit();
+    const calls = [_]ToolCall{toolCall("call-echo", "fixture.echo", "{}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "Final" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+
+    try runToolboxQualifiedEchoCall(&gateway, &hooks, arena_state.allocator(), true);
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try expectBodyContains(&gateway, 0, "\"name\":\"mcp_fixture_echo\"");
+    // Permission, the run and the transcript all use the exposed name.
+    try std.testing.expectEqual(@as(usize, 1), hooks.permission_names.items.len);
+    try std.testing.expectEqualStrings("mcp_fixture_echo", hooks.permission_names.items[0]);
+    try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
+    try std.testing.expectEqualStrings("mcp_fixture_echo", hooks.executed_names.items[0]);
+    try expectBodyNotContains(&gateway, 1, "fixture.echo");
+    try expectSameTools(alloc, &gateway, 0, 1);
+}
+
+test "with toolbox sent, a qualified call of a tool the request doesn't send keeps the toolbox answer" {
+    const alloc = std.testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(alloc);
+    defer arena_state.deinit();
+    const calls = [_]ToolCall{toolCall("call-echo", "fixture.echo", "{}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "Final" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+
+    try runToolboxQualifiedEchoCall(&gateway, &hooks, arena_state.allocator(), false);
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    // The call reaches the tool runtime under the model's own name, where a
+    // tool the request didn't send answers "Open it with toolbox"; the tools
+    // stay as first sent.
+    try std.testing.expectEqual(@as(usize, 0), hooks.rejected_names.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
+    try std.testing.expectEqualStrings("fixture.echo", hooks.executed_names.items[0]);
+    try expectBodyNotContains(&gateway, 1, "\"name\":\"mcp_fixture_echo\"");
+    try expectSameTools(alloc, &gateway, 0, 1);
 }
