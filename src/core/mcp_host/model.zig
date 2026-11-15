@@ -538,8 +538,6 @@ pub const Catalog = struct {
         };
     }
 
-    /// The servers the model's prompt lists. Project servers that aren't
-    /// approved stay out of it.
     /// The names of the servers the model may reach, for the toolbox menu:
     /// every configured server but one waiting for approval or rejected.
     /// `alloc` owns the slice and each name.
@@ -1253,7 +1251,7 @@ test "an open-object argument stays an object in the schema and reaches the serv
     defer arena.deinit();
     const a = arena.allocator();
 
-    // The schema `mcp_select_tool` loads is the server's own.
+    // The schema the toolbox's `open` loads is the server's own.
     const open_object = "\"arguments\":{\"type\":\"object\",\"additionalProperties\":true}";
     const schema = (try c.toolSchema(a, "mcp_fake_tool_call", .{}, .{}, .unrestricted, null)).?;
     try testing.expect(std.mem.find(u8, schema.selected.model_output, open_object) != null);

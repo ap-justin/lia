@@ -3130,6 +3130,53 @@ test "session/new during a turn, after a sign-in, ends the turn and adopts the s
     try std.testing.expectEqual(@as(usize, 1), answers);
 }
 
+test "a sign-in adopted after a signed-out initialize starts the Token Pass check" {
+    const token_pass = @import("../core/gateway/token_pass.zig");
+    const token_pass_check = @import("../core/app/token_pass_check.zig");
+    const token_pass_memory = @import("../core/gateway/token_pass_memory.zig");
+    const token_pass_team = @import("../core/gateway/token_pass_team.zig");
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.lia");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_path);
+    const workspace_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_path);
+    const test_home = try AcpSessionTestHome.install(alloc, home_path);
+    defer test_home.deinit();
+    try test_home.map.put("LIA_DISABLE_KEYCHAIN", "1");
+    // A saved answer, so the check takes it without waiting on the credits call.
+    const named = token_pass_check.name(alloc, .ai_gateway_api_key, "gateway-token", null, null).?;
+    try token_pass_memory.save(alloc, home_path, &named.saved_as.?, .has_pass);
+    defer token_pass_team.publishAnswer(null, false);
+    var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-output.jsonl", .{ .read = true });
+    defer capture.close(io_mod.getIo());
+
+    var state = try initAcpSessionTestState(arena, workspace_path, capture);
+    defer state.deinit();
+    state.initialized = true;
+    state.cfg.home_override = home_path;
+    state.cfg.provider_set.gateway.credits = null;
+    // What a signed-out `initialize` leaves: no credential, the profile's
+    // model and speeds, and the check not started.
+    state.provider = .gateway;
+    state.credential_source = null;
+    state.cfg.credential_override = "gateway-token";
+    state.auth_pending = true;
+    state.token_pass_model_source = .compiled_default;
+    state.fast_mode = true;
+
+    try std.testing.expectEqual(server.PendingAuth.adopted, try server.refreshPendingAuth(&state));
+    try std.testing.expect(state.token_pass_run != null);
+    try std.testing.expectEqualStrings(token_pass.default_model, state.selected_model);
+    try std.testing.expect(!state.fast_mode);
+}
+
 test "initialize succeeds when HOME does not exist and says why sign-in cannot be saved" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

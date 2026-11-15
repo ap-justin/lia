@@ -129,7 +129,7 @@ pub const Job = struct {
     fn newSignIn(self: *Job) Outcome {
         var runtime: login_flow.SignInRuntime = .{};
         defer runtime.deinit(self.alloc());
-        const started = runtime.start(self.alloc(), self.state.cfg.gateway_provider.oauth_transport) catch |err| return .{ .failed = err };
+        const started = runtime.startWithoutTeam(self.alloc(), self.state.cfg.gateway_provider.oauth_transport) catch |err| return .{ .failed = err };
         if (!started) return .{ .failed = error.SignInAlreadyRunning };
         while (true) {
             if (runtime.takeBrowserPending() and !self.stop.load(.seq_cst)) self.announce(runtime.snapshot());
@@ -154,7 +154,7 @@ pub const Job = struct {
     /// without asking. With several, the session keeps none until `lia teams`.
     fn complete(self: *Job, selection: *const login_flow.TeamSelection) Outcome {
         switch (selection.teams.items.len) {
-            // `completeSignIn` reads a failed team request as no teams.
+            // The sign-in reads a failed team request as no teams.
             0 => return .{ .failed = error.NoTeams },
             1 => {
                 var team = selection.select(self.alloc(), 0) catch |err| {

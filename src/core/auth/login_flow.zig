@@ -351,6 +351,20 @@ pub const SignInRuntime = struct {
         return self.startPreparedWithMode(alloc, null, .{ .oauth_transport = transport }, false);
     }
 
+    /// `start` for a host with no team picker: the new login is saved with
+    /// no team, not the saved or retired login's, and the host chooses one
+    /// from `TeamSelection.teams`.
+    pub fn startWithoutTeam(
+        self: *Self,
+        alloc: Allocator,
+        transport: oauth_transport.Provider,
+    ) !bool {
+        return self.startPreparedWithMode(alloc, null, .{
+            .oauth_transport = transport,
+            .complete = completeSignInWithoutTeam,
+        }, false);
+    }
+
     /// Returns true once after the worker publishes a device code.
     pub fn takeBrowserPending(self: *Self) bool {
         self.mutex.lockUncancelable(io_mod.getIo());
@@ -709,6 +723,9 @@ fn prepareLogin(
     };
 }
 
+/// Saves the new login on the team of the saved or retired login, when the
+/// account still has it, so the team picker selects it and closing the
+/// picker keeps it.
 fn completeSignIn(
     _: ?*anyopaque,
     alloc: Allocator,
@@ -717,12 +734,38 @@ fn completeSignIn(
     client_id: []const u8,
     token: *oauth.TokenSet,
 ) !SignInCompletion {
+    return completeSignInOn(alloc, transport, issuer_url, client_id, token, .known);
+}
+
+/// Saves the new login with no team; the caller chooses one from
+/// `TeamSelection.teams`.
+fn completeSignInWithoutTeam(
+    _: ?*anyopaque,
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    issuer_url: []const u8,
+    client_id: []const u8,
+    token: *oauth.TokenSet,
+) !SignInCompletion {
+    return completeSignInOn(alloc, transport, issuer_url, client_id, token, .none);
+}
+
+fn completeSignInOn(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    issuer_url: []const u8,
+    client_id: []const u8,
+    token: *oauth.TokenSet,
+    starting_team: enum { known, none },
+) !SignInCompletion {
     var teams = fetchTeams(alloc, transport, token.access_token, issuer_url) catch std.ArrayList(Team).empty;
     errdefer freeTeams(alloc, &teams);
     const now_ms = io_mod.milliTimestamp();
-    // The new login starts on the person's team, so the team picker selects
-    // it and closing the picker keeps it.
-    const session = try take_login_session(alloc, issuer_url, client_id, token, savedLoginTeam(alloc, teams.items), now_ms);
+    const team = switch (starting_team) {
+        .known => savedLoginTeam(alloc, teams.items),
+        .none => null,
+    };
+    const session = try take_login_session(alloc, issuer_url, client_id, token, team, now_ms);
     return .{ .vercel = .{
         .session = session,
         .teams = teams,
@@ -1938,6 +1981,56 @@ test "login flow parses teams" {
     try std.testing.expectEqualStrings("team_1", teams.items[0].id);
     try std.testing.expectEqualStrings("Vercel Labs", teams.items[0].name);
     try std.testing.expectEqualStrings("personal", teams.items[1].name);
+}
+
+const TeamsTestTransport = struct {
+    fn provider() oauth_transport.Provider {
+        return .{ .context = null, .execute_fn = execute };
+    }
+
+    fn execute(_: ?*anyopaque, alloc: Allocator, _: oauth_transport.Request) !oauth_transport.Response {
+        return .{
+            .disposition = .accepted,
+            .body = try alloc.dupe(u8, "{\"teams\":[{\"id\":\"team_a\",\"slug\":\"team-a\"},{\"id\":\"team_b\",\"slug\":\"team-b\"}]}"),
+        };
+    }
+};
+
+test "a sign-in without a team leaves the retired login's team unsaved" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".lia");
+    var kept = try tmp.dir.createFile(std.testing.io, ".lia/" ++ oauth_session.kept_team_file_name, .{
+        .permissions = std.Io.File.Permissions.fromMode(0o600),
+    });
+    try kept.writeStreamingAll(std.testing.io, "{\"team_id\":\"team_b\",\"team_slug\":\"team-b\"}\n");
+    kept.close(std.testing.io);
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "");
+    defer alloc.free(home);
+    var env = std.process.Environ.Map.init(alloc);
+    defer env.deinit();
+    // The Keychain is keyed by account, not HOME: without this the test reads
+    // the developer's real lia login.
+    try env.put("LIA_DISABLE_KEYCHAIN", "1");
+    try env.put("HOME", home);
+    io_mod.setEnvironMap(&env);
+    defer io_mod.resetEnvironForTest();
+
+    // The kept team is in the list, so `completeSignIn` would start on it.
+    var kept_token = try testTokenSet(alloc);
+    defer kept_token.deinit(alloc);
+    var kept_completion = try completeSignIn(null, alloc, TeamsTestTransport.provider(), "https://vercel.test", "client", &kept_token);
+    defer kept_completion.deinit(alloc);
+    try std.testing.expectEqualStrings("team_b", kept_completion.vercel.session.?.team_id.?);
+
+    var token = try testTokenSet(alloc);
+    defer token.deinit(alloc);
+    var completion = try completeSignInWithoutTeam(null, alloc, TeamsTestTransport.provider(), "https://vercel.test", "client", &token);
+    defer completion.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), completion.vercel.teams.items.len);
+    try std.testing.expectEqual(@as(?[]u8, null), completion.vercel.session.?.team_id);
+    try std.testing.expectEqual(@as(?[]u8, null), completion.vercel.session.?.team_slug);
 }
 
 const ScriptedPollResult = enum {

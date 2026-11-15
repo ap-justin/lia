@@ -1,8 +1,8 @@
 //! The OpenAI Responses protocol for a custom model connection whose
 //! settings say `"protocol": "openai-responses"`
 //! (`src/core/config/configured_provider.zig`): the request body and the
-//! streamed reply. The wire format is `responses_protocol.zig`'s, which the
-//! ChatGPT and Grok adapters share; `configured_transport.zig` sends it.
+//! streamed reply. The wire format is `responses_protocol.zig`'s;
+//! `configured_transport.zig` sends it.
 const std = @import("std");
 const responses_protocol = @import("responses_protocol.zig");
 const stream_provider = @import("../core/agent/stream_provider.zig");
@@ -95,8 +95,8 @@ pub fn build_request(alloc: Allocator, request: stream_provider.RequestData, opt
         try std.json.Stringify.value(instructions.written(), .{}, writer);
     }
     try writer.writeAll(",\"input\":[");
-    // Replay and image scratch must not grow the body's own buffer, as the
-    // ChatGPT and Grok adapters keep it apart.
+    // Replay and image scratch must not grow the body's own buffer, so they
+    // use their own allocator.
     try responses_protocol.writeInput(writer, std.heap.c_allocator, projected orelse request.messages, request.verified_images, .{
         .tool_calls = max_tool_calls,
         .tool_identity_bytes = max_tool_identity_bytes,

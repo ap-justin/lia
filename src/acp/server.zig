@@ -320,6 +320,9 @@ pub const ServerState = struct {
     /// The profile's speeds, kept while nothing chose the model, so new
     /// sessions follow the team's start model (`token_pass.startModel`).
     token_pass_start: ?struct { fast_mode: bool, ultrafast_mode: bool } = null,
+    /// Where `initialize` found the model, for the Token Pass check that a
+    /// sign-in adopted later starts. Null before `initialize`.
+    token_pass_model_source: ?config_runtime.ModelSource = null,
     process_provider_override: bool = false,
     permission_mode: types.PermissionMode = .ask,
     permission_rules: types.PermissionRuleSet = .{},
@@ -1727,7 +1730,11 @@ pub fn refreshPendingAuth(state: *ServerState) !PendingAuth {
         break :running .deferred;
     } else if (try selectCredentialForProvider(state, state.provider)) .adopted else .unavailable;
     state.auth_adoption_deferred = outcome == .deferred;
-    if (outcome == .adopted) state.auth_pending = false;
+    if (outcome == .adopted) {
+        state.auth_pending = false;
+        // `initialize` found no credential, so it started no check.
+        if (state.token_pass_model_source) |source| startTokenPassCheck(state, state.alloc, source);
+    }
     return outcome;
 }
 
@@ -2450,6 +2457,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.fast_mode = startup.fast_mode and
         (state.cfg.model_override == null or startup.fast_mode_source != .compiled_default);
     configureUltrafastStartup(state, &startup);
+    state.token_pass_model_source = startup.model_source;
     startTokenPassCheck(state, alloc, startup.model_source);
     state.effort = startup.effort;
     state.first_call_tool_choice = startup.first_call_tool_choice;

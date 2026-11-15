@@ -21,6 +21,7 @@ Merges fx 0.0.17.
 - Claude Fable 5.1 and later no longer reject a continued session with "Invalid signature in thinking block".
 - MCP calls wait up to 5 minutes, up from 60 seconds. Starting many HTTP MCP servers no longer crashes lia. Arguments a model sends as text reach the server as the type the tool's schema names, and a closed connection is detected.
 - `lia ask` and ACP no longer wait 15 seconds for a stuck session title, and start in about 2 seconds on a dead network.
+- ACP sign-in with `lia-login` starts the Token Pass check once the login lands, and leaves the team unset when the account has several, instead of reusing the team of a login that was signed out.
 - Errors show in plain words, and a sign-out the provider did not confirm is retried at the next `lia login` or `lia logout`.
 
 ## lia 0.1.2
