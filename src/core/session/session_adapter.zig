@@ -41,6 +41,7 @@ const sm = @import("session_manager");
 /// A line boundary in a session log, for hosts that walk it.
 pub const LogCursor = sm.Cursor;
 const debug_trace = @import("../shared/debug_trace.zig");
+const write_test_controls = @import("write_test_controls.zig");
 const io_mod = @import("../shared/io.zig");
 const types = @import("../shared/types.zig");
 const agent_frame = @import("../shared/agent_frame.zig");
@@ -58,6 +59,7 @@ const session_store = @import("session_store.zig");
 const session_summary_codec = @import("session_summary_codec.zig");
 const v1_conversion = @import("v1_conversion.zig");
 const child_state = @import("../subagent/child_state.zig");
+const subagent_domain = @import("../subagent/domain.zig");
 const artifact_digest = @import("artifact_digest.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const model_provider = @import("../config/model_provider.zig");
@@ -305,13 +307,14 @@ pub const Store = struct {
         return complete;
     }
 
-    /// Removes folders outside the manager whose session is gone, except
-    /// young ones (D36, D45), in both roots.
-    fn sweepFiles(store: *Store, alloc: Allocator, report: *Doctor, now_ms: i64) !void {
-        for (outside_folders) |root_name| try store.sweepRoot(alloc, root_name, report, now_ms);
+    /// Finds folders outside the manager whose session is gone, except young
+    /// ones (D36, D45), in both roots, and counts or removes them as
+    /// `orphans` says.
+    fn sweepFiles(store: *Store, alloc: Allocator, report: *Doctor, now_ms: i64, orphans: OrphanSweep) !void {
+        for (outside_folders) |root_name| try store.sweepRoot(alloc, root_name, report, now_ms, orphans);
     }
 
-    fn sweepRoot(store: *Store, alloc: Allocator, root_name: []const u8, report: *Doctor, now_ms: i64) !void {
+    fn sweepRoot(store: *Store, alloc: Allocator, root_name: []const u8, report: *Doctor, now_ms: i64, orphans: OrphanSweep) !void {
         var files = try store.openProfileFolder(root_name) orelse return;
         defer files.close();
         var it = files.dir.iterate();
@@ -335,6 +338,10 @@ pub const Store = struct {
                 debug_trace.logf("session", "event=sessions_v2_orphan_files_young session={s} root={s}", .{ entry.name, root_name });
                 continue;
             }
+            if (orphans == .count) {
+                report.removable += 1;
+                continue;
+            }
             files.dir.deleteTree(io_mod.getIo(), entry.name) catch |err| {
                 debug_trace.logf("session", "event=sessions_v2_files_kept session={s} root={s} why=orphan err={s}", .{ entry.name, root_name, @errorName(err) });
                 report.kept += 1;
@@ -343,6 +350,17 @@ pub const Store = struct {
             debug_trace.logf("session", "event=sessions_v2_files_removed session={s} root={s} why=orphan", .{ entry.name, root_name });
             report.removed += 1;
         }
+    }
+
+    /// A child's stored title, read without opening it; null when it has
+    /// none yet. Caller owns it.
+    pub fn childTitle(store: *Store, alloc: Allocator, child_id: []const u8) !?[]u8 {
+        var peeked = try store.manager.peek(alloc, child_id);
+        defer peeked.deinit(alloc);
+        const raw = peeked.state.title orelse return null;
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        return try alloc.dupe(u8, try json_decode.parseFromSliceLeaky([]const u8, scratch.allocator(), raw, .{}));
     }
 
     /// A child's whole history, read without its lock: every turn, oldest
@@ -453,6 +471,25 @@ pub fn readSession(store: *Store, alloc: Allocator, id: []const u8) !Resumed {
     };
     defer peeked.deinit(alloc);
     if (peeked.role != .root) return error.SessionNotFound;
+    return detailOf(store, alloc, id, peeked);
+}
+
+/// A subagent's session, by its own id, as `readSession` reads a root's:
+/// without its lock (D37). `resolveAgent` finds the id from the names its
+/// parents gave it. Anything but a v2 child is `error.SessionNotFound`.
+/// Caller owns the result.
+pub fn readChild(store: *Store, alloc: Allocator, id: []const u8) !Resumed {
+    var peeked = store.manager.peek(alloc, id) catch |err| return switch (err) {
+        error.NotFound, error.InvalidArgument => error.SessionNotFound,
+        else => err,
+    };
+    defer peeked.deinit(alloc);
+    if (peeked.role != .child) return error.SessionNotFound;
+    return detailOf(store, alloc, id, peeked);
+}
+
+/// Every turn and setting of peeked session `id`, as `lia session` shows it.
+fn detailOf(store: *Store, alloc: Allocator, id: []const u8, peeked: sm.Peeked) !Resumed {
     var scratch = std.heap.ArenaAllocator.init(alloc);
     defer scratch.deinit();
     var restored = try settingsFrom(alloc, scratch.allocator(), peeked.state);
@@ -592,6 +629,359 @@ fn countBefore(sorted: []const session_store.SessionSummary, summary: session_st
     return count;
 }
 
+// ---------------------------------------------------------------------------
+// Live sessions, and subagents by name
+
+/// How deep a live listing and an agent address follow subagents: lia nests
+/// two levels below a root, and this leaves room. A log that names a deeper
+/// chain, or a loop, stops here.
+const max_agent_depth = 4;
+
+/// Index rows read per page while scanning for live sessions. Each page
+/// loads the whole index again, so one page covers any common profile.
+const live_scan_page = 4096;
+
+/// Every root session in `workspace`, or in every workspace when it is null,
+/// that a lia process has open right now, newest first, each with its
+/// subagents (`tests/tla/session/LiveSessions.tla`). A session is live while
+/// a process holds its writer lock, which the kernel frees however the
+/// process ends. The scan tries each lock without waiting and lets a free
+/// one go at once (`isBusy`), then reads the live session's log without the
+/// lock (D37). It writes nothing. A session whose lock can't be tried is not
+/// live, and one whose log can't be read is listed as `unknown`; both are
+/// traced. The caller frees the list with `deinit`.
+pub fn listLive(store: *Store, alloc: Allocator, workspace: ?[]const u8) !session_store.LiveSessionList {
+    var list: session_store.LiveSessionList = .{ .arena = .init(alloc), .sessions = &.{} };
+    errdefer list.arena.deinit();
+    const arena = list.arena.allocator();
+    var sessions: std.ArrayList(session_store.LiveSession) = .empty;
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const filter: sm.Filter = if (workspace) |root| .{ .workspace = root } else .all;
+    var cursor: ?sm.ListCursor = null;
+    while (true) {
+        var page = try store.manager.list(alloc, filter, cursor, live_scan_page);
+        defer page.deinit();
+        for (page.items) |item| {
+            if (item.role != .root) continue;
+            const live = store.manager.isBusy(item.id) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {
+                    debug_trace.logf("session", "event=live_probe_failed session={s} err={s}", .{ item.id, @errorName(err) });
+                    continue;
+                },
+            };
+            if (!live) continue;
+            _ = scratch.reset(.retain_capacity);
+            try sessions.append(arena, try liveSession(store, arena, scratch.allocator(), item));
+        }
+        cursor = page.next orelse break;
+    }
+    list.sessions = sessions.items;
+    return list;
+}
+
+/// Live root session `item`, read from its log into `arena`.
+fn liveSession(store: *Store, arena: Allocator, scratch: Allocator, item: sm.Summary) !session_store.LiveSession {
+    const summary = try summaryOf(arena, scratch, item);
+    const peeked = store.manager.peek(scratch, item.id) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            debug_trace.logf("session", "event=live_peek_failed session={s} err={s}", .{ item.id, @errorName(err) });
+            return .{ .summary = summary, .saved_model = null, .state = .unknown, .agents = &.{} };
+        },
+    };
+    return .{
+        .summary = summary,
+        .saved_model = savedModel(arena, peeked.state.prefs),
+        .state = if (peeked.state.open_turn != null) .working else .idle,
+        .agents = try liveAgents(store, arena, scratch, item.id, peeked.state.children.items, 1),
+    };
+}
+
+/// The model a session's `prefs` saved, copied into `arena`, or null when
+/// it can't be read.
+fn savedModel(arena: Allocator, prefs: ?[]const u8) ?[]const u8 {
+    const raw = prefs orelse return null;
+    const Saved = struct { model: ?[]const u8 = null };
+    const saved = json_decode.parseFromSliceLeaky(Saved, arena, raw, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch return null;
+    return saved.model;
+}
+
+/// A folded child as the subagent code reads it, borrowing `child`.
+fn foldedChild(child: sm.Child) Child {
+    return .{
+        .id = child.id,
+        .work_id = child.work_id,
+        .open = child.open,
+        .outcome = child.outcome,
+        .spawn_data = child.spawn_data,
+        .finish_data = child.finish_data,
+        .seq = child.seq,
+    };
+}
+
+/// The newest spawn in `children` that goes by `name`, closed for good or
+/// not, so a closed subagent's turns stay readable. Null when none does.
+fn newestNamed(scratch: Allocator, children: []const sm.Child, name: []const u8) ?sm.Child {
+    var best: ?sm.Child = null;
+    for (children) |child| {
+        const own = child_state.foldedName(scratch, foldedChild(child)) orelse continue;
+        if (!std.mem.eql(u8, own, name)) continue;
+        if (best == null or child.seq > best.?.seq) best = child;
+    }
+    return best;
+}
+
+/// Whether a spawn in `children` that goes by `name` and is not closed for
+/// good is newer than `seq`.
+fn newerOpenNamed(scratch: Allocator, children: []const sm.Child, name: []const u8, seq: u64) bool {
+    for (children) |child| {
+        if (child.seq <= seq) continue;
+        const entry = foldedChild(child);
+        if (child_state.foldedClosed(entry)) continue;
+        const own = child_state.foldedName(scratch, entry) orelse continue;
+        if (std.mem.eql(u8, own, name)) return true;
+    }
+    return false;
+}
+
+/// The subagents a live listing shows of one parent, whose folded children
+/// are `children`: each named one not closed for good, the newest spawn of
+/// each name, with its own below it down to `max_agent_depth`. Their
+/// addresses start with `parent`.
+fn liveAgents(store: *Store, arena: Allocator, scratch: Allocator, parent: []const u8, children: []const sm.Child, depth: usize) ![]const session_store.LiveAgent {
+    var agents: std.ArrayList(session_store.LiveAgent) = .empty;
+    for (children) |child| {
+        const entry = foldedChild(child);
+        if (child_state.foldedClosed(entry)) continue;
+        const name = child_state.foldedName(scratch, entry) orelse continue;
+        if (newerOpenNamed(scratch, children, name, child.seq)) continue;
+        const address = try std.mem.concat(arena, u8, &.{ parent, "/", name });
+        var nested: []const session_store.LiveAgent = &.{};
+        if (depth < max_agent_depth) {
+            if (store.manager.peek(scratch, child.id)) |peeked| {
+                nested = try liveAgents(store, arena, scratch, address, peeked.state.children.items, depth + 1);
+            } else |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => debug_trace.logf("session", "event=live_agent_peek_failed session={s} err={s}", .{ child.id, @errorName(err) }),
+            }
+        }
+        try agents.append(arena, .{
+            .name = try arena.dupe(u8, name),
+            .address = address,
+            .id = try arena.dupe(u8, child.id),
+            .state = if (child.open) .working else .idle,
+            .agents = nested,
+        });
+    }
+    return agents.items;
+}
+
+/// `<session-id>/<name>[/<name>...]`: a subagent by the names its parents
+/// gave it, below a root session. Borrows the text it was parsed from.
+pub const AgentAddress = struct {
+    root: []const u8,
+    names_buffer: [max_agent_depth][]const u8 = undefined,
+    depth: usize = 0,
+
+    fn names(address: *const AgentAddress) []const []const u8 {
+        return address.names_buffer[0..address.depth];
+    }
+};
+
+/// What `lia session <target>` names, before any session is read.
+pub const SessionTarget = union(enum) {
+    /// No `/`: a session id alone.
+    session,
+    agent: AgentAddress,
+    /// An address `lia session` cannot follow.
+    invalid: AddressProblem,
+};
+
+/// Why an agent address names no subagent, before any session is read.
+pub const AddressProblem = union(enum) {
+    /// The first part below the root that is not a name lia gives a
+    /// subagent; empty when the address has an empty part.
+    bad_name: []const u8,
+    /// More names than `max_agent_depth`.
+    too_deep,
+
+    /// The problem as `lia session` says it, quoting the part at fault or
+    /// `text`, the address, as a terminal can show it.
+    pub fn describe(problem: AddressProblem, writer: *std.Io.Writer, text: []const u8) std.Io.Writer.Error!void {
+        switch (problem) {
+            .bad_name => |name| if (name.len == 0)
+                try writer.print("{f} has an empty agent name", .{text_utils.terminalSafe(text)})
+            else
+                try writer.print(
+                    "{f} is not an agent name; agent names are lowercase letters, digits, \"_\", and \"-\", start with a letter or digit, and are at most {d} bytes",
+                    .{ text_utils.terminalSafe(name), subagent_domain.max_agent_name_bytes },
+                ),
+            .too_deep => try writer.print("{f} goes more than {d} agents deep", .{ text_utils.terminalSafe(text), max_agent_depth }),
+        }
+    }
+};
+
+/// Pure: what `text` names as a `lia session` target. Borrows `text`.
+/// `error.InvalidSessionId` when the part before the first `/` is not a
+/// session id.
+pub fn parseSessionTarget(text: []const u8) error{InvalidSessionId}!SessionTarget {
+    const slash = std.mem.findScalar(u8, text, '/') orelse return .session;
+    var address: AgentAddress = .{ .root = text[0..slash] };
+    session_store.validateSessionId(address.root) catch return error.InvalidSessionId;
+    var parts = std.mem.splitScalar(u8, text[slash + 1 ..], '/');
+    while (parts.next()) |name| {
+        if (address.depth == max_agent_depth) return .{ .invalid = .too_deep };
+        if (!subagent_domain.validAgentName(name)) return .{ .invalid = .{ .bad_name = name } };
+        address.names_buffer[address.depth] = name;
+        address.depth += 1;
+    }
+    return .{ .agent = address };
+}
+
+/// What an agent address names: the subagent's own session, or the first
+/// name no subagent of `parent` goes by, with the names its subagents do.
+/// Strings are borrowed from the arena `resolveAgent` was given.
+const AgentLookup = union(enum) {
+    found: []const u8,
+    missing: struct { parent: []const u8, name: []const u8, names: []const []const u8 },
+};
+
+/// Follows `address` from its root session down the names each parent gave
+/// its subagent, through each parent's log read without its lock (D37). A
+/// name two children took reaches the newer, closed for good or not, so a
+/// closed subagent's turns stay readable. A missing root, or one that is a
+/// child itself, is `error.SessionNotFound`.
+pub fn resolveAgent(store: *Store, arena: Allocator, address: AgentAddress) !AgentLookup {
+    // Only `parseSessionTarget` makes one, and it names at least one subagent.
+    std.debug.assert(address.depth >= 1);
+    var peeked = store.manager.peek(arena, address.root) catch |err| return switch (err) {
+        error.NotFound, error.InvalidArgument => error.SessionNotFound,
+        else => err,
+    };
+    if (peeked.role != .root) return error.SessionNotFound;
+    var parent: []const u8 = address.root;
+    for (address.names(), 0..) |name, index| {
+        const children = peeked.state.children.items;
+        const child = newestNamed(arena, children, name) orelse
+            return .{ .missing = .{ .parent = parent, .name = name, .names = try agentNames(arena, children) } };
+        if (index + 1 == address.depth) return .{ .found = child.id };
+        parent = try std.mem.concat(arena, u8, &.{ parent, "/", name });
+        peeked = store.manager.peek(arena, child.id) catch |err| return switch (err) {
+            error.NotFound, error.InvalidArgument => error.SessionNotFound,
+            else => err,
+        };
+    }
+    unreachable;
+}
+
+/// The names of the subagents in `children` that are not closed for good,
+/// each once, in the order they were first started.
+fn agentNames(arena: Allocator, children: []const sm.Child) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    for (children) |child| {
+        const entry = foldedChild(child);
+        if (child_state.foldedClosed(entry)) continue;
+        const name = child_state.foldedName(arena, entry) orelse continue;
+        for (out.items) |known| {
+            if (std.mem.eql(u8, known, name)) break;
+        } else try out.append(arena, name);
+    }
+    return out.items;
+}
+
+test "a session target splits into its root and the names below it" {
+    const address = (try parseSessionTarget("abc123/reviewer/helper-2")).agent;
+    try std.testing.expectEqualStrings("abc123", address.root);
+    try std.testing.expectEqual(@as(usize, 2), address.names().len);
+    try std.testing.expectEqualStrings("reviewer", address.names()[0]);
+    try std.testing.expectEqualStrings("helper-2", address.names()[1]);
+    try std.testing.expectEqual(SessionTarget.session, try parseSessionTarget("abc123"));
+    // A part that is not a subagent name is named, an empty one as empty.
+    for ([_][2][]const u8{ .{ "abc123/Reviewer", "Reviewer" }, .{ "abc123/a b", "a b" }, .{ "abc123/reviewer/x.y", "x.y" }, .{ "abc123/", "" }, .{ "abc123//reviewer", "" } }) |case| {
+        try std.testing.expectEqualStrings(case[1], (try parseSessionTarget(case[0])).invalid.bad_name);
+    }
+    try std.testing.expectEqual(AddressProblem.too_deep, (try parseSessionTarget("abc123/a/b/c/d/e")).invalid);
+    // A root that is not a session id is not one.
+    for ([_][]const u8{ "/reviewer", "../x/reviewer", "a b/reviewer" }) |text| {
+        try std.testing.expectError(error.InvalidSessionId, parseSessionTarget(text));
+    }
+    // The deepest address it takes.
+    try std.testing.expectEqual(@as(usize, max_agent_depth), (try parseSessionTarget("abc123/a/b/c/d")).agent.depth);
+}
+
+test "an address problem names the part at fault and the rule" {
+    for ([_][2][]const u8{
+        .{ "abc123/Reviewer", "Reviewer is not an agent name; agent names are lowercase letters, digits, \"_\", and \"-\", start with a letter or digit, and are at most 64 bytes" },
+        .{ "abc123/reviewer/\x1b]0;x\x07", "\\x1b]0;x\\x07 is not an agent name; agent names are lowercase letters, digits, \"_\", and \"-\", start with a letter or digit, and are at most 64 bytes" },
+        .{ "abc123//reviewer", "abc123//reviewer has an empty agent name" },
+        .{ "abc123/a/b/c/d/e", "abc123/a/b/c/d/e goes more than 4 agents deep" },
+    }) |case| {
+        var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer out.deinit();
+        try (try parseSessionTarget(case[0])).invalid.describe(&out.writer, case[0]);
+        try std.testing.expectEqualStrings(case[1], out.written());
+    }
+}
+
+test "an agent address parses or is refused on fuzzed bytes" {
+    try std.testing.fuzz({}, fuzzAgentAddress, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "abc123/reviewer",
+            "abc123/lead/helper",
+            "abc123",
+            "abc123//x",
+            "\xff/\x00",
+        }) ++ @import("fuzz_corpus").session_address.*),
+    });
+}
+
+fn fuzzAgentAddress(_: void, smith: *std.testing.Smith) anyerror!void {
+    var buffer: [512]u8 = undefined;
+    const bytes = buffer[0..@intCast(smith.slice(&buffer))];
+    const slash = std.mem.findScalar(u8, bytes, '/');
+    const target = parseSessionTarget(bytes) catch {
+        // Only a root that is not a session id is refused.
+        try std.testing.expect(slash != null);
+        try std.testing.expectError(error.InvalidSessionId, session_store.validateSessionId(bytes[0..slash.?]));
+        return;
+    };
+    const names = if (slash) |at| bytes[at + 1 ..] else {
+        try std.testing.expectEqual(SessionTarget.session, target);
+        return;
+    };
+    try session_store.validateSessionId(bytes[0..slash.?]);
+    switch (target) {
+        .session => return error.TestUnexpectedResult,
+        .invalid => |problem| switch (problem) {
+            .too_deep => try std.testing.expect(std.mem.count(u8, names, "/") >= max_agent_depth),
+            .bad_name => |name| {
+                // One of the parts, and the first that is not a subagent name.
+                try std.testing.expect(!subagent_domain.validAgentName(name));
+                var parts = std.mem.splitScalar(u8, names, '/');
+                while (parts.next()) |part| {
+                    if (part.ptr == name.ptr and part.len == name.len) break;
+                    try std.testing.expect(subagent_domain.validAgentName(part));
+                } else return error.TestUnexpectedResult;
+            },
+        },
+        .agent => |address| {
+            // A valid root and valid names that join back to the text.
+            try std.testing.expect(address.depth >= 1 and address.depth <= max_agent_depth);
+            var joined: std.ArrayList(u8) = .empty;
+            defer joined.deinit(std.testing.allocator);
+            try joined.appendSlice(std.testing.allocator, address.root);
+            for (address.names()) |name| {
+                try std.testing.expect(subagent_domain.validAgentName(name));
+                try joined.append(std.testing.allocator, '/');
+                try joined.appendSlice(std.testing.allocator, name);
+            }
+            try std.testing.expectEqualStrings(bytes, joined.items);
+        },
+    }
+}
+
 pub const Recovered = struct {
     id: []u8,
     /// Entries in the copy's history; a compaction summary counts as one.
@@ -661,6 +1051,9 @@ pub const Doctor = struct {
     damaged: std.ArrayList([]u8) = .empty,
     /// Side folders removed because their session is gone.
     removed: usize = 0,
+    /// Side folders whose session is gone that `lia doctor --fix` would
+    /// remove; counted only when the sweep does not remove.
+    removable: usize = 0,
     /// Side folders with no session that could not be removed.
     kept: usize = 0,
     /// Roots an older lia saved that v2 does not hold yet; each converts
@@ -700,9 +1093,18 @@ pub const Doctor = struct {
 /// turn has not created its log yet (D36).
 const orphan_min_age_ms: i64 = 24 * std.time.ms_per_hour;
 
-/// `lia doctor` on v2 (D36): verifies up to `limit` sessions and removes side
-/// folders whose session is gone. Rebuilds nothing. Caller owns the report.
-pub fn doctor(store: *Store, alloc: Allocator, limit: usize, now_ms: i64) !Doctor {
+/// What `lia doctor` does with a side folder whose session is gone.
+pub const OrphanSweep = enum {
+    /// Counts it as removable: plain `lia doctor`.
+    count,
+    /// Removes it: `lia doctor --fix`.
+    remove,
+};
+
+/// `lia doctor` on v2 (D36): verifies up to `limit` sessions and finds side
+/// folders whose session is gone, counting or removing them as `orphans`
+/// says. Rebuilds nothing. Caller owns the report.
+pub fn doctor(store: *Store, alloc: Allocator, limit: usize, now_ms: i64, orphans: OrphanSweep) !Doctor {
     var report: Doctor = .{};
     errdefer report.deinit(alloc);
     var latest_ms: u64 = 0;
@@ -737,7 +1139,7 @@ pub fn doctor(store: *Store, alloc: Allocator, limit: usize, now_ms: i64) !Docto
     try doctorV1(store, alloc, &report, limit);
     report.kept_children = try keptChildren(store, alloc);
     for (report.kept_children) |child| report.keeps_left_out += @intFromBool(child.keeps);
-    try store.sweepFiles(alloc, &report, now_ms);
+    try store.sweepFiles(alloc, &report, now_ms, orphans);
     return report;
 }
 
@@ -927,6 +1329,13 @@ const BlobHost = struct {
     /// The open session; null once it closed.
     session: ?sm.Session,
     mutex: std.Io.Mutex = .init,
+    /// One write of the session at a time. `Session.write` holds it from
+    /// taking the due records until it clears them, so two writes on
+    /// different threads, such as main's compaction line and a subagent's
+    /// finish line, never take the same records
+    /// (`tests/tla/session/SessionWrite.tla` NoStaleRemoval, ListedOnce).
+    /// Taken before `life` and `mutex`, and never while holding either.
+    write_lock: std.Io.Mutex = .init,
     refs: usize = 1,
     /// Blobs stored since the last item that lists them (D44).
     pending: std.ArrayList(Hash) = .empty,
@@ -1487,12 +1896,16 @@ pub const Session = struct {
     /// stores kept since the last such line, so verify and recover see a
     /// lost one as damage (D39, D44). Compactor records kept since the last
     /// `compaction_records` line get a new one first, so the line that
-    /// cites them never lands without them (D50).
+    /// cites them never lands without them (D50). Writes of the session run
+    /// one at a time (`BlobHost.write_lock`).
     fn write(self: *Session, events: []const sm.Event) sm.AppendError!u64 {
+        self.host.write_lock.lockUncancelable(io_mod.getIo());
+        defer self.host.write_lock.unlock(io_mod.getIo());
         var scratch = std.heap.ArenaAllocator.init(self.alloc);
         defer scratch.deinit();
         const a = scratch.allocator();
         const due = try self.host.recordsDue(a);
+        if (due) |records| write_test_controls.holdDueRecords(records.added.len);
         const with_records = if (due) |records| try std.mem.concat(a, sm.Event, &.{ try self.recordLines(a, records), events }) else events;
         const pending = try self.host.pendingCopy(a);
         const batch = try listPending(a, with_records, pending);
@@ -2284,6 +2697,20 @@ pub const Session = struct {
         var scratch = std.heap.ArenaAllocator.init(alloc);
         defer scratch.deinit();
         const state = try self.handle.state(scratch.allocator());
+        return childrenOf(alloc, &state);
+    }
+
+    /// The children this session had at the end of the turn before
+    /// `before_turn`, a `ForkPoint.turn`, each as its newest work stood
+    /// then: what `fork` can copy (D97). Free with `freeChildren`.
+    pub fn forkChildren(self: *Session, alloc: Allocator, before_turn: u64) ![]Child {
+        if (before_turn == 0) return error.InvalidForkPoint;
+        var state = try self.store.manager.stateAt(self.id(), .{ .turn = before_turn - 1 });
+        defer state.deinit(self.store.manager.gpa);
+        return childrenOf(alloc, &state);
+    }
+
+    fn childrenOf(alloc: Allocator, state: *const sm.State) ![]Child {
         const out = try alloc.alloc(Child, state.children.items.len);
         var built: usize = 0;
         errdefer {
@@ -2710,7 +3137,11 @@ pub const Session = struct {
         host: Host,
         /// The title the source shows; the fork gets it marked as a fork.
         title: ?[]const u8 = null,
+        /// The children the fork takes a copy of, from `forkChildren` (D97).
+        children: []const ChildCopy = &.{},
     };
+
+    pub const ChildCopy = sm.ChildCopy;
 
     /// A new session holding this one's log up to the end of the turn before
     /// `options.before_turn`, under a new id (D58). The manager copies the
@@ -2724,6 +3155,7 @@ pub const Session = struct {
             .at = .{ .turn = options.before_turn - 1 },
             .workspace = options.workspace,
             .host = options.host,
+            .children = options.children,
         });
         errdefer handle.release();
         const copy = try init(alloc, self.store, handle, false);
@@ -5802,6 +6234,12 @@ test "a child opens under the id its parent names, and its parent folds its line
         try testing.expectEqualStrings(child_id, child.id());
         try testing.expectEqualStrings("Be brief.", child.childInstructions());
         try child.commitTurn(assistantTurn("task one", "done one"), types.ConversationLanguage.default());
+        // Its title reads from the store without opening it.
+        try testing.expect((try t.store.childTitle(alloc, child_id)) == null);
+        try child.rename("Review the parser");
+        const title = (try t.store.childTitle(alloc, child_id)).?;
+        defer alloc.free(title);
+        try testing.expectEqualStrings("Review the parser", title);
     }
     try parent.appendChildLines(&.{.{ .finished = .{ .child = child_id, .work_id = "w1", .outcome = .ok, .data = "{}" } }});
 
@@ -5862,6 +6300,7 @@ test "the manager guards child lines, and a child without a log reopens under it
     // Closed before its first turn, as a crash would leave it: nothing on disk.
     (try Session.openChild(alloc, &t.store, parent.id(), child_id, "/w", childSeed(&model, "Stay short."))).close();
     try testing.expectError(error.NotFound, t.store.childHistory(alloc, child_id));
+    try testing.expectError(error.NotFound, t.store.childTitle(alloc, child_id));
     const child = try Session.openChild(alloc, &t.store, parent.id(), child_id, "/w", testSeed(&model));
     defer child.close();
     try testing.expectEqualStrings(child_id, child.id());
@@ -8130,6 +8569,208 @@ test "an older session moves off its side folder on its first writable open, and
     try testing.expect(std.mem.endsWith(u8, lost.snapshot_path.?, "images/" ++ OldSideFolder.image_name));
 }
 
+/// Every `compaction_records` setting in session `id`'s log, as the count
+/// of records each lists besides its own map, and how many records they
+/// list in all. Fails when a setting leaves out its map or two list the same
+/// record (D50). In `arena`.
+fn recordListings(arena: Allocator, manager: *sm.Manager, id: []const u8) !struct { counts: []usize, records: usize } {
+    var page = try manager.read(testing.allocator, id, .start, .forward, 10_000);
+    defer page.deinit();
+    var counts: std.ArrayList(usize) = .empty;
+    var listed: std.array_hash_map.String(void) = .empty;
+    for (page.entries) |entry| {
+        const body = entry.body orelse continue;
+        if (body != .set or body.set.key != .compaction_records) continue;
+        const value = try std.json.parseFromSliceLeaky(struct { map: []const u8 }, arena, body.set.value, .{ .allocate = .alloc_always });
+        var lists_map = false;
+        var count: usize = 0;
+        for (body.set.blobs) |hash| {
+            if (std.mem.eql(u8, hash, value.map)) {
+                lists_map = true;
+                continue;
+            }
+            const slot = try listed.getOrPut(arena, try arena.dupe(u8, hash));
+            try testing.expect(!slot.found_existing);
+            count += 1;
+        }
+        try testing.expect(lists_map);
+        try counts.append(arena, count);
+    }
+    return .{ .counts = counts.items, .records = listed.count() };
+}
+
+/// Holds the first write that takes due records until `go` is set, so a
+/// test can run another write of the session, or keep a record, meanwhile.
+const HeldWrite = struct {
+    var held: std.Io.Event = .unset;
+    var go: std.Io.Event = .unset;
+    var calls = std.atomic.Value(u32).init(0);
+
+    fn arm() void {
+        held = .unset;
+        go = .unset;
+        calls.store(0, .seq_cst);
+        write_test_controls.test_hold = hold;
+    }
+
+    fn disarm() void {
+        write_test_controls.test_hold = null;
+    }
+
+    fn hold(_: usize) void {
+        if (calls.fetchAdd(1, .seq_cst) != 0) return;
+        held.set(io_mod.getIo());
+        go.waitUncancelable(io_mod.getIo());
+    }
+
+    fn write(session: *Session, text: []const u8, done: *std.atomic.Value(bool), failed: *std.atomic.Value(bool)) void {
+        session.setClientPrompt(text) catch failed.store(true, .seq_cst);
+        done.store(true, .seq_cst);
+    }
+
+    /// A subagent's line, as when one is spawned or finishes: unlike
+    /// `setClientPrompt`, it doesn't take `Session.mutex`, so only the write
+    /// lock makes it wait.
+    fn childLine(session: *Session, child: []const u8, done: *std.atomic.Value(bool), failed: *std.atomic.Value(bool)) void {
+        session.appendChildLines(&.{.{ .spawned = .{ .child = child, .work_id = "w1", .data = "{\"kind\":\"persistent\"}" } }}) catch failed.store(true, .seq_cst);
+        done.store(true, .seq_cst);
+    }
+};
+
+test "a write that took due records makes the session's other writes wait, and a record kept meanwhile stays due (D50)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    defer s.close();
+    try s.beginTurn();
+    const records = result_store.compactorStore(try s.childCapability());
+    try records.write(testing.allocator, "compacted-T1.txt", "T1 first\n");
+    try records.write(testing.allocator, "compacted-T2.txt", "T2 second\n");
+    HeldWrite.arm();
+    defer HeldWrite.disarm();
+    var first_done = std.atomic.Value(bool).init(false);
+    var second_done = std.atomic.Value(bool).init(false);
+    var failed = std.atomic.Value(bool).init(false);
+    const first = try std.Thread.spawn(.{}, HeldWrite.write, .{ s, "first", &first_done, &failed });
+    HeldWrite.held.waitUncancelable(io_mod.getIo());
+    // The first write holds T1 and T2. A subagent's line from another
+    // thread, as during main's compaction, waits for it.
+    const second = try std.Thread.spawn(.{}, HeldWrite.childLine, .{ s, "1786460757754-kid", &second_done, &failed });
+    // The compactor keeps a record meanwhile, after the first write took
+    // its records.
+    try records.write(testing.allocator, "compacted-T3.txt", "T3 third\n");
+    io_mod.sleep(50 * std.time.ns_per_ms);
+    try testing.expect(!first_done.load(.seq_cst));
+    try testing.expect(!second_done.load(.seq_cst));
+    HeldWrite.go.set(io_mod.getIo());
+    first.join();
+    second.join();
+    try testing.expect(!failed.load(.seq_cst));
+    // The first write lists T1 and T2, and the second the T3 it found due.
+    const listings = try recordListings(arena_state.allocator(), t.store.manager, s.id());
+    try testing.expectEqualSlices(usize, &.{ 2, 1 }, listings.counts);
+}
+
+test "a write whose append fails keeps its records due and lets the next write go (D50)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    defer s.close();
+    try s.beginTurn();
+    const records = result_store.compactorStore(try s.childCapability());
+    try records.write(testing.allocator, "compacted-T1.txt", "T1 first\n");
+    // The manager refuses a finish line for a child the session never
+    // spawned, so nothing of that batch lands, its records line included.
+    if (s.appendChildLines(&.{.{ .finished = .{ .child = "never-spawned", .work_id = "w", .outcome = .ok } }})) |_| {
+        return error.TestUnexpectedResult;
+    } else |_| {}
+    try testing.expectEqual(@as(usize, 0), try countSettings(t.store.manager, s.id(), .compaction_records));
+    // The record is still due, and the write after the failure lists it.
+    try s.setClientPrompt("after the failure");
+    const listings = try recordListings(arena_state.allocator(), t.store.manager, s.id());
+    try testing.expectEqualSlices(usize, &.{1}, listings.counts);
+}
+
+test "fuzzed puts and writes list each compactor record once (D50)" {
+    try std.testing.fuzz({}, fuzzRecordsListing, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "",
+            "\x00",
+            "\x00\x02\x00\x03\x01",
+            "\x00\x01\x05\x02\x00\x00\x03\x02\x09",
+            "\x03\x00\x04\x00\x02\x01\x02\x03\x00\x0d",
+        }) ++ @import("fuzz_corpus").session_records_listing.*),
+    });
+}
+
+/// Each byte is one step: keep a new record (0), keep a record again under
+/// a name already kept (1), save a setting that cites nothing (2), or end
+/// the turn and start the next (3). Every record kept must then be listed
+/// by exactly one `compaction_records` setting, each setting lists its own
+/// map too, and the session resumes with every name kept (D50).
+fn fuzzRecordsListing(_: void, smith: *std.testing.Smith) !void {
+    var steps: [24]u8 = undefined;
+    const len: usize = @intCast(smith.slice(&steps));
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    var open = true;
+    defer if (open) s.close();
+    try s.beginTurn();
+    const records = result_store.compactorStore(try s.childCapability());
+    var kept: usize = 0;
+    var puts: usize = 0;
+    var name_buf: [32]u8 = undefined;
+    var body_buf: [48]u8 = undefined;
+    for (steps[0..len], 0..) |step, index| {
+        switch (step % 4) {
+            0, 1 => {
+                const slot = if (step % 4 == 1 and kept > 0) (step / 4) % kept else blk: {
+                    kept += 1;
+                    break :blk kept - 1;
+                };
+                puts += 1;
+                const name = try std.mem.print(&name_buf, "compacted-T{d}.txt", .{slot});
+                const body = try std.mem.print(&body_buf, "T{d} result {d}\n", .{ slot, puts });
+                try records.write(testing.allocator, name, body);
+            },
+            2 => try s.setClientPrompt(try std.mem.print(&body_buf, "prompt {d}", .{index})),
+            else => {
+                try s.commitTurn(assistantTurn("step", "done"), types.ConversationLanguage.default());
+                try s.beginTurn();
+            },
+        }
+    }
+    try s.commitTurn(assistantTurn("last", "done"), types.ConversationLanguage.default());
+
+    var listings_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer listings_arena.deinit();
+    const listings = try recordListings(listings_arena.allocator(), t.store.manager, s.id());
+    // Each put kept new bytes, so each is its own record.
+    try testing.expectEqual(puts, listings.records);
+
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+    open = false;
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const names = try result_store.compactorStore(try r.childCapability()).list(arena_state.allocator());
+    try testing.expectEqual(kept, names.len);
+}
+
 test "compactor records on v2 are recorded by one setting with the next write, and come back on resume and in a fork (D50)" {
     var t: TestHome = undefined;
     try t.init();
@@ -9028,7 +9669,7 @@ test "a v1 session whose hosted terminal state holds an entry the copy can't tak
     var again = try convertAll(&t.store, alloc);
     defer again.deinit(alloc);
     try testing.expect(V1Home.exists(&t, id));
-    var doctor_report = try doctor(&t.store, alloc, 64, 0);
+    var doctor_report = try doctor(&t.store, alloc, 64, 0, .count);
     defer doctor_report.deinit(alloc);
     try testing.expectEqual(@as(usize, 0), doctor_report.stuck.items.len);
     try testing.expectEqual(@as(usize, 0), doctor_report.unconverted);
@@ -9274,7 +9915,7 @@ test "doctor counts sessions an older lia saved and names each that can't be con
     defer alloc.free(damaged);
     try v1.put(torn, null, "events.jsonl", damaged);
 
-    var report = try doctor(&t.store, alloc, 100, io_mod.milliTimestamp());
+    var report = try doctor(&t.store, alloc, 100, io_mod.milliTimestamp(), .count);
     defer report.deinit(alloc);
     try testing.expectEqual(@as(usize, 0), report.sessions);
     try testing.expectEqual(@as(usize, 5), report.unconverted);
@@ -9811,7 +10452,7 @@ test "lia sessions convert keeps a v1 subagent's own subagent as it is, and lia 
     try testing.expectEqual(before.count(), after.count());
     for (before.keys(), before.values()) |path, bytes| try testing.expectEqualStrings(bytes, after.get(path).?);
 
-    var doctor_report = try doctor(&t.store, alloc, 64, 0);
+    var doctor_report = try doctor(&t.store, alloc, 64, 0, .count);
     defer doctor_report.deinit(alloc);
     try testing.expectEqual(@as(usize, 1), doctor_report.kept_children.len);
     try testing.expectEqualStrings(family[2], doctor_report.kept_children[0].id);
@@ -9962,7 +10603,7 @@ test "lia doctor counts each v1 folder a family's conversion kept, a subagent's 
     try testing.expectEqual(@as(usize, 1), report.converted);
     try testing.expectEqual(@as(usize, 2), report.left_out.items.len);
     for (family) |id| try testing.expect(V1Home.exists(&t, id));
-    var doctor_report = try doctor(&t.store, alloc, 64, 0);
+    var doctor_report = try doctor(&t.store, alloc, 64, 0, .count);
     defer doctor_report.deinit(alloc);
     try testing.expectEqual(@as(usize, 2), doctor_report.keeps_left_out);
     // Each copy names what it left out and keeps no fingerprint, which an
@@ -10241,7 +10882,7 @@ test "a child an earlier try published keeps its v1 folder when that try left a 
     try testing.expectEqualStrings(child, report.kept_children[0].id);
     try testing.expectEqualStrings("lia converted it already without logs/commands/replay.bin, so this folder keeps it", report.kept_children[0].reason);
     // lia doctor counts that folder, though its root's folder is gone.
-    var doctor_report = try doctor(&t.store, alloc, 64, 0);
+    var doctor_report = try doctor(&t.store, alloc, 64, 0, .count);
     defer doctor_report.deinit(alloc);
     try testing.expectEqual(@as(usize, 1), doctor_report.keeps_left_out);
 }
@@ -10565,7 +11206,7 @@ test "a v1 side file larger than one v2 blob is left out and named, its v1 folde
     defer again.deinit(alloc);
     for (roots) |id| try testing.expect(V1Home.exists(&t, id));
     try testing.expectEqual(@as(u64, sm.max_blob_bytes + 1), (try t.tmp.dir.statFile(io, try v1.sessionPath(roots[1], "logs/commands/replay.bin"), .{})).size);
-    var doctor_report = try doctor(&t.store, alloc, 64, 0);
+    var doctor_report = try doctor(&t.store, alloc, 64, 0, .count);
     defer doctor_report.deinit(alloc);
     try testing.expectEqual(@as(usize, 2), doctor_report.keeps_left_out);
 }

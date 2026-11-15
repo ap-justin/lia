@@ -1,5 +1,6 @@
 const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");
+const testing_listener = @import("../shared/testing_listener.zig");
 const builtin = @import("builtin");
 const credentials = @import("credentials.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -9,7 +10,10 @@ const oauth = @import("oauth.zig");
 const oauth_session = @import("oauth_session.zig");
 const oauth_transport = @import("oauth_transport.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
+const pending_revocation = @import("pending_revocation.zig");
 const secret = @import("secret.zig");
+const text_utils = @import("../shared/text_utils.zig");
+const types = @import("../shared/types.zig");
 const test_builtin_gateway = if (builtin.is_test)
     @import("../../builtins/gateway.zig")
 else
@@ -37,11 +41,16 @@ pub const LoginError = error{
 const LogoutError = error{SessionDeleteFailed};
 
 pub const remote_revocation_warning = "Warning: signed out locally, but the remote session could not be revoked.";
+/// `remote_revocation_warning`, when the session's tokens are kept and lia
+/// revokes them later (`pending_revocation`).
+pub const remote_revocation_retry_warning = remote_revocation_warning ++ " " ++ pending_revocation.retry_later ++ ".";
 
 pub const LogoutResult = struct {
     session_deleted: bool = false,
     local_durability_failed: bool = false,
     remote_revocation_failed: bool = false,
+    /// The unconfirmed revocation's tokens are kept, and lia revokes them later.
+    retry_kept: bool = false,
 };
 
 pub const Team = struct {
@@ -340,6 +349,20 @@ pub const SignInRuntime = struct {
         transport: oauth_transport.Provider,
     ) !bool {
         return self.startPreparedWithMode(alloc, null, .{ .oauth_transport = transport }, false);
+    }
+
+    /// `start` for a host with no team picker: the new login is saved with
+    /// no team, not the saved or retired login's, and the host chooses one
+    /// from `TeamSelection.teams`.
+    pub fn startWithoutTeam(
+        self: *Self,
+        alloc: Allocator,
+        transport: oauth_transport.Provider,
+    ) !bool {
+        return self.startPreparedWithMode(alloc, null, .{
+            .oauth_transport = transport,
+            .complete = completeSignInWithoutTeam,
+        }, false);
     }
 
     /// Returns true once after the worker publishes a device code.
@@ -700,6 +723,9 @@ fn prepareLogin(
     };
 }
 
+/// Saves the new login on the team of the saved or retired login, when the
+/// account still has it, so the team picker selects it and closing the
+/// picker keeps it.
 fn completeSignIn(
     _: ?*anyopaque,
     alloc: Allocator,
@@ -708,10 +734,38 @@ fn completeSignIn(
     client_id: []const u8,
     token: *oauth.TokenSet,
 ) !SignInCompletion {
+    return completeSignInOn(alloc, transport, issuer_url, client_id, token, .known);
+}
+
+/// Saves the new login with no team; the caller chooses one from
+/// `TeamSelection.teams`.
+fn completeSignInWithoutTeam(
+    _: ?*anyopaque,
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    issuer_url: []const u8,
+    client_id: []const u8,
+    token: *oauth.TokenSet,
+) !SignInCompletion {
+    return completeSignInOn(alloc, transport, issuer_url, client_id, token, .none);
+}
+
+fn completeSignInOn(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    issuer_url: []const u8,
+    client_id: []const u8,
+    token: *oauth.TokenSet,
+    starting_team: enum { known, none },
+) !SignInCompletion {
     var teams = fetchTeams(alloc, transport, token.access_token, issuer_url) catch std.ArrayList(Team).empty;
     errdefer freeTeams(alloc, &teams);
     const now_ms = io_mod.milliTimestamp();
-    const session = try take_login_session(alloc, issuer_url, client_id, token, null, now_ms);
+    const team = switch (starting_team) {
+        .known => savedLoginTeam(alloc, teams.items),
+        .none => null,
+    };
+    const session = try take_login_session(alloc, issuer_url, client_id, token, team, now_ms);
     return .{ .vercel = .{
         .session = session,
         .teams = teams,
@@ -760,7 +814,8 @@ pub fn runLogin(
 
     var teams = fetchTeams(alloc, transport, token.access_token, prepared.metadata.issuer) catch std.ArrayList(Team).empty;
     defer freeTeams(alloc, &teams);
-    const selected_team_index = try selectTeam(alloc, teams.items, null);
+    const saved_team = savedLoginTeam(alloc, teams.items);
+    const selected_team_index = try selectTeam(alloc, teams.items, if (saved_team) |team| team.id else null);
     const selected_team = if (selected_team_index) |index| &teams.items[index] else null;
 
     const now_ms = io_mod.milliTimestamp();
@@ -778,6 +833,51 @@ pub fn runLogin(
         debug_trace.logf("auth", "sign-in session save failed err={s}", .{@errorName(err)});
         return signInPersistenceError(err);
     };
+}
+
+/// The team a new lia login starts on, so signing in again keeps the person's
+/// team instead of the first team of the list: the saved login's team, else
+/// the team lia kept when it retired the last login (`oauth_session.loadKeptTeam`),
+/// when the new account's list has it. Null means the first team; the trace
+/// says why, without naming the team.
+fn savedLoginTeam(alloc: Allocator, teams: []const Team) ?*const Team {
+    if (teams.len == 0) return null;
+    var saved = oauth_session.load(alloc) catch |err| blk: {
+        debug_trace.logf("auth", "saved login not read for the team choice err={s}", .{@errorName(err)});
+        break :blk null;
+    };
+    defer if (saved) |*session| session.deinit(alloc);
+    if (saved) |session| {
+        if (session.team_id != null or session.team_slug != null) {
+            return startingTeam(teams, session.team_id, session.team_slug, "saved_login");
+        }
+    }
+    var kept = oauth_session.loadKeptTeam(alloc) orelse {
+        debug_trace.logf("auth", "sign-in starts on the first team reason=no_known_team", .{});
+        return null;
+    };
+    defer kept.deinit(alloc);
+    return startingTeam(teams, kept.id, kept.slug, "kept_team");
+}
+
+fn startingTeam(teams: []const Team, id: ?[]const u8, slug: ?[]const u8, comptime source: []const u8) ?*const Team {
+    const team = teamIn(teams, id, slug) orelse {
+        debug_trace.logf("auth", "sign-in starts on the first team reason=" ++ source ++ "_not_in_list", .{});
+        return null;
+    };
+    debug_trace.logf("auth", "sign-in starts on a known team source=" ++ source, .{});
+    return team;
+}
+
+/// The team in `teams` with the id `id`, else with the slug `slug`.
+fn teamIn(teams: []const Team, id: ?[]const u8, slug: ?[]const u8) ?*const Team {
+    if (id) |value| for (teams) |*team| {
+        if (std.mem.eql(u8, team.id, value)) return team;
+    };
+    if (slug) |value| for (teams) |*team| {
+        if (std.mem.eql(u8, team.slug, value)) return team;
+    };
+    return null;
 }
 
 fn take_login_session(
@@ -877,14 +977,20 @@ fn sameCredentialState(left: oauth_session.Session, right: oauth_session.Session
 pub fn logout(
     alloc: Allocator,
     transport: oauth_transport.Provider,
+    before_revocation: ?oauth.BeforeRevocation,
 ) !LogoutResult {
     var local = try logoutLocally(alloc);
     defer if (local.session) |*session| session.deinit(alloc);
     var result = local.result;
     if (local.session) |session| {
-        revokeLoggedOutSession(alloc, transport, session) catch {
+        if (before_revocation) |notice| notice.run(notice.context);
+        revokeLoggedOutSession(alloc, transport, session) catch |err| {
             result.remote_revocation_failed = true;
+            result.retry_kept = local.kept and pending_revocation.retryable(err);
+            if (local.kept and !result.retry_kept) pending_revocation.forget(alloc, .lia_login, session.refresh_token);
+            return result;
         };
+        if (local.kept) pending_revocation.forget(alloc, .lia_login, session.refresh_token);
     }
     return result;
 }
@@ -944,6 +1050,9 @@ pub const LocalLogout = struct {
     /// Owned by the caller when set; release it with `Session.deinit` using
     /// the allocator passed to `logoutLocally`.
     session: ?oauth_session.Session = null,
+    /// Whether `session`'s tokens are kept to revoke later
+    /// (`pending_revocation`). Forget them once the revocation is confirmed.
+    kept: bool = false,
 };
 
 /// Deletes the saved lia login session without contacting the issuer. Revoke
@@ -951,6 +1060,7 @@ pub const LocalLogout = struct {
 pub fn logoutLocally(alloc: Allocator) LogoutError!LocalLogout {
     var session: ?oauth_session.Session = null;
     var session_load_failed = false;
+    var kept = false;
     const delete_result = blk: {
         var mutation = (oauth_session.beginExistingMutation() catch {
             return LogoutError.SessionDeleteFailed;
@@ -963,10 +1073,25 @@ pub fn logoutLocally(alloc: Allocator) LogoutError!LocalLogout {
                 break :load null;
             },
         };
-        break :blk mutation.delete(alloc) catch oauth_session.DeleteResult{
+        // Kept before the login is deleted, so a revocation that never
+        // completes still leaves the tokens for a later retry.
+        if (session) |loaded| kept = pending_revocation.keep(alloc, .lia_login, keptTokens(loaded));
+        const deleted = mutation.delete(alloc) catch oauth_session.DeleteResult{
             .local_cleanup_failed = true,
         };
+        // Signing out forgets the team lia kept for the next sign-in.
+        if (mutation.forgetTeam()) |forgotten| {
+            if (forgotten) debug_trace.logf("auth", "kept team forgotten reason=logout", .{});
+        } else |err| {
+            debug_trace.logf("auth", "kept team not forgotten err={s}", .{@errorName(err)});
+        }
+        break :blk deleted;
     };
+    if (kept and !delete_result.session_deleted) {
+        // The login is still saved, so its tokens must not be revoked later.
+        pending_revocation.forget(alloc, .lia_login, session.?.refresh_token);
+        kept = false;
+    }
     return .{
         .result = .{
             .session_deleted = delete_result.session_deleted,
@@ -974,7 +1099,33 @@ pub fn logoutLocally(alloc: Allocator) LogoutError!LocalLogout {
             .remote_revocation_failed = session_load_failed,
         },
         .session = session,
+        .kept = kept,
     };
+}
+
+fn keptTokens(session: oauth_session.Session) pending_revocation.Tokens {
+    return .{
+        .refresh_token = session.refresh_token,
+        .access_token = session.access_token,
+        .issuer = session.issuer,
+        .client_id = session.client_id,
+    };
+}
+
+/// Revokes the lia login sign-outs that earlier logouts kept because the
+/// issuer did not confirm them (`pending_revocation.retry`).
+pub fn retryKeptSignOuts(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    before_revocation: ?oauth.BeforeRevocation,
+) pending_revocation.RetryOutcome {
+    return pending_revocation.retry(alloc, .lia_login, .{ .context = &transport, .run = revokeKept }, before_revocation);
+}
+
+fn revokeKept(context: *const anyopaque, alloc: Allocator, tokens: pending_revocation.Tokens) anyerror!void {
+    const transport: *const oauth_transport.Provider = @ptrCast(@alignCast(context));
+    if (tokens.access_token.len == 0 or tokens.issuer.len == 0 or tokens.client_id.len == 0) return error.KeptSignOutUnusable;
+    return revokeTokens(alloc, transport.*, tokens.issuer, tokens.client_id, tokens.refresh_token, tokens.access_token);
 }
 
 /// Revokes a signed-out session's refresh and access tokens at its issuer.
@@ -983,24 +1134,35 @@ pub fn revokeLoggedOutSession(
     transport: oauth_transport.Provider,
     session: oauth_session.Session,
 ) !void {
-    var metadata = try oauth.discover(alloc, transport, session.issuer);
+    return revokeTokens(alloc, transport, session.issuer, session.client_id, session.refresh_token, session.access_token);
+}
+
+fn revokeTokens(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    issuer: []const u8,
+    client_id: []const u8,
+    refresh_token: []const u8,
+    access_token: []const u8,
+) !void {
+    var metadata = try oauth.discover(alloc, transport, issuer);
     defer metadata.deinit(alloc);
     const endpoint = metadata.revocation_endpoint orelse return error.RevocationEndpointMissing;
-    try oauth_session.validateE2EEndpoint(session.issuer, endpoint);
+    try oauth_session.validateE2EEndpoint(issuer, endpoint);
     const refresh_result = oauth.revokeToken(
         alloc,
         transport,
         endpoint,
-        session.client_id,
-        session.refresh_token,
+        client_id,
+        refresh_token,
         .refresh_token,
     );
     const access_result = oauth.revokeToken(
         alloc,
         transport,
         endpoint,
-        session.client_id,
-        session.access_token,
+        client_id,
+        access_token,
         .access_token,
     );
     try refresh_result;
@@ -1311,8 +1473,17 @@ fn parseTeams(alloc: Allocator, bytes: []const u8) !std.ArrayList(Team) {
         const id = entry.object.get("id") orelse continue;
         const slug = entry.object.get("slug") orelse continue;
         if (id != .string or slug != .string) continue;
+        // lia sends the id or the slug as the team and saves the slug, so a
+        // team whose id or slug it could not send is left out.
+        if (!types.validGatewayTeam(id.string) or !types.validGatewayTeam(slug.string)) {
+            debug_trace.logf("auth", "team list entry skipped reason=invalid_team_id_or_slug", .{});
+            continue;
+        }
+        // The picker and the team notices show the name, so a name that
+        // would not draw as it is shows as the slug.
         const name_value = entry.object.get("name");
-        const name = if (name_value != null and name_value.? == .string and name_value.?.string.len > 0)
+        const name = if (name_value != null and name_value.? == .string and name_value.?.string.len > 0 and
+            text_utils.isTerminalSafe(name_value.?.string))
             name_value.?.string
         else
             slug.string;
@@ -1329,9 +1500,10 @@ fn selectTeam(alloc: Allocator, teams: []const Team, current: ?[]const u8) !?usi
     if (teams.len == 0) return null;
     if (teams.len == 1) return 0;
 
-    const default_index = defaultTeamIndex(teams, current);
+    const current_index = currentTeamIndex(teams, current);
+    const default_index = current_index orelse 0;
     const index = if (canUseInteractiveTeamPicker())
-        selectTeamInteractive(alloc, teams, default_index) catch |err| switch (err) {
+        selectTeamInteractive(alloc, teams, default_index, current_index) catch |err| switch (err) {
             error.NotATerminal => try selectTeamByLine(alloc, teams, default_index),
             else => return err,
         }
@@ -1340,12 +1512,12 @@ fn selectTeam(alloc: Allocator, teams: []const Team, current: ?[]const u8) !?usi
     return index;
 }
 
-fn defaultTeamIndex(teams: []const Team, current: ?[]const u8) usize {
-    const needle = current orelse return 0;
+fn currentTeamIndex(teams: []const Team, current: ?[]const u8) ?usize {
+    const needle = current orelse return null;
     for (teams, 0..) |team, i| {
         if (std.mem.eql(u8, team.id, needle) or std.mem.eql(u8, team.slug, needle)) return i;
     }
-    return 0;
+    return null;
 }
 
 fn selectTeamByLine(alloc: Allocator, teams: []const Team, default_index: usize) !usize {
@@ -1371,7 +1543,9 @@ fn selectTeamByLine(alloc: Allocator, teams: []const Team, default_index: usize)
     }
 }
 
-fn selectTeamInteractive(alloc: Allocator, teams: []const Team, default_index: usize) !usize {
+/// `current_index` is the team the login already uses, labeled "(current)";
+/// null when it has none in `teams`.
+fn selectTeamInteractive(alloc: Allocator, teams: []const Team, default_index: usize, current_index: ?usize) !usize {
     var raw = try TeamPickerRawMode.enable();
     defer raw.disable();
 
@@ -1380,17 +1554,17 @@ fn selectTeamInteractive(alloc: Allocator, teams: []const Team, default_index: u
 
     var selected = default_index;
     var first_render = true;
-    try renderTeamPicker(alloc, teams, selected, default_index, &first_render);
+    try renderTeamPicker(alloc, teams, selected, current_index, &first_render);
 
     while (true) {
         switch (try readTeamPickerKey()) {
             .up => {
                 selected = if (selected == 0) teams.len - 1 else selected - 1;
-                try renderTeamPicker(alloc, teams, selected, default_index, &first_render);
+                try renderTeamPicker(alloc, teams, selected, current_index, &first_render);
             },
             .down => {
                 selected = if (selected + 1 == teams.len) 0 else selected + 1;
-                try renderTeamPicker(alloc, teams, selected, default_index, &first_render);
+                try renderTeamPicker(alloc, teams, selected, current_index, &first_render);
             },
             .enter => return selected,
             .cancel => return LoginError.InvalidTeamSelection,
@@ -1411,7 +1585,7 @@ fn renderTeamPicker(
     alloc: Allocator,
     teams: []const Team,
     selected: usize,
-    default_index: usize,
+    current_index: ?usize,
     first_render: *bool,
 ) !void {
     if (!first_render.*) {
@@ -1422,7 +1596,7 @@ fn renderTeamPicker(
 
     for (teams, 0..) |team, i| {
         const prefix = if (i == selected) "  › " else "    ";
-        const marker = if (i == default_index) " (current)" else "";
+        const marker = if (current_index == i) " (current)" else "";
         try writeStdoutFmt("\x1b[2K{s}{d}. {s} ({s}){s}\n", .{ prefix, i + 1, team.name, team.slug, marker });
     }
     first_render.* = false;
@@ -1567,6 +1741,43 @@ fn dupeTeam(alloc: Allocator, source_id: []const u8, source_slug: []const u8, so
         .slug = slug,
         .name = name,
     };
+}
+
+test "parseTeams keeps only teams lia can use, under a name that is safe for the terminal" {
+    const alloc = std.testing.allocator;
+    var teams = try parseTeams(alloc,
+        \\{"teams":[
+        \\{"id":"team_1","slug":"one","name":"One"},
+        \\{"id":"team_2","slug":"\u001b[2Jtwo","name":"Two"},
+        \\{"id":"team 3","slug":"three","name":"Three"},
+        \\{"id":"team_4","slug":"four","name":"\u001b]2;title\u0007Four"},
+        \\{"id":"team_5","slug":"five","name":"\u202eFive"},
+        \\{"id":"team_6","slug":"six","name":"Équipe Café"},
+        \\{"id":"team_7","slug":"seven","name":""}
+        \\]}
+    );
+    defer freeTeams(alloc, &teams);
+    const expected = [_][3][]const u8{
+        .{ "team_1", "one", "One" },
+        .{ "team_4", "four", "four" },
+        .{ "team_5", "five", "five" },
+        .{ "team_6", "six", "Équipe Café" },
+        .{ "team_7", "seven", "seven" },
+    };
+    try std.testing.expectEqual(expected.len, teams.items.len);
+    for (expected, teams.items) |want, team| {
+        try std.testing.expectEqualStrings(want[0], team.id);
+        try std.testing.expectEqualStrings(want[1], team.slug);
+        try std.testing.expectEqualStrings(want[2], team.name);
+    }
+
+    // A list with no usable team is an empty list, as for an account with
+    // no teams.
+    var none = try parseTeams(alloc,
+        \\{"teams":[{"id":"team x","slug":"x","name":"X"},{"id":"team_y","slug":"y\u0007","name":"Y"}]}
+    );
+    defer freeTeams(alloc, &none);
+    try std.testing.expectEqual(@as(usize, 0), none.items.len);
 }
 
 fn check_parse_teams_allocation_failures(alloc: Allocator) !void {
@@ -1770,6 +1981,56 @@ test "login flow parses teams" {
     try std.testing.expectEqualStrings("team_1", teams.items[0].id);
     try std.testing.expectEqualStrings("Vercel Labs", teams.items[0].name);
     try std.testing.expectEqualStrings("personal", teams.items[1].name);
+}
+
+const TeamsTestTransport = struct {
+    fn provider() oauth_transport.Provider {
+        return .{ .context = null, .execute_fn = execute };
+    }
+
+    fn execute(_: ?*anyopaque, alloc: Allocator, _: oauth_transport.Request) !oauth_transport.Response {
+        return .{
+            .disposition = .accepted,
+            .body = try alloc.dupe(u8, "{\"teams\":[{\"id\":\"team_a\",\"slug\":\"team-a\"},{\"id\":\"team_b\",\"slug\":\"team-b\"}]}"),
+        };
+    }
+};
+
+test "a sign-in without a team leaves the retired login's team unsaved" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".lia");
+    var kept = try tmp.dir.createFile(std.testing.io, ".lia/" ++ oauth_session.kept_team_file_name, .{
+        .permissions = std.Io.File.Permissions.fromMode(0o600),
+    });
+    try kept.writeStreamingAll(std.testing.io, "{\"team_id\":\"team_b\",\"team_slug\":\"team-b\"}\n");
+    kept.close(std.testing.io);
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "");
+    defer alloc.free(home);
+    var env = std.process.Environ.Map.init(alloc);
+    defer env.deinit();
+    // The Keychain is keyed by account, not HOME: without this the test reads
+    // the developer's real lia login.
+    try env.put("LIA_DISABLE_KEYCHAIN", "1");
+    try env.put("HOME", home);
+    io_mod.setEnvironMap(&env);
+    defer io_mod.resetEnvironForTest();
+
+    // The kept team is in the list, so `completeSignIn` would start on it.
+    var kept_token = try testTokenSet(alloc);
+    defer kept_token.deinit(alloc);
+    var kept_completion = try completeSignIn(null, alloc, TeamsTestTransport.provider(), "https://vercel.test", "client", &kept_token);
+    defer kept_completion.deinit(alloc);
+    try std.testing.expectEqualStrings("team_b", kept_completion.vercel.session.?.team_id.?);
+
+    var token = try testTokenSet(alloc);
+    defer token.deinit(alloc);
+    var completion = try completeSignInWithoutTeam(null, alloc, TeamsTestTransport.provider(), "https://vercel.test", "client", &token);
+    defer completion.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), completion.vercel.teams.items.len);
+    try std.testing.expectEqual(@as(?[]u8, null), completion.vercel.session.?.team_id);
+    try std.testing.expectEqual(@as(?[]u8, null), completion.vercel.session.?.team_slug);
 }
 
 const ScriptedPollResult = enum {
@@ -2202,16 +2463,12 @@ const WithholdingTokenFixture = struct {
 
     fn deinit(self: *@This()) void {
         if (!self.server_open) return;
-        const zio = self.io();
         self.stopping.store(true, .seq_cst);
         if (self.thread) |thread| {
-            const listener = std.Io.net.Stream{ .socket = self.server.socket };
-            listener.shutdown(zio, .both) catch {};
-            self.wakeAccept();
             thread.join();
             self.thread = null;
         }
-        self.server.deinit(zio);
+        self.server.deinit(self.io());
         self.server_open = false;
     }
 
@@ -2225,26 +2482,15 @@ const WithholdingTokenFixture = struct {
         return self.io_backend.io();
     }
 
-    fn wakeAccept(self: *@This()) void {
-        var wake_backend: std.Io.Threaded = .init_single_threaded;
-        const zio = wake_backend.io();
-        const address = std.Io.net.IpAddress{
-            .ip4 = .loopback(self.server.socket.address.getPort()),
-        };
-        var stream = address.connect(zio, .{ .mode = .stream }) catch return;
-        stream.close(zio);
-    }
-
     fn run(self: *@This()) void {
         self.runFallible() catch |err| {
-            if (self.stopping.load(.seq_cst) and err == error.SocketNotListening) return;
             self.failure = err;
         };
     }
 
     fn runFallible(self: *@This()) !void {
         const zio = self.io();
-        var stream = try self.server.accept(zio);
+        var stream = (try testing_listener.acceptUnlessStopping(&self.server, zio, &self.stopping)) orelse return;
         defer stream.close(zio);
         if (self.stopping.load(.seq_cst)) return;
         self.accepted.store(true, .seq_cst);

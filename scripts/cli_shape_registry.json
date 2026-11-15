@@ -113,6 +113,10 @@
       "job": "test",
       "stability": "internal"
     },
+    "LIA_TEST_DOCTOR_DEADLINE_MS": {
+      "job": "test",
+      "stability": "internal"
+    },
     "LIA_TEST_FAIL_ON_DURABLE_MUTATION": {
       "job": "test",
       "stability": "internal"
@@ -141,7 +145,19 @@
       "job": "test",
       "stability": "internal"
     },
+    "LIA_TEST_SESSION_WRITE_HELD": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "LIA_TEST_SESSION_WRITE_RELEASE": {
+      "job": "test",
+      "stability": "internal"
+    },
     "LIA_TEST_SHELL_PARITY_ALL_SHELLS": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "LIA_TEST_SHELL_QUIET_NOTICE_MS": {
       "job": "test",
       "stability": "internal"
     },
@@ -154,6 +170,30 @@
       "stability": "internal"
     },
     "LIA_TEST_SNAPSHOT_MARKER": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "LIA_TEST_STEER_YIELD_GRACE_MS": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "LIA_TEST_SUBAGENT_END_HELD": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "LIA_TEST_SUBAGENT_END_RELEASE": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "LIA_TEST_SUBAGENT_START_HELD": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "LIA_TEST_SUBAGENT_START_RELEASE": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "LIA_TEST_SUBAGENT_START_WAIT_MS": {
       "job": "test",
       "stability": "internal"
     },
@@ -217,11 +257,13 @@
   "not_env": {
     "LIA_AI_GATEWAY_API_KEY": "Keychain service name for the AI Gateway API key, not an env var",
     "LIA_MCP_OAUTH_CREDENTIALS_V3": "Keychain service name for MCP OAuth credentials, not an env var",
+    "LIA_OAUTH_PENDING_REVOCATIONS_V1": "Keychain service name for the lia login's kept sign-outs, not an env var",
     "LIA_OAUTH_SESSION_V1": "Keychain service name for the lia OAuth session, not an env var",
     "LIA_PARITY_LOG": "Set for the fake shell in a unit test; lia never reads it",
     "LIA_TEST_AI_GATEWAY_API_KEY": "Keychain service name used by keychain tests, not an env var"
   },
   "external_env": [
+    "CMUX_WORKSPACE_ID",
     "COLUMNS",
     "COMSPEC",
     "DISPLAY",
@@ -229,11 +271,15 @@
     "GIT_CONFIG_NOSYSTEM",
     "GIT_CONFIG_SYSTEM",
     "HOME",
+    "LANG",
     "NO_COLOR",
+    "PATH",
     "SHELL",
     "SSH_CONNECTION",
     "TERM",
+    "TERM_PROGRAM",
     "TMPDIR",
+    "TMUX",
     "TYPESAFE_API_KEY",
     "TYPESAFE_BASE_URL",
     "USER",
@@ -293,6 +339,7 @@
   "exceptions": {},
   "hand_parsed_files": {
     "src/builtins/skills.zig": "Reads a pasted npx skills add command line, another program's flags.",
+    "src/core/app/trace_report.zig": "Reads the -c lia passes to the user's shell, to show the shell invocation in a trace report.",
     "src/core/shell_command/command_classification.zig": "Classifies shell commands the agent runs, another program's flags.",
     "src/core/shell_command/command_effect.zig": "Reads the flags of git and other commands the agent runs.",
     "src/core/shell_command/command_lex.zig": "Reads the flags of timeout, env, and other wrapper commands the agent runs.",

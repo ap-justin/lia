@@ -39,4 +39,14 @@ TurnStream stream-witness-recovery NeverCommittedAfterRecovery
 TurnStream stream-witness-missed-path MissedPathsNeverParse
 TurnStream stream-simulate simulate $sim
 TurnStream stream-simulate-before simulate $sim
+SessionWrite session-write -
+SessionWrite session-write-today NoStaleRemoval
+SessionWrite session-write-today-loss ClearedWereListed
+SessionWrite session-write-today-twice ListedOnce
+SessionWrite session-write-mutant-unlock-after-take NoStaleRemoval
+SessionWrite session-write-mutant-clear-all ClearedWereListed
+SessionWrite session-write-mutant-clear-on-failure ClearedWereListed
+SessionWrite session-write-witness-added-during-write NeverAddedDuringWrite
+SessionWrite session-write-witness-waits NeverWaitsBehindDue
+SessionWrite session-write-witness-relisted NeverRelistedAfterFailure
 EOF

@@ -47,6 +47,9 @@ pub const StartupState = struct {
     max_tool_result_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
     auto_compact_percent: u8 = compactor.default_percent,
     context_limits: config_runtime.context_limits.Values = .{},
+    /// Where built-in tools are offered, from the settings files; a host
+    /// applies `--tool-placement` over it.
+    tool_placement: config_runtime.tool_placement.Overrides = .{},
     context_enabled: bool = true,
     fast_mode: bool = false,
     ultrafast_mode: bool = false,
@@ -70,6 +73,9 @@ pub const StartupState = struct {
     session_title_generation: bool = true,
     /// Resolved `cache_warming` preference.
     cache_warming: bool = true,
+    /// The `cache_warming` setting as written, null when no settings file
+    /// names it. ACP keeps warming off unless this turns it on.
+    cache_warming_setting: ?bool = null,
     notification_turn_end: bool = false,
     notification_attention_required: bool = false,
     notification_max: bool = false,
@@ -225,7 +231,7 @@ pub const ModelOrigin = enum {
         };
     }
 
-    fn of(settings: *const config_runtime.Settings, provider: model_provider.ProviderId, env_model: ?[]const u8) ModelOrigin {
+    pub fn of(settings: *const config_runtime.Settings, provider: model_provider.ProviderId, env_model: ?[]const u8) ModelOrigin {
         if (env_model != null) return .env;
         return if (settings.models.get(provider) != null) .settings else .default;
     }
@@ -636,6 +642,7 @@ pub fn resolveSettings(alloc: Allocator, state: *StartupState, detailed: *const 
     state.max_tool_result_bytes = tool_result_limits.resolveMaxToolResultBytes(settings.max_tool_result_bytes, tool_result_limits.default_max_tool_result_bytes);
     state.auto_compact_percent = compactor.resolvePercent(settings.auto_compact_percent, io_mod.getenv("LIA_AUTO_COMPACT_PERCENT"));
     state.context_limits = config_runtime.resolveContextLimits(settings, &.{});
+    state.tool_placement = settings.tool_placement;
     state.context_enabled = settings.context orelse true;
     const fast_mode = resolveStartupFastMode(
         state.model_source,
@@ -671,6 +678,7 @@ pub fn resolveSettings(alloc: Allocator, state: *StartupState, detailed: *const 
     }
     state.session_title_generation = settings.session_titles orelse true;
     state.cache_warming = settings.cache_warming orelse true;
+    state.cache_warming_setting = settings.cache_warming;
     const sound_override = soundEnvOverride();
     const sound_on_override: ?bool = if (sound_override) |level| level != .off else null;
     const max_override: ?bool = if (sound_override) |level| level == .max else null;

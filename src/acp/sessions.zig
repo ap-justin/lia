@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const io_mod = @import("../core/shared/io.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const agent_frame = @import("../core/shared/agent_frame.zig");
+const recovery_prompt = @import("../core/shared/recovery_prompt.zig");
 const mem_utils = @import("../core/shared/mem_utils.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
 const jsonrpc = @import("jsonrpc.zig");
@@ -197,7 +198,7 @@ fn startV2Session(
             .provider = state.provider,
             .model = if (picked_model) |model| model.configured else state.configured_model,
             .effort = state.effort,
-            .fast_mode = state.fast_mode,
+            .fast_mode = if (picked_model) |model| model.fast_mode else state.fast_mode,
             .ultrafast_mode = state.configured_ultrafast_mode,
         },
         .language = session_runtime.ConversationLanguage.default(),
@@ -231,8 +232,8 @@ fn startV2Session(
         .v2 = v2,
         .model = model_copy,
         .provider = state.provider,
-        .fast_mode = state.fast_mode,
-        .ultrafast_mode = state.ultrafast_mode,
+        .fast_mode = if (picked_model) |model| model.fast_mode else state.fast_mode,
+        .ultrafast_mode = if (picked_model) |model| model.ultrafast_mode else state.ultrafast_mode,
         .effort = state.effort,
         .session_rt = session_rt,
         .mcp_host = session_host,
@@ -1256,6 +1257,11 @@ fn sendExecutionHistory(
                     debug_trace.logf("acp", "event=history_steering_skipped reason=subagent_frame bytes={d}", .{text.len});
                     continue;
                 }
+                // Nor is lia's own prompt to a stalled turn.
+                if (recovery_prompt.fromSaved(text) != null) {
+                    debug_trace.logf("acp", "event=history_steering_skipped reason=recovery_prompt bytes={d}", .{text.len});
+                    continue;
+                }
                 try sendSteeringHistoryChunk(state, alloc, session_id, text);
             },
             .tool_call => |call| try sendHistoryToolCall(state, alloc, session_id, call),
@@ -1327,17 +1333,19 @@ fn planToolCallFrame(
         call,
         saved,
     );
-    const name = tool_call_presentation.acpToolName(call.name);
+    // A toolbox run replays as the tool it ran, as it was shown live.
+    const shown = try tool_call_presentation.shownCall(arena, call);
+    const name = tool_call_presentation.acpToolName(shown.name);
     // MCP identity comes from the live catalog, or from the identity recorded
     // when the session made the call; it is never guessed from the exposed
     // name.
-    const mcp_identity = if (registry.lookup(call.name) == null)
-        (if (session_host) |h| h.catalog.toolIdentity(arena, call.name) catch null else null) orelse
-            if (identities) |record| try record.lookup(arena, call.name) else null
+    const mcp_identity = if (registry.lookup(shown.name) == null)
+        (if (session_host) |h| h.catalog.toolIdentity(arena, shown.name) catch null else null) orelse
+            if (identities) |record| try record.lookup(arena, shown.name) else null
     else
         null;
-    const presentation = tool_call_presentation.describeToolCall(registry, arena, call, mcp_identity);
-    const masked_arguments = try agent_execution_memory.redactToolArgumentsJson(arena, call.name, call.arguments_json);
+    const presentation = tool_call_presentation.describeToolCall(registry, arena, shown, mcp_identity);
+    const masked_arguments = try agent_execution_memory.redactToolArgumentsJson(arena, shown.name, shown.arguments_json);
     // Parsed with the arena and returned in the frame; no deinit, the caller's
     // arena frees it in bulk.
     const parsed: ?std.json.Parsed(std.json.Value) = std.json.parseFromSlice(
@@ -3120,6 +3128,53 @@ test "session/new during a turn, after a sign-in, ends the turn and adopts the s
         try std.testing.expect(result.get("sessionId").? == .string);
     }
     try std.testing.expectEqual(@as(usize, 1), answers);
+}
+
+test "a sign-in adopted after a signed-out initialize starts the Token Pass check" {
+    const token_pass = @import("../core/gateway/token_pass.zig");
+    const token_pass_check = @import("../core/app/token_pass_check.zig");
+    const token_pass_memory = @import("../core/gateway/token_pass_memory.zig");
+    const token_pass_team = @import("../core/gateway/token_pass_team.zig");
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.lia");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_path);
+    const workspace_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_path);
+    const test_home = try AcpSessionTestHome.install(alloc, home_path);
+    defer test_home.deinit();
+    try test_home.map.put("LIA_DISABLE_KEYCHAIN", "1");
+    // A saved answer, so the check takes it without waiting on the credits call.
+    const named = token_pass_check.name(alloc, .ai_gateway_api_key, "gateway-token", null, null).?;
+    try token_pass_memory.save(alloc, home_path, &named.saved_as.?, .has_pass);
+    defer token_pass_team.publishAnswer(null, false);
+    var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-output.jsonl", .{ .read = true });
+    defer capture.close(io_mod.getIo());
+
+    var state = try initAcpSessionTestState(arena, workspace_path, capture);
+    defer state.deinit();
+    state.initialized = true;
+    state.cfg.home_override = home_path;
+    state.cfg.provider_set.gateway.credits = null;
+    // What a signed-out `initialize` leaves: no credential, the profile's
+    // model and speeds, and the check not started.
+    state.provider = .gateway;
+    state.credential_source = null;
+    state.cfg.credential_override = "gateway-token";
+    state.auth_pending = true;
+    state.token_pass_model_source = .compiled_default;
+    state.fast_mode = true;
+
+    try std.testing.expectEqual(server.PendingAuth.adopted, try server.refreshPendingAuth(&state));
+    try std.testing.expect(state.token_pass_run != null);
+    try std.testing.expectEqualStrings(token_pass.default_model, state.selected_model);
+    try std.testing.expect(!state.fast_mode);
 }
 
 test "initialize succeeds when HOME does not exist and says why sign-in cannot be saved" {

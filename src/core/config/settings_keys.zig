@@ -55,8 +55,9 @@ pub const Key = struct {
     children: []const []const u8 = &.{},
     /// What each of `children` does, in the same order.
     child_descriptions: []const []const u8 = &.{},
-    /// The strings lia accepts for a string key with a fixed set. lia ignores
-    /// case; the schema lists the spellings lia writes and documents.
+    /// The strings lia accepts for a string key, or for each value of a string
+    /// map, with a fixed set. lia ignores case; the schema lists the spellings
+    /// lia writes and documents.
     values: []const []const u8 = &.{},
     /// Inclusive bounds of an integer key.
     minimum: ?i64 = null,
@@ -144,6 +145,7 @@ pub const keys = [_]Key{
     .{ .name = "statusLine", .where = .retired, .kind = .any, .description = retired_description },
     .{ .name = "status_line", .where = .retired, .kind = .any, .description = retired_description },
     .{ .name = "theme", .where = .profile, .kind = .string, .description = "light, dark, or the name of a theme file in ~/.lia/themes" },
+    .{ .name = "tool_placement", .where = .profile, .kind = .string_map, .map = true, .values = &.{ "direct", "toolbox" }, .description = "Where each built-in tool is offered: \"direct\" sends it with the tools, \"toolbox\" lists it in the toolbox menu" },
     .{ .name = "ultrafast_mode", .where = .profile, .kind = .boolean, .description = "Request the higher-priced Ultrafast tier for an eligible AI Gateway model" },
     .{ .name = "update_channel", .where = .retired, .kind = .any, .description = retired_description },
     .{ .name = "web_fetch_worker_model", .where = .retired, .kind = .any, .description = retired_description },
@@ -346,7 +348,7 @@ test "every key says what it holds and what it does" {
         try std.testing.expectEqual(key.children.len > 0, key.kind == .switches);
         try std.testing.expectEqual(key.where == .retired, key.kind == .any);
         try std.testing.expect(!(key.workspace_only and key.top_level_only));
-        if (key.values.len > 0) try std.testing.expectEqual(Kind.string, key.kind);
+        if (key.values.len > 0) try std.testing.expect(key.kind == .string or key.kind == .string_map);
         if (key.minimum != null or key.maximum != null) try std.testing.expectEqual(Kind.integer, key.kind);
         if (key.max_items != null) try std.testing.expect(key.kind == .strings or key.kind == .strings_or_auto);
         if (key.superseded_by) |path| {

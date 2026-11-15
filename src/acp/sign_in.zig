@@ -11,6 +11,7 @@ const credentials = @import("../core/auth/credentials.zig");
 const login_flow = @import("../core/auth/login_flow.zig");
 const oauth_session = @import("../core/auth/oauth_session.zig");
 const config_runtime = @import("../core/config/config_runtime.zig");
+const token_pass = @import("../core/gateway/token_pass.zig");
 const provider_activation = @import("../core/cli/provider_activation.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const io_mod = @import("../core/shared/io.zig");
@@ -129,7 +130,7 @@ pub const Job = struct {
     fn newSignIn(self: *Job) Outcome {
         var runtime: login_flow.SignInRuntime = .{};
         defer runtime.deinit(self.alloc());
-        const started = runtime.start(self.alloc(), self.state.cfg.gateway_provider.oauth_transport) catch |err| return .{ .failed = err };
+        const started = runtime.startWithoutTeam(self.alloc(), self.state.cfg.gateway_provider.oauth_transport) catch |err| return .{ .failed = err };
         if (!started) return .{ .failed = error.SignInAlreadyRunning };
         while (true) {
             if (runtime.takeBrowserPending() and !self.stop.load(.seq_cst)) self.announce(runtime.snapshot());
@@ -154,7 +155,7 @@ pub const Job = struct {
     /// without asking. With several, the session keeps none until `lia teams`.
     fn complete(self: *Job, selection: *const login_flow.TeamSelection) Outcome {
         switch (selection.teams.items.len) {
-            // `completeSignIn` reads a failed team request as no teams.
+            // The sign-in reads a failed team request as no teams.
             0 => return .{ .failed = error.NoTeams },
             1 => {
                 var team = selection.select(self.alloc(), 0) catch |err| {
@@ -381,11 +382,17 @@ fn rememberSwitchRoot(state: *ServerState, root: []const u8) void {
     state.sign_in_root = owned;
 }
 
-/// The connection's next model, picked for a session's folder; both copies
-/// owned by `state.alloc` until `sessionActivated` takes them.
+/// The connection's next model and speeds, picked for a session's folder;
+/// both model copies owned by `state.alloc` until `sessionActivated` takes
+/// them.
 pub const SessionModel = struct {
     selected: []u8,
     configured: []u8,
+    fast_mode: bool,
+    ultrafast_mode: bool,
+    /// The folder chose its own model, so new sessions stop following the
+    /// Token Pass start (`ServerState.token_pass_start`).
+    ends_token_pass_start: bool = false,
 
     pub fn deinit(self: SessionModel, alloc: Allocator) void {
         alloc.free(self.selected);
@@ -398,13 +405,45 @@ pub const SessionModel = struct {
 /// of the folder it started in, which for ACP v1 is where lia was launched,
 /// since `cwd` arrives only with the session. When the session's folder is
 /// another one, picks the model again from that folder's settings, on top of
-/// what the switch saved. Null keeps the connection's model: no sign-in
-/// switched the profile since the last session, its folder is this one, the
-/// model is fixed for the process, or the pick is the current model.
+/// what the switch saved. While new sessions follow the Token Pass start, a
+/// folder's own model takes the profile's speeds back. Null keeps the
+/// connection's model: no sign-in switched the profile since the last
+/// session, its folder is this one, the model is fixed for the process, the
+/// pick is the current model, or the folder chose no model of its own while
+/// new sessions follow the Token Pass start.
 pub fn modelForSession(state: *const ServerState, workspace_root: []const u8) ?SessionModel {
     const switched_root = state.sign_in_root orelse return null;
     if (std.mem.eql(u8, switched_root, workspace_root)) return null;
     if (state.provider != .gateway or state.process_model_override) return null;
+    const selected = folderModel(state, workspace_root) orelse return null;
+    var picked: SessionModel = .{
+        .selected = selected,
+        .configured = &.{},
+        .fast_mode = state.fast_mode,
+        .ultrafast_mode = state.ultrafast_mode,
+    };
+    if (state.token_pass_start) |profile| {
+        if (!choosesOwnModel(state, switched_root, selected)) {
+            state.alloc.free(selected);
+            return null;
+        }
+        picked.fast_mode = profile.fast_mode;
+        picked.ultrafast_mode = profile.ultrafast_mode;
+        picked.ends_token_pass_start = true;
+    } else if (std.mem.eql(u8, selected, state.selected_model)) {
+        state.alloc.free(selected);
+        return null;
+    }
+    picked.configured = state.alloc.dupe(u8, selected) catch {
+        state.alloc.free(selected);
+        return null;
+    };
+    return picked;
+}
+
+/// The Gateway model the settings of `workspace_root` pick, owned by
+/// `state.alloc`; null when they cannot be read.
+fn folderModel(state: *const ServerState, workspace_root: []const u8) ?[]u8 {
     var settings = (if (state.cfg.home_override) |home|
         config_runtime.loadMergedSettingsFromHome(state.alloc, home, workspace_root)
     else
@@ -414,18 +453,22 @@ pub fn modelForSession(state: *const ServerState, workspace_root: []const u8) ?S
     };
     defer settings.deinit(state.alloc);
     const selection = config_runtime.selectProviderModel(state.cfg.default_model, &settings, .gateway, null) catch return null;
-    if (std.mem.eql(u8, selection.model, state.selected_model)) return null;
-    const selected = state.alloc.dupe(u8, selection.model) catch return null;
-    const configured = state.alloc.dupe(u8, selection.model) catch {
-        state.alloc.free(selected);
-        return null;
-    };
-    return .{ .selected = selected, .configured = configured };
+    return state.alloc.dupe(u8, selection.model) catch null;
+}
+
+/// Whether `model`, a folder's pick, is that folder's own: neither start
+/// model, nor the sign-in folder's pick, which is the model the profile
+/// switch saved for every folder.
+fn choosesOwnModel(state: *const ServerState, switched_root: []const u8, model: []const u8) bool {
+    if (token_pass.isStartModel(model, state.cfg.default_model)) return false;
+    const switched = folderModel(state, switched_root) orelse return true;
+    defer state.alloc.free(switched);
+    return !std.mem.eql(u8, model, switched);
 }
 
 /// Called once a session is active, after the previous one's turn is
 /// reaped: the sign-in's folder is spent, and `picked`, from
-/// `modelForSession`, becomes the connection's model.
+/// `modelForSession`, becomes the connection's model and speeds.
 pub fn sessionActivated(state: *ServerState, picked: ?SessionModel) void {
     if (state.sign_in_root) |root| state.alloc.free(root);
     state.sign_in_root = null;
@@ -434,6 +477,9 @@ pub fn sessionActivated(state: *ServerState, picked: ?SessionModel) void {
     if (state.configured_model.len > 0) state.alloc.free(state.configured_model);
     state.selected_model = model.selected;
     state.configured_model = model.configured;
+    state.fast_mode = model.fast_mode;
+    state.ultrafast_mode = model.ultrafast_mode;
+    if (model.ends_token_pass_start) state.token_pass_start = null;
 }
 
 /// Stops the sign-in that would answer `requested` and answers that request
@@ -1240,6 +1286,81 @@ test "a session opened after the sign-in uses its own folder's settings, not the
     try std.testing.expectEqualStrings(workspace_model, state.active_session.?.model);
     try std.testing.expectEqualStrings(workspace_model, state.selected_model);
     try std.testing.expect(state.sign_in_root == null);
+}
+
+test "after a sign-in on a Token Pass team, sessions in another folder start on the Token Pass model at standard speed unless that folder names its own" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
+    const token_pass_team = @import("../core/gateway/token_pass_team.zig");
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |folder_names_model| {
+        token_pass_team.clear();
+        defer token_pass_team.clear();
+        const home = try SignInTestHome.install(alloc, .{});
+        defer home.deinit();
+        try home.tmp.dir.createDirPath(io_mod.getIo(), "project");
+        try home.tmp.dir.createDirPath(io_mod.getIo(), "later");
+        const project = try io_mod.dirRealpathAlloc(alloc, home.tmp.dir, "project");
+        defer alloc.free(project);
+        const later = try io_mod.dirRealpathAlloc(alloc, home.tmp.dir, "later");
+        defer alloc.free(later);
+        if (folder_names_model) {
+            const profile = try alloc.print("{{\"workspaces\":{{\"{s}\":{{\"models\":{{\"gateway\":\"{s}\"}}}}}}}}", .{ project, workspace_model });
+            defer alloc.free(profile);
+            try home.writePrivate(".lia/settings.json", profile, 0o600);
+        }
+        var fake: FakeVercel = .{};
+        var frames: Frames = .{ .alloc = alloc };
+        defer frames.deinit();
+        // Launched in HOME, which names no model: `initialize` left the
+        // builtin default and the profile's speeds, and started no check.
+        var state = try signInTestState(alloc, home, &frames, &fake);
+        defer state.deinit();
+        state.cfg.provider_set = provider_set.gateway_only(.{ .model_catalog = .{ .context = null, .fetch_fn = fetchTwoModels } });
+        state.cfg.allow_acp_mcp = false;
+        state.sessions_v2 = try session_adapter.Store.open(alloc, home.home);
+        state.selected_model = try alloc.dupe(u8, state.cfg.default_model);
+        state.configured_model = try alloc.dupe(u8, state.cfg.default_model);
+        state.token_pass_model_source = .compiled_default;
+        state.fast_mode = true;
+
+        var trap = try StdStreamTrap.begin(home.tmp.dir);
+        defer trap.end();
+        try authenticateForTest(&state, 7);
+        const answer = try frames.waitFor(7);
+        defer answer.deinit();
+        // Reaps the sign-in, which starts the check without waiting.
+        try dispatchForTest(&state, 8, "lia/unknown", "{}");
+        const check_started = state.token_pass_run != null;
+        // The team's answer arrives after the sign-in, as catalog marks.
+        const marked = [_]model_catalog.ModelCatalogEntry{.{
+            .id = @constCast(token_pass.default_model),
+            .model_type = @constCast("language"),
+            .token_pass = true,
+        }};
+        token_pass_team.publishCatalog(&marked);
+        const project_params = try alloc.print("{{\"cwd\":\"{s}\",\"mcpServers\":[]}}", .{project});
+        defer alloc.free(project_params);
+        try dispatchForTest(&state, 9, "session/new", project_params);
+        const first_model = try alloc.dupe(u8, state.active_session.?.model);
+        defer alloc.free(first_model);
+        const first_fast = state.active_session.?.fast_mode;
+        const later_params = try alloc.print("{{\"cwd\":\"{s}\",\"mcpServers\":[]}}", .{later});
+        defer alloc.free(later_params);
+        try dispatchForTest(&state, 10, "session/new", later_params);
+        trap.end();
+
+        try expectSignedIn(answer);
+        try std.testing.expect(check_started);
+        try std.testing.expect(state.sign_in_root == null);
+        // Token Pass credit pays only for standard speed; a folder's own
+        // model runs at the profile's speeds.
+        const expected_model = if (folder_names_model) workspace_model else token_pass.default_model;
+        try std.testing.expectEqualStrings(expected_model, first_model);
+        try std.testing.expectEqual(folder_names_model, first_fast);
+        try std.testing.expectEqualStrings(later, state.active_session.?.workspace_root);
+        try std.testing.expectEqualStrings(expected_model, state.active_session.?.model);
+        try std.testing.expectEqual(folder_names_model, state.active_session.?.fast_mode);
+    }
 }
 
 test "a session/new that fails to create its session leaves the model, the running turn and the sign-in's folder for the next one" {

@@ -204,6 +204,14 @@ fn commandFailure(deps: RunDeps, err: anyerror) BeforeInteractiveResult {
 /// (`types.plainErrorText`). The raw name goes only to the trace.
 fn tryWriteErrorMessage(deps: RunDeps, err: anyerror) void {
     debug_trace.logf("core", "command error err={s}", .{@errorName(err)});
+    const alloc = std.heap.c_allocator;
+    if (config_runtime.configuredProviderMessage(alloc, err) catch null) |message| {
+        defer alloc.free(message);
+        writeStderr(deps, "lia: ");
+        writeStderr(deps, message);
+        writeStderr(deps, "\n");
+        return;
+    }
     var words: [128]u8 = undefined;
     writeStderr(deps, "lia: ");
     writeStderr(deps, config_runtime.modelNotSelectedMessage(err) orelse types.plainErrorText(@errorName(err), &words));

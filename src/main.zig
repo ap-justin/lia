@@ -294,7 +294,7 @@ fn rawEnvValue(raw_env: RawEnviron, comptime key: []const u8) ?[]const u8 {
 }
 
 fn topLevelHelpColumns(raw_env: RawEnviron) usize {
-    if (stdoutTerminalColumns()) |columns| return columns;
+    if (terminal_env.stdoutColumns()) |columns| return columns;
     if (rawEnvValue(raw_env, "COLUMNS")) |value| {
         if (parseColumnCount(value)) |columns| return columns;
     }
@@ -309,26 +309,11 @@ fn topLevelHelpColumns(raw_env: RawEnviron) usize {
 fn topLevelHelpStyle(raw_env: RawEnviron) command_specs.HelpStyle {
     const no_color = terminal_env.noColorValue(rawEnvValue(raw_env, "NO_COLOR"));
     const dumb_terminal = terminal_env.dumbTerminalValue(rawEnvValue(raw_env, "TERM"));
-    return topLevelHelpStyleForValues(stdoutIsTerminal(), no_color, dumb_terminal);
+    return topLevelHelpStyleForValues(terminal_env.stdoutIsTerminal(), no_color, dumb_terminal);
 }
 
 fn topLevelHelpStyleForValues(is_terminal: bool, no_color: bool, dumb_terminal: bool) command_specs.HelpStyle {
     return if (is_terminal and !no_color and !dumb_terminal) .ansi else .plain;
-}
-
-fn stdoutIsTerminal() bool {
-    if (comptime builtin.target.os.tag == .windows or !builtin.link_libc) return false;
-    return std.c.isatty(std.posix.STDOUT_FILENO) != 0;
-}
-
-fn stdoutTerminalColumns() ?usize {
-    if (comptime builtin.target.os.tag == .windows or !builtin.link_libc) return null;
-
-    var ws: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
-    const req: c_int = @intCast(std.c.T.IOCGWINSZ);
-    const rc = std.c.ioctl(std.posix.STDOUT_FILENO, req, &ws);
-    if (rc == -1 or ws.col == 0) return null;
-    return @intCast(ws.col);
 }
 
 fn parseColumnCount(value: []const u8) ?usize {
@@ -801,13 +786,16 @@ test {
     _ = @import("core/config/model_provider.zig");
     _ = @import("core/config/configured_provider.zig");
     _ = @import("gateway/chat_completions_protocol.zig");
-    _ = @import("gateway/json_depth.zig");
+    _ = @import("gateway/function_tools.zig");
+    _ = @import("gateway/anthropic_messages_protocol.zig");
+    _ = @import("gateway/configured_transport.zig");
+    _ = @import("gateway/request_deadlines.zig");
+    _ = @import("gateway/configured_responses.zig");
+    _ = @import("core/shared/json_depth.zig");
     _ = @import("acp/prompt.zig");
     _ = @import("acp/server.zig");
-    _ = @import("acp/sign_in.zig");
     _ = @import("acp/libfx_hooks.zig");
     _ = @import("acp/types.zig");
-    _ = @import("acp/mcp_servers.zig");
     _ = @import("core/mcp_host/model.zig");
     _ = @import("core/agent/agent_runtime.zig");
     _ = @import("core/agent/execution_memory.zig");
@@ -816,11 +804,13 @@ test {
     _ = @import("core/agent/runtime/tool_admission.zig");
     _ = @import("core/agent/runtime/prompt_context.zig");
     _ = @import("core/agent/runtime/runtime_context.zig");
-    _ = auth_runtime;
     _ = @import("core/auth/auth_transition.zig");
     _ = @import("core/workspace/context_contract.zig");
+    _ = @import("core/workspace/subagent_turn_metrics.zig");
     _ = @import("core/workspace/workspace_access.zig");
+    _ = @import("core/workspace/tool_call_metrics.zig");
     _ = @import("core/workspace/workspace_commands.zig");
+    _ = @import("core/app/usage_host.zig");
     _ = @import("core/app/app_entry_runtime.zig");
     _ = @import("core/app/app_lifecycle.zig");
     _ = @import("core/app/app_runtime_setup.zig");
@@ -837,17 +827,21 @@ test {
     _ = @import("core/session/session_title_generation.zig");
     _ = @import("builtins/context.zig");
     _ = @import("builtins/gateway.zig");
+    _ = @import("builtins/gateway/typesafe_permission_reviewer.zig");
     _ = @import("core/shared/debug_trace.zig");
     _ = @import("core/output/diff.zig");
     _ = @import("core/shared/display_width.zig");
     _ = @import("core/shared/gateway_error_format.zig");
     _ = @import("core/shared/history_range.zig");
     _ = @import("core/cli/doctor_runtime.zig");
+    _ = @import("core/cli/doctor_probes.zig");
+    _ = @import("core/cli/doctor_child_status.zig");
     _ = @import("core/auth/login_flow.zig");
     _ = @import("core/auth/provider_catalog.zig");
-    _ = credentials;
+    _ = @import("gateway/responses_protocol.zig");
     _ = @import("core/auth/oauth.zig");
     _ = @import("core/auth/oauth_session.zig");
+    _ = @import("core/auth/pending_revocation.zig");
     _ = @import("core/workspace/file_index.zig");
     _ = @import("core/indexer/indexer.zig");
     _ = @import("core/agents/agents.zig");
@@ -883,6 +877,7 @@ test {
     _ = @import("core/mcp/elicitation_interaction.zig");
     _ = @import("core/config/model_capabilities.zig");
     _ = @import("core/output/output_contracts.zig");
+    _ = @import("core/output/session_list_text.zig");
     _ = @import("core/workspace/pathing.zig");
     _ = @import("core/workspace/current_branch.zig");
     _ = @import("core/permissions/permission_gate.zig");
@@ -925,6 +920,7 @@ test {
     _ = @import("tools/shell/process_provider.zig");
     _ = @import("acp/sessions.zig");
     _ = @import("core/shared/text_utils.zig");
+    _ = @import("core/shared/testing_listener.zig");
     _ = @import("core/tooling/tool_projection.zig");
     _ = @import("core/tooling/tool_dispatch.zig");
     _ = @import("core/tooling/tool_set.zig");
@@ -933,6 +929,7 @@ test {
     _ = @import("core/tooling/tool_result_errors.zig");
     _ = @import("core/tooling/tool_runtime.zig");
     _ = @import("core/tooling/tool_specs.zig");
+    _ = @import("core/tooling/toolbox.zig");
     _ = @import("builtins/commands.zig");
     _ = @import("builtins/mcp.zig");
     _ = @import("builtins/modes.zig");
@@ -945,15 +942,46 @@ test {
     _ = @import("core/tooling/web_search_runtime.zig");
     _ = @import("gateway/web_search.zig");
     _ = @import("gateway/web_search_types.zig");
+    _ = @import("tools/web/http_fetch.zig");
     _ = @import("tools/web/content.zig");
     _ = @import("tools/web/html_to_markdown.zig");
     _ = @import("tools/filesystem/read_file.zig");
     _ = @import("tools/session/read_tool_result.zig");
     _ = @import("tools/skills/install_skill.zig");
     _ = @import("tools/skills/skill.zig");
+    _ = @import("tools/skills/skill_search.zig");
+    _ = @import("tools/capabilities/capability_search.zig");
+    _ = @import("tools/capabilities/toolbox.zig");
     _ = @import("core/shared/types.zig");
     _ = @import("core/agent/worker_runtime.zig");
     _ = @import("gateway/client.zig");
     _ = @import("gateway/open_job.zig");
     _ = @import("gateway/vercel_failure_diagnostics.zig");
+    _ = @import("acp/sign_in.zig");
+    _ = @import("acp/mcp_servers.zig");
+    _ = @import("core/config/env_settings.zig");
+    _ = @import("core/auth/api_key_validator.zig");
+    _ = @import("core/auth/oauth_transport.zig");
+    _ = @import("core/auth/secret.zig");
+    _ = @import("usage/usage.zig");
+    _ = @import("core/app/credits_lookup.zig");
+    _ = @import("core/app/token_pass_check.zig");
+    _ = @import("gateway/vercel_model_policy.zig");
+    _ = @import("core/agent/stream_provider.zig");
+    _ = @import("core/mcp_host/host.zig");
+    _ = @import("core/mcp/access_policy.zig");
+    _ = @import("core/skills/skill_commands.zig");
+    _ = @import("core/hooks/hooks.zig");
+    _ = @import("core/permissions/auto_classifier_context.zig");
+    _ = @import("core/session/session_codec.zig");
+    _ = @import("core/session/session_child_store.zig");
+    _ = @import("core/session/session_log.zig");
+    _ = @import("core/tooling/tool_admission.zig");
+    _ = @import("core/tooling/command_output_content.zig");
+    _ = @import("core/tooling/tool_mcp_runtime.zig");
+    _ = @import("core/agent/question_prompt.zig");
+    _ = @import("core/permissions/approval_prompt.zig");
+    _ = @import("core/permissions/permission_request.zig");
+    _ = @import("core/skills/skill_contract.zig");
+    _ = @import("core/output/compaction_activity.zig");
 }

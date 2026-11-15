@@ -152,6 +152,12 @@ pub fn managedSkillsDir(alloc: Allocator, home: []const u8) ![]u8 {
     return rootPath(alloc, home, &.{managed_skills_dir_name});
 }
 
+/// `managedSkillsDir` inside `root_parent`, the folder that holds lia's
+/// folder, such as the real path of `rootParent`. The caller owns the result.
+pub fn managedSkillsDirIn(alloc: Allocator, root_parent: []const u8) ![]u8 {
+    return std.Io.Dir.path.join(alloc, &.{ root_parent, rootName(), managed_skills_dir_name });
+}
+
 /// Agent profiles, one folder each. A repository keeps its own under
 /// `<workspace>/.lia/agents`.
 pub const agents_dir_name = "agents";

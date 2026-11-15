@@ -18,7 +18,6 @@ const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const tool_runtime = @import("../tooling/tool_runtime.zig");
 const access_policy = @import("../mcp/access_policy.zig");
 const catalog_state = @import("../mcp/catalog_state.zig");
-const model_catalog = @import("../mcp/model_catalog.zig");
 const selected_schema = @import("../mcp/selected_schema.zig");
 const tool_names = @import("../mcp/tool_names.zig");
 const tool_result = @import("../mcp/tool_result.zig");
@@ -206,7 +205,7 @@ pub const Catalog = struct {
         if (options.expected_binding) |b| if (b.runtime_generation != c.currentGeneration()) return error.McpAdvertisedToolChanged;
         if (options.expected_runtime_generation) |g| if (g != c.currentGeneration()) return error.McpAuthorityChanged;
         try c.ensureCurrent(name, options.cancel_flag);
-        const server, const tool, const transport, const how, const schema_json = found: {
+        const server, const tool, const transport, const how, const input_schema = found: {
             c.mutex.lockUncancelable(c.io);
             defer c.mutex.unlock(c.io);
             const found = c.findLocked(name) orelse return null;
@@ -215,15 +214,29 @@ pub const Catalog = struct {
                 if (!b.sameDefinition(c.bindingLocked(found.server, found.tool.*))) return error.McpAdvertisedToolChanged;
             }
             const s = c.servers[found.server];
-            break :found .{ s.name, try arena.dupe(u8, found.tool.original_name), @tagName(s.transport), signIn(c.runtime.options.slash_commands, s.source), try arena.dupe(u8, found.tool.input_schema_json) };
+            break :found .{
+                s.name,
+                try arena.dupe(u8, found.tool.original_name),
+                @tagName(s.transport),
+                signIn(c.runtime.options.slash_commands, s.source),
+                try arena.dupe(u8, found.tool.input_schema_json),
+            };
         };
-        const arguments = tools_feature.coerceObjectArguments(arena, schema_json, arguments_json) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-        };
+        // An object argument the model wrote as its JSON text goes out as
+        // the object, at every level the schema's `properties` describe.
+        const object_arguments = try tools_feature.coerceObjectArguments(arena, input_schema, arguments_json);
+        // A value the model wrote as text goes out as the type the tool's
+        // schema names, so a server that checks types takes the call.
+        const sent_arguments = if (try tools_feature.repairArgumentTypes(arena, input_schema, object_arguments)) |repaired| sent: {
+            for (repaired.fields) |field| {
+                debug_trace.logf("mcp", "MCP argument sent as its schema's type server={s} tool={s} field={s} type={t}", .{ server, tool, field.name, field.json_type });
+            }
+            break :sent repaired.arguments_json;
+        } else object_arguments;
         var asking: Asking = .{ .responder = options.input_responder orelse undefined, .tool = name, .cancel = options.cancel_flag, .io = c.io };
         const observed = if (options.observer) |observer| observer.beginMcp(.{ .call_id = options.call_id, .server = server, .tool = tool, .transport = transport }) else null;
         const asker: ?runtime_mod.Asker = if (options.input_responder != null) .{ .context = &asking, .ask = Asking.ask } else null;
-        const answer = c.runtime.callObserved(arena, server, tool, arguments, options.cancel_flag, asker, options.progress, observed) catch |err| {
+        const answer = c.runtime.callObserved(arena, server, tool, sent_arguments, options.cancel_flag, asker, options.progress, observed) catch |err| {
             if (observed) |call| call.end(if (err == error.Cancelled) .cancelled else .failure, @errorName(err));
             asking.finish(arena, .abandoned);
             return err;
@@ -525,38 +538,30 @@ pub const Catalog = struct {
         };
     }
 
-    /// The servers the model's prompt lists. Project servers that aren't
-    /// approved stay out of it.
-    pub fn modelSnapshot(c: *Catalog, alloc: Allocator) !model_catalog.Snapshot {
+    /// The names of the servers the model may reach, for the toolbox menu:
+    /// every configured server but one waiting for approval or rejected.
+    /// `alloc` owns the slice and each name.
+    pub fn serverNames(c: *Catalog, alloc: Allocator) ![]const []const u8 {
         var scratch: std.heap.ArenaAllocator = .init(c.gpa);
         defer scratch.deinit();
         const statuses = try c.runtime.statuses(scratch.allocator());
-        var out: std.ArrayList(model_catalog.ServerSummary) = .empty;
+        var out: std.ArrayList([]const u8) = .empty;
         errdefer {
-            for (out.items) |s| alloc.free(s.name);
+            for (out.items) |name| alloc.free(name);
             out.deinit(alloc);
         }
         c.mutex.lockUncancelable(c.io);
         defer c.mutex.unlock(c.io);
-        for (c.servers, c.lists) |server, l| {
+        for (c.servers) |server| {
             const s = statusOf(statuses, server.name) orelse continue;
-            const availability: model_catalog.Availability = switch (s.state) {
+            switch (s.state) {
                 .waiting_for_approval, .rejected => continue,
-                .disabled => .disabled,
-                .unsupported, .missing_env, .invalid_env => .unavailable,
-                .idle => if (l.state == .loaded) .ready else .available_on_demand,
-                .connecting, .retrying => .discovering,
-                .ready => .ready,
-                .failed => .failed,
-            };
+                else => {},
+            }
             try out.ensureUnusedCapacity(alloc, 1);
-            out.appendAssumeCapacity(.{
-                .name = try alloc.dupe(u8, s.name),
-                .availability = if (s.needs_login) .authentication_required else availability,
-                .tool_count = if (l.state == .loaded) l.tools.len else null,
-            });
+            out.appendAssumeCapacity(try alloc.dupe(u8, s.name));
         }
-        return .{ .servers = try out.toOwnedSlice(alloc) };
+        return out.toOwnedSlice(alloc);
     }
 
     // ---- lists ----
@@ -1147,10 +1152,13 @@ test "an MCP server's tools reach the model under lia's names" {
     defer view.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 1), view.tools.len);
     try testing.expect(Access.allowsTool(.{ .scoped = .{ .captured = &view, .admission_authority_generation = 0, .live = undefined } }, c.currentGeneration(), "mcp_fake_echo"));
-    var snapshot = try c.modelSnapshot(testing.allocator);
-    defer snapshot.deinit(testing.allocator);
-    try testing.expectEqual(model_catalog.Availability.ready, snapshot.servers[0].availability);
-    try testing.expectEqual(@as(?usize, 1), snapshot.servers[0].tool_count);
+    const names = try c.serverNames(testing.allocator);
+    defer {
+        for (names) |name| testing.allocator.free(name);
+        testing.allocator.free(names);
+    }
+    try testing.expectEqual(@as(usize, 1), names.len);
+    try testing.expectEqualStrings("fake", names[0]);
 }
 
 test "a server-qualified name resolves to the exposed tools it fits" {
@@ -1243,7 +1251,7 @@ test "an open-object argument stays an object in the schema and reaches the serv
     defer arena.deinit();
     const a = arena.allocator();
 
-    // The schema `mcp_select_tool` loads is the server's own.
+    // The schema the toolbox's `open` loads is the server's own.
     const open_object = "\"arguments\":{\"type\":\"object\",\"additionalProperties\":true}";
     const schema = (try c.toolSchema(a, "mcp_fake_tool_call", .{}, .{}, .unrestricted, null)).?;
     try testing.expect(std.mem.find(u8, schema.selected.model_output, open_object) != null);

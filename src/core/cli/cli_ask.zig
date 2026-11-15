@@ -1,4 +1,5 @@
 const std = @import("std");
+const toolbox = @import("../tooling/toolbox.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const std_builtin = @import("builtin");
@@ -43,13 +44,15 @@ const agent_run_flags = @import("agent_run_flags.zig");
 const flag_placement = @import("flag_placement.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const model_provider = @import("../config/model_provider.zig");
+const token_pass = @import("../gateway/token_pass.zig");
+const token_pass_team = @import("../gateway/token_pass_team.zig");
+const token_pass_check = @import("../app/token_pass_check.zig");
 const builtin_commands = @import("../../builtins/commands.zig");
 const cli_flags = @import("cli_flags.zig");
 const output_contracts = @import("../output/output_contracts.zig");
 const mcp_elicitation_interaction = @import("../mcp/elicitation_interaction.zig");
 const mcp_elicitation = @import("../mcp/elicitation.zig");
 const mcp_access_policy = @import("../mcp/access_policy.zig");
-const mcp_model_catalog = @import("../mcp/model_catalog.zig");
 const mcp_host = @import("../mcp_host/host.zig");
 const mcp_verbs = @import("../mcp_host/verbs.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
@@ -261,6 +264,7 @@ pub const Config = struct {
     mode_registry: mode_registry.Registry,
     load_mcp_host: ?mcp_host.LoadFn = null,
     context_limit_overrides: []const config_runtime.context_limits.Override = &.{},
+    tool_placement_overrides: []const config_runtime.tool_placement.Override = &.{},
     additional_directories: []const []const u8 = &.{},
     saved_directories_suppressed: bool = false,
 };
@@ -281,10 +285,12 @@ fn runAskChild(
             .permission_mode = admission.permission_mode,
             .permission_rules = admission.rules,
             .subagent_available = true,
+            .behind_toolbox = ctx.toolbox_behind.slice(),
         },
     ) catch return error.OutOfMemory;
     defer child_projection.deinit(ctx.alloc);
     return subagent_agent_adapter.run(.{
+        .toolbox_behind = ctx.toolbox_behind.slice(),
         .host = ctx.subagent_host orelse return error.ProviderFailed,
         .tool_context = ctx.toolContext(),
         .provider_set = ctx.cfg.provider_set,
@@ -423,7 +429,7 @@ fn postAskReport(
     const text = switch (delivery) {
         .report => |report| try subagent_reports.message(alloc, report, ctx.max_tool_result_bytes),
         // Its children share this host, so their parent is the ask's own agent.
-        .message => |message| try subagent_reports.messageText(alloc, message.agent, message.child_id, message.text, ctx.max_tool_result_bytes, null),
+        .message => |message| try subagent_reports.messageText(alloc, message.agent, message.child_id, message.text, ctx.max_tool_result_bytes, null, message.user_typed),
     };
     ctx.worker.postMail(alloc, .{
         .prompt = text,
@@ -613,6 +619,8 @@ const AskContext = struct {
     max_tool_result_bytes: usize = 64 * 1024,
     auto_compact_percent: u8 = compactor.default_percent,
     context_limits: config_runtime.context_limits.Values = .{},
+    /// The built-in tools offered through toolbox, fixed for the run.
+    toolbox_behind: config_runtime.tool_placement.Behind = config_runtime.tool_placement.behindToolbox(.{}, &.{}),
     fast_mode: bool = false,
     /// Profile preference used only when creating a new durable session.
     /// Process and CLI overrides remain per-run and never rewrite this value.
@@ -1036,6 +1044,8 @@ const AskContext = struct {
             self.alloc.destroy(children);
             return;
         };
+        // A child whose profile lists a tool kept behind toolbox keeps toolbox.
+        self.subagent_host.?.authority_resolver.toolbox_behind = &self.toolbox_behind;
         self.v2_children = children;
         self.subagent_host.?.report_sink = .{ .context = self, .post_fn = postAskReport };
         // What a restart left owed runs as this run's next turns.
@@ -1652,6 +1662,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     ctx.auto_compact_percent = startup.auto_compact_percent;
     ctx.context_limits = startup.context_limits;
     ctx.context_limits.applyCommandLine(cfg.context_limit_overrides);
+    ctx.toolbox_behind = config_runtime.tool_placement.behindToolbox(startup.tool_placement, cfg.tool_placement_overrides);
     ctx.fast_mode = startup.fast_mode;
     ctx.persisted_ultrafast_mode = startup.configured_ultrafast_mode;
     ctx.ultrafast_mode = startup.ultrafast_mode;
@@ -1768,6 +1779,43 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         );
     }
 
+    // A team with Token Pass starts a new session on the Token Pass default
+    // when nothing chose the model. The check refreshes the saved answer
+    // while the turn runs, and waits for it only when lia has none.
+    var token_pass_run: ?token_pass_check.Check = null;
+    defer if (token_pass_run) |*check| check.finish(alloc, "ask_finished");
+    const token_pass_source: ?credentials.Source = if (ctx.provider == .gateway and cfg.auth_mode != .host_managed) ctx.credential_source else null;
+    if (token_pass_source) |source| {
+        if (token_pass_check.name(alloc, source, ctx.api_key, ctx.account_id, ctx.gateway_team)) |named| {
+            token_pass_run = .{ .named = named, .home = io_mod.homeDir() };
+            token_pass_run.?.begin(
+                alloc,
+                cfg.provider_set.select(.gateway).credits orelse gateway_provider.unavailable_credits_provider,
+                .{ .credential = ctx.api_key, .credential_source = source, .tenant = ctx.gateway_team },
+                token_pass_check.first_prompt_wait_ms,
+            );
+            const nothing_chose_model = startup.model_source == .compiled_default and
+                options.model_override == null and
+                ctx.requested_resume == null and
+                ctx.session.agent.history.items.len == 0;
+            // Without an answer, the catalog's Token Pass marks can answer for
+            // the team; the turn reuses the catalog this loads.
+            if (nothing_chose_model and !token_pass_run.?.has_pass and !token_pass_run.?.answered) {
+                _ = resolveModelCapabilities(&ctx, alloc, ctx.model) catch |err| {
+                    debug_trace.logf("token_pass", "catalog not loaded for the start model err={s}", .{@errorName(err)});
+                };
+                _ = token_pass_run.?.observeCatalog(alloc);
+            }
+            if (token_pass_run.?.has_pass and nothing_chose_model) {
+                debug_trace.logf("token_pass", "start model={s}", .{token_pass.default_model});
+                ctx.model = token_pass.default_model;
+                // Token Pass credit pays only for standard speed.
+                if (options.fast_override == null) ctx.fast_mode = false;
+                if (options.ultrafast_override == null) ctx.ultrafast_mode = false;
+            }
+        }
+    }
+
     const restored_image_catalog = try ctx.session.snapshotImageCatalog(alloc, &.{});
     defer types.freeImageAttachmentSlice(alloc, restored_image_catalog);
     const restored_image_bounds = try image_attachments.calculate_next_image_id(restored_image_catalog);
@@ -1805,12 +1853,9 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     loaded_skills.dir = &.{};
     if (startup.context_enabled) {
         try ctx.checkCancellation();
-        const context_targets = try context_contract.applicableTargetsForImages(alloc, current_images);
-        defer if (context_targets.len > 0) alloc.free(context_targets);
         ctx.context_snapshot = try ctx.deps.context_registry.gatherDefaultSnapshot(alloc, .{
             .workspace_root = startup.workspace_root,
             .access_scope = ctx.workspace_access.scope(ctx.workspace_root),
-            .targets = context_targets,
             .context_limits = ctx.context_limits,
         });
         try ctx.checkCancellation();
@@ -1828,6 +1873,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .permission_mode = ctx.permission_mode,
         .permission_rules = ctx.permission_rules,
         .subagent_available = ctx.subagent_host != null,
+        .behind_toolbox = ctx.toolbox_behind.slice(),
     }, session_child_capability != null);
     defer tool_projection.deinit(alloc);
 
@@ -1873,10 +1919,15 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         options.save_session and ctx.requested_resume == null,
     );
     defer if (title_task) |task| completeAskTitleTask(&ctx, task);
+    var toolbox_arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer toolbox_arena_state.deinit();
+    const toolbox_mcp_servers = try toolboxMcpServerNames(toolbox_arena_state.allocator(), &ctx);
     const turn_config: agent_runtime.Config = .{
         .system_prompt = cfg.prompt_policy.system_prompt,
         .model_prompt_overlay = cfg.prompt_policy.modelPromptOverlay(ctx.model),
         .skill_catalog = .{ .skills = loaded_skills.skills, .diagnostics = loaded_skills.diagnostics },
+        .toolbox_mcp_servers = toolbox_mcp_servers,
+        .toolbox_behind = ctx.toolbox_behind.slice(),
         .gateway_retry_count = cfg.gateway_retry_count,
         .gateway_chat_url = cfg.gateway_chat_url,
         .advertised_tool_names = tool_projection.advertised_names,
@@ -1902,20 +1953,24 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         else
             null,
     };
-    if (try runAskTurn(&ctx, alloc, options, &deps, semantic_presentation, turn_config, job)) |early| return early;
-    // The ask ends once its whole tree is quiet: each report
-    // that arrives runs as the ask's next turn, as one wakes an idle main.
+    if (try runAskTurn(&ctx, alloc, options, &deps, semantic_presentation, turn_config, job, false)) |early| return early;
+    // The ask ends once its whole tree is quiet: mail that waits when a turn
+    // ends runs as the ask's next turn, as one wakes an idle main.
     while (ctx.subagent_host) |tree| {
         switch (tree.awaitMailOrQuiet(&ctx.worker, ctx.cancelFlag())) {
             .quiet, .stopped => break,
             .mail => {},
         }
-        const next = ctx.worker.takeQueuedPrompt(std.heap.c_allocator) orelse continue;
+        // The take marks the turn, so mail posted from then on joins it.
+        const turn_id = debug_trace.nextTurnId();
+        const next = ctx.worker.takeQueuedPromptForTurn(std.heap.c_allocator, turn_id) orelse continue;
         defer worker_runtime.freeQueuedPrompt(std.heap.c_allocator, next);
+        var turn_marked = true;
+        defer if (turn_marked) ctx.worker.finishProcessing();
         try ctx.checkCancellation();
         const history = try ctx.session.snapshotHistory(alloc);
         defer types.freeHistoryTurnSlice(alloc, history);
-        ctx.active_turn_id = debug_trace.nextTurnId();
+        ctx.active_turn_id = turn_id;
         var follow = job;
         follow.turn_id = ctx.active_turn_id;
         follow.prompt = next.prompt;
@@ -1926,7 +1981,9 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         follow.history = history;
         follow.unversioned_history_count = ctx.session.unversionedHistoryEnd();
         debug_trace.eventf("mailbox", "ask_next_turn", .{ .turn_id = ctx.active_turn_id }, "author={s}", .{@tagName(next.author)});
-        if (try runAskTurn(&ctx, alloc, options, &deps, semantic_presentation, turn_config, follow)) |early| return early;
+        // runAskTurn ends the turn the take marked.
+        turn_marked = false;
+        if (try runAskTurn(&ctx, alloc, options, &deps, semantic_presentation, turn_config, follow, true)) |early| return early;
     }
     worker_events_drained = true;
 
@@ -1939,6 +1996,8 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
 /// skipped or unavailable.
 /// Runs one of the ask's turns. Returns the ask's result when the turn ends
 /// it early: a permission it cannot ask for, or a failure in JSON output.
+/// `marked` says the worker already marks the turn, as the take of its mail
+/// did; the turn then ends it.
 fn runAskTurn(
     ctx: *AskContext,
     alloc: Allocator,
@@ -1947,7 +2006,13 @@ fn runAskTurn(
     semantic_presentation: ?agent_runtime.SemanticPresentationSink,
     config: agent_runtime.Config,
     job: worker_runtime.QueuedPrompt,
+    marked: bool,
 ) !?PromptRunResult {
+    // Mail that arrives while the turn runs joins it at its next boundary, as
+    // in the app; what the turn leaves waits and runs as the ask's next turn
+    // (`tests/tla/subagent/MainMail.tla` JoinsOpenTurn).
+    const processing = marked or (ctx.subagent_host != null and ctx.worker.beginDirectProcessing(job.turn_id));
+    defer if (processing) ctx.worker.finishProcessing();
     options.deps.process_queued_prompt(&ctx.session.agent, deps, semantic_presentation, ctx.lifecycleContext(), config, job) catch |err| switch (err) {
         error.NonInteractivePermissionRequired => {
             const assistant_output = try alloc.dupe(u8, ctx.assistant_output.items);
@@ -1987,10 +2052,20 @@ fn maybeStartAskTitleTask(
     if (ctx.session.agent.history.items.len != 0) return null;
     const session_id = ctx.activeSessionId() orelse return null;
     const bundle = ctx.cfg.provider_set.select(ctx.provider);
-    const title_model = bundle.title_model orelse return null;
+    const provider_title_model = bundle.title_model orelse return null;
+    // A Token Pass session of a team with Token Pass titles itself with a
+    // Token Pass model the catalog marks, so the title waits for the catalog
+    // the turn would load anyway.
+    const title_model = if (ctx.provider == .gateway) title: {
+        _ = resolveModelCapabilities(ctx, ctx.alloc, ctx.model) catch |err| {
+            debug_trace.logf("token_pass", "catalog not loaded for the title model err={s}", .{@errorName(err)});
+        };
+        break :title token_pass_team.modelForSideCall(.title, ctx.model, provider_title_model);
+    } else provider_title_model;
     const agent_stream = bundle.agent_stream orelse return null;
     const excerpt = session_title_generation.promptExcerpt(prompt) orelse return null;
-    if (ctx.credential_source != .host_managed and ctx.api_key.len == 0) return null;
+    // A custom connection may need no key; its adapter checks the one it gets.
+    if (ctx.credential_source != .host_managed and ctx.credential_source != .configured and ctx.api_key.len == 0) return null;
     const task = session_title_generation.Task.create(.{
         .session_id = session_id,
         .model = title_model,
@@ -1999,6 +2074,7 @@ fn maybeStartAskTitleTask(
         .gateway_team = ctx.gateway_team,
         .account_id = ctx.account_id,
         .credential_source = ctx.credential_source,
+        .reads_shared_sign_in = true,
         .stream_provider = agent_stream,
     }) catch return null;
     task.spawn() catch |err| {
@@ -2111,14 +2187,15 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .tool_registry = ctx.toolRegistry(),
         .context_registry = ctx.deps.context_registry,
         .context_enabled = ctx.context_enabled,
+        .image_folder_rules = true,
         .finalize_turn = finalizeTurn,
+        .take_steering_boundary = takeSteeringBoundary,
         .release_agent_terminal_lease = releaseAgentTerminalLease,
         .append_runtime_context = appendRuntimeContext,
         .append_static_context = appendStaticContext,
         .validate_tool_call = validateToolCall,
         .snapshot_mcp_definition = snapshotMcpDefinition,
         .resolve_unselected_mcp_tool = resolveUnselectedMcpTool,
-        .prepare_skill_call = prepareSkillCall,
         .check_tool_availability = checkToolAvailability,
         .request_tool_permission = requestToolPermissionOutcomeWithRequest,
         .request_prepared_file_mutation_permission = requestPreparedFileMutationPermissionOutcomeForRuntime,
@@ -2141,6 +2218,7 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .push_diff_block = pushDiffBlock,
         .push_system_notice = pushSystemNotice,
         .push_context_notice = pushContextNotice,
+        .push_session_notice = pushSessionNotice,
         .push_route_recovery_status = pushRouteRecoveryStatus,
         .begin_route_recovery_request = beginRouteRecoveryRequest,
         .push_command_output_complete = pushCommandOutputComplete,
@@ -2171,7 +2249,8 @@ fn refreshGatewayCredential(
     source: credentials.Source,
     mode: auth_runtime.CredentialRefreshMode,
     expected_account_id: ?[]const u8,
-) !?[]u8 {
+    rejected_token: ?[]const u8,
+) !?agent_runtime.RefreshedGatewayCredential {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     if (mode == .if_needed and auth_runtime.requestPathCredentialVerifiedRecently(source)) {
         debug_trace.logf("auth", "credential refresh skipped source={t} reason=verified_recently", .{source});
@@ -2183,9 +2262,11 @@ fn refreshGatewayCredential(
         source,
         mode,
         expected_account_id,
+        rejected_token,
     )) orelse return null;
     defer refreshed.deinit(ctx.alloc);
-    return try adoptRefreshedAskCredential(ctx, alloc, &refreshed);
+    // A team change is refused above, so the request keeps its team.
+    return .{ .token = try adoptRefreshedAskCredential(ctx, alloc, &refreshed) };
 }
 
 fn adoptRefreshedAskCredential(
@@ -2292,6 +2373,20 @@ fn finalizeTurn(raw_ctx: *anyopaque, turn_id: u64, outcome: types.TurnPresentati
     if (outcome == .completed) discard_restarted_json_preview(ctx);
 }
 
+/// Takes the subagent mail that joined the running turn at a model or final
+/// boundary. An ask has no one to steer it, so a cancel always ends the
+/// turn, as it does with no hook.
+fn takeSteeringBoundary(
+    raw_ctx: *anyopaque,
+    arena: Allocator,
+    turn_id: u64,
+    kind: worker_runtime.SteeringBoundaryKind,
+) !worker_runtime.SteeringBoundaryResult {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    if (kind == .cancelled) return .interrupt;
+    return ctx.worker.takeSteeringBoundaryInto(std.heap.c_allocator, arena, turn_id, kind);
+}
+
 fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     try ctx.deps.context_registry.appendDefaultTransient(.{
@@ -2300,6 +2395,7 @@ fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.Ar
         .interactive = false,
         .permission_mode = ctx.permission_mode,
         .model = if (ctx.model.len > 0) ctx.model else null,
+        .subagents = if (ctx.subagent_host) |team_host| try team_host.teamNote(arena, ctx.active_turn_id) else null,
     }, arena, messages);
 }
 
@@ -2308,16 +2404,15 @@ fn appendStaticContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.Arr
     try ctx.deps.context_registry.appendDefaultStatic(.{
         .project_context = ctx.modelVisibleProjectContext(),
     }, arena, messages);
-    var snapshot = if (ctx.mcp_host) |h|
-        try h.catalog.modelSnapshot(arena)
-    else
-        try mcp_model_catalog.Snapshot.empty(arena);
-    defer snapshot.deinit(arena);
-    const section = try mcp_model_catalog.render(arena, snapshot);
-    if (section.text.len > 0) {
-        try messages.append(arena, .{ .role = .system, .content = section.text });
-    }
-    if (section.notice) |notice| try pushContextNotice(raw_ctx, notice);
+    // The toolbox menu lists the MCP servers (toolboxMcpServerNames), so
+    // there is no MCP block here.
+}
+
+/// The configured MCP servers by name, for the toolbox menu. The names are
+/// allocated in `arena`.
+fn toolboxMcpServerNames(arena: Allocator, ctx: *AskContext) ![]const []const u8 {
+    const live_host = ctx.mcp_host orelse return &.{};
+    return live_host.catalog.serverNames(arena);
 }
 
 fn snapshotMcpDefinition(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, known: tool_mcp_runtime.Binding) !tool_mcp_runtime.DefinitionSnapshot {
@@ -2341,11 +2436,6 @@ fn validateToolCall(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall) !agen
 fn checkToolAvailability(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall) !?[]const u8 {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     return tool_runtime.checkToolAvailability(ctx.toolContext(), arena, call);
-}
-
-fn prepareSkillCall(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, locations: ?*const skill_contract.Locations) !skill_contract.CallPreparation {
-    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    return tool_runtime.prepareSkillCall(ctx.toolContext(), arena, call, locations);
 }
 
 fn cliAdmissionContext(
@@ -2826,16 +2916,25 @@ fn appendToolCallRecord(
     ctx.tool_call_records_mutex.lockUncancelable(io_mod.getIo());
     defer ctx.tool_call_records_mutex.unlock(io_mod.getIo());
 
-    const name = try ctx.alloc.dupe(u8, call.name);
-    errdefer ctx.alloc.free(name);
-    const owned_status = try ctx.alloc.dupe(u8, status);
-    errdefer ctx.alloc.free(owned_status);
     var scratch_state = std.heap.ArenaAllocator.init(ctx.alloc);
     defer scratch_state.deinit();
     const scratch = scratch_state.allocator();
-    const is_shell = std.mem.eql(u8, call.name, "shell");
+    // A toolbox run reports the tool that ran, with that tool's arguments, so
+    // a script reading the JSON sees mcp_linear_create_issue, or shell and its
+    // command, not toolbox.
+    const ran: ToolCall = if (try toolbox.carriedCall(scratch, call.name, call.arguments_json)) |carried| ran: {
+        var effective = call;
+        effective.name = carried.name;
+        effective.arguments_json = carried.arguments_json;
+        break :ran effective;
+    } else call;
+    const name = try ctx.alloc.dupe(u8, ran.name);
+    errdefer ctx.alloc.free(name);
+    const owned_status = try ctx.alloc.dupe(u8, status);
+    errdefer ctx.alloc.free(owned_status);
+    const is_shell = std.mem.eql(u8, ran.name, "shell");
     const action = if (is_shell and error_category != null)
-        shell_action_for_call(scratch, call)
+        shell_action_for_call(scratch, ran)
     else
         null;
     const error_code = if (is_shell and error_category != null)
@@ -2858,7 +2957,7 @@ fn appendToolCallRecord(
     else
         null;
     errdefer if (command_result_json) |json| ctx.alloc.free(json);
-    const ask_question_text = try questionTextForAskCall(ctx.alloc, call);
+    const ask_question_text = try questionTextForAskCall(ctx.alloc, ran);
     errdefer if (ask_question_text) |text| ctx.alloc.free(text);
 
     try ctx.tool_call_records.append(ctx.alloc, .{
@@ -2886,10 +2985,7 @@ fn shell_action_for_call(arena: Allocator, call: ToolCall) ?ShellAction {
         .object => |object| object,
         else => return null,
     };
-    const request = if (root.get("request")) |value| switch (value) {
-        .object => |object| object,
-        else => return null,
-    } else root;
+    const request = (tool_args.unwrapRequest(arena, root) catch return null) orelse return null;
     const action = switch (request.get("action") orelse return null) {
         .string => |value| value,
         else => return null,
@@ -3001,7 +3097,13 @@ fn questionTextForAskCall(alloc: Allocator, call: ToolCall) !?[]u8 {
     };
     defer parsed.deinit();
     if (parsed.value != .object) return null;
-    const questions_value = parsed.value.object.get("questions") orelse return null;
+    var questions_value = parsed.value.object.get("questions") orelse return null;
+    // The tool reads the batch from JSON text too, so the record names the
+    // same question.
+    tool_args.normalizeCompositeArrayValue(parsed.arena.allocator(), &questions_value) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
     if (questions_value != .array or questions_value.array.items.len == 0) return null;
     const first = questions_value.array.items[0];
     if (first != .object) return null;
@@ -3343,6 +3445,12 @@ fn pushSystemNotice(raw_ctx: *anyopaque, text: []const u8) !void {
     try ctx.writeStderr("[notice] ");
     try ctx.writeStderr(text);
     try ctx.writeStderr("\n");
+}
+
+fn pushSessionNotice(raw_ctx: *anyopaque, text: []const u8) !void {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    if (!try ctx.session.claimContextNotice(ctx.alloc, text)) return;
+    try pushSystemNotice(raw_ctx, text);
 }
 
 fn pushContextNotice(raw_ctx: *anyopaque, text: []const u8) !void {
@@ -4668,8 +4776,8 @@ const TestContextRegistryFixture = struct {
     var gather_calls: usize = 0;
     var process_calls: usize = 0;
     var gather_error: ?context_contract.ProviderError = null;
-    var expected_target_paths: []const []const u8 = &.{};
-    var targets_match: bool = false;
+    var expected_queued_image: ?[]const u8 = null;
+    var queued_image_folder_rules: bool = false;
     var expected_static_context: ?[]const u8 = null;
     var expected_gather_calls: usize = 0;
     var transient_permission_mode: ?PermissionMode = null;
@@ -4678,24 +4786,15 @@ const TestContextRegistryFixture = struct {
         gather_calls = 0;
         process_calls = 0;
         gather_error = null;
-        expected_target_paths = &.{};
-        targets_match = false;
+        expected_queued_image = null;
+        queued_image_folder_rules = false;
         expected_static_context = expected_static;
         expected_gather_calls = expected_calls;
         transient_permission_mode = null;
     }
 
-    fn gather(alloc: Allocator, input: context_contract.InitialContextInput) context_contract.ProviderError!context_contract.ProviderContext {
+    fn gather(alloc: Allocator, _: context_contract.InitialContextInput) context_contract.ProviderError!context_contract.ProviderContext {
         gather_calls += 1;
-        targets_match = input.targets.len == expected_target_paths.len;
-        if (targets_match) {
-            for (input.targets, expected_target_paths) |target, expected_path| {
-                if (target.kind != .file or !std.mem.eql(u8, target.path, expected_path)) {
-                    targets_match = false;
-                    break;
-                }
-            }
-        }
         if (gather_error) |err| return err;
         var result: context_contract.ProviderContext = .{
             .content = try alloc.dupe(u8, test_registry_static_context),
@@ -4735,7 +4834,13 @@ const TestContextRegistryFixture = struct {
         process_calls += 1;
         try std.testing.expect(semantic_presentation == null);
         try std.testing.expectEqual(expected_gather_calls, gather_calls);
-        if (expected_gather_calls > 0) try std.testing.expect(targets_match);
+        queued_image_folder_rules = deps.image_folder_rules;
+        if (expected_queued_image) |path| {
+            try std.testing.expectEqual(@as(usize, 1), job.images.len);
+            try std.testing.expectEqualStrings(path, job.images[0].path);
+        } else {
+            try std.testing.expectEqual(@as(usize, 0), job.images.len);
+        }
         const ctx: *AskContext = @ptrCast(@alignCast(deps.ctx));
         if (expected_static_context != null) {
             const contribution = ctx.context_snapshot.contribution orelse return error.TestExpectedEqual;
@@ -4769,15 +4874,15 @@ const TestContextRegistryFixture = struct {
             transient_permission_mode orelse return error.TestExpectedEqual,
         );
 
+        // The toolbox menu lists the MCP servers, so no MCP block follows
+        // the static context.
         if (expected_static_context) |expected_static| {
-            try std.testing.expectEqual(@as(usize, 3), messages.items.len);
-            try std.testing.expectEqualStrings(expected_static, messages.items[0].content.?);
-            try std.testing.expect(std.mem.find(u8, messages.items[1].content.?, "<mcp_servers>") != null);
-            try std.testing.expectEqualStrings(test_registry_transient_context, messages.items[2].content.?);
-        } else {
             try std.testing.expectEqual(@as(usize, 2), messages.items.len);
-            try std.testing.expect(std.mem.find(u8, messages.items[0].content.?, "<mcp_servers>") != null);
+            try std.testing.expectEqualStrings(expected_static, messages.items[0].content.?);
             try std.testing.expectEqualStrings(test_registry_transient_context, messages.items[1].content.?);
+        } else {
+            try std.testing.expectEqual(@as(usize, 1), messages.items.len);
+            try std.testing.expectEqualStrings(test_registry_transient_context, messages.items[0].content.?);
         }
 
         try testPushAssistantText(deps, "assistant text");
@@ -5079,6 +5184,37 @@ test "lia ask publishes a complete refreshed credential before later consumers" 
         "fresh-token",
         ctx.model_catalog_access.authorizationCredential().?,
     );
+}
+
+test "lia ask refuses a refreshed login on another team" {
+    const alloc = std.testing.allocator;
+    var stdout_capture = TestCapture{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture = TestCapture{};
+    defer stderr_capture.deinit(alloc);
+    var ctx = AskContext.init(
+        alloc,
+        testConfig(),
+        testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup),
+        "/tmp/workspace",
+    );
+    defer ctx.deinit();
+    ctx.api_key = "stale-token";
+    ctx.credential_source = .fx_login;
+    ctx.gateway_team = "team_123";
+
+    // Another lia process saved the login on another team while this request
+    // ran; lia ask does not move a request to it.
+    var refreshed = credentials.Credential{
+        .token = try alloc.dupe(u8, "fresh-token"),
+        .source = .fx_login,
+        .team_id = try alloc.dupe(u8, "team_456"),
+        .refresh_after_ms = 100,
+    };
+    defer refreshed.deinit(alloc);
+    try std.testing.expectError(error.CredentialAuthorityChanged, adoptRefreshedAskCredential(&ctx, alloc, &refreshed));
+    try std.testing.expectEqualStrings("stale-token", ctx.api_key);
+    try std.testing.expectEqualStrings("team_123", ctx.gateway_team.?);
 }
 
 test "lia ask finalization fails every failed turn" {
@@ -7890,6 +8026,56 @@ test "lia ask JSON records permission-denied tool calls as error status" {
     );
 }
 
+test "lia ask JSON names a toolbox run by the tool it ran, with that tool's fields, at any size" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(root);
+
+    var ctx = AskContext.init(alloc, testConfig(), .{
+        .context_registry = test_no_context_registry,
+        .tool_set = builtin_tools.advertisement_set,
+    }, root);
+    defer ctx.deinit();
+    ctx.output_mode = .json;
+
+    // Bigger than any fixed parse buffer.
+    const padding: [20 * 1024]u8 = @splat('x');
+    const arguments = try alloc.print(
+        "{{\"run\":\"shell\",\"arguments\":{{\"action\":\"interact\",\"session_id\":\"shell-missing\",\"note\":\"{s}\"}}}}",
+        .{&padding},
+    );
+    defer alloc.free(arguments);
+    captureToolExecutionError(&ctx, .{
+        .call_allocator = alloc,
+        .result_allocator = alloc,
+        .call = .{ .id = "toolbox-shell", .name = "toolbox", .arguments_json = arguments },
+        .authority = .ordinary,
+        .session_grants = &.{},
+        .advertised_dynamic_tool_names = &.{},
+        .max_tool_result_bytes = 4096,
+    }, error.ExecutionNotFound);
+
+    const records = try takeToolCallRecords(&ctx, alloc);
+    const result = PromptRunResult{
+        .exit_code = 1,
+        .assistant_output = try alloc.dupe(u8, ""),
+        .tool_calls = records,
+    };
+    defer result.deinit(alloc);
+    const rendered = try renderFinalJsonResult(alloc, result);
+    defer alloc.free(rendered);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, rendered, .{});
+    defer parsed.deinit();
+    const record = parsed.value.object.get("tool_calls").?.array.items[0].object;
+    try std.testing.expectEqualStrings("shell", record.get("name").?.string);
+    try std.testing.expectEqualStrings("interact", (record.get("action") orelse return error.TestExpectedEqual).string);
+    const failure = (record.get("error") orelse return error.TestExpectedEqual).object;
+    try std.testing.expectEqualStrings("ExecutionNotFound", failure.get("code").?.string);
+}
+
 test "lia ask JSON preserves shell action and runtime error identity" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -7970,6 +8156,7 @@ test "shell diagnostic action projection accepts only current actions" {
         .{ .arguments_json = "{\"action\":\"run\"}", .expected = .run },
         .{ .arguments_json = "{\"action\":\"interact\"}", .expected = .interact },
         .{ .arguments_json = "{\"request\":{\"action\":\"stop\"}}", .expected = .stop },
+        .{ .arguments_json = "{\"request\":\"{\\\"action\\\":\\\"interact\\\"}\"}", .expected = .interact },
     };
     for (cases) |case| {
         try std.testing.expectEqual(
@@ -8228,6 +8415,30 @@ test "lia ask JSON records ask_user_question text for matching assertions" {
     try std.testing.expectEqualStrings("What is your GitHub handle?", tool_call.get("question").?.string);
 }
 
+test "lia ask JSON names the question of a batch sent as JSON text" {
+    const alloc = std.testing.allocator;
+    const call = struct {
+        fn of(arguments_json: []const u8) ToolCall {
+            return .{ .id = "question", .name = "ask_user_question", .arguments_json = arguments_json };
+        }
+    }.of;
+
+    const text = (try questionTextForAskCall(alloc, call("{\"questions\":\"[{\\\"question\\\":\\\" Which path? \\\"}]\"}"))).?;
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("Which path?", text);
+
+    // Text that does not hold a batch names no question, including a batch
+    // encoded twice.
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const twice = try std.json.Stringify.valueAlloc(arena, "[{\"question\":\"Twice?\"}]", .{});
+    for ([_][]const u8{ "not json", "{}", "[]", "[1]", twice }) |questions_text| {
+        const arguments_json = try std.json.Stringify.valueAlloc(arena, .{ .questions = questions_text }, .{});
+        try std.testing.expect((try questionTextForAskCall(alloc, call(arguments_json))) == null);
+    }
+}
+
 test "lia ask JSON clips ask_user_question text at a UTF-8 boundary" {
     const alloc = std.testing.allocator;
     var question_bytes: [257]u8 = undefined;
@@ -8374,7 +8585,7 @@ test "lia ask carries resolved auto mode and initial registry context into the q
     );
 }
 
-test "default lia ask passes canonical image paths as initial context targets" {
+test "default lia ask keeps image paths out of the initial context and has the runtime carry their folders' rules" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -8394,7 +8605,7 @@ test "default lia ask passes canonical image paths as initial context targets" {
     defer stderr_capture.deinit(alloc);
 
     TestContextRegistryFixture.reset(test_registry_static_context, 1);
-    TestContextRegistryFixture.expected_target_paths = &.{image_path};
+    TestContextRegistryFixture.expected_queued_image = image_path;
     var deps = testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup);
     deps.context_registry = test_cli_context_registry;
     deps.process_queued_prompt = TestContextRegistryFixture.process;
@@ -8409,7 +8620,10 @@ test "default lia ask passes canonical image paths as initial context targets" {
     try std.testing.expectEqual(@as(u8, 0), exit_code);
     try std.testing.expectEqual(@as(usize, 1), TestContextRegistryFixture.gather_calls);
     try std.testing.expectEqual(@as(usize, 1), TestContextRegistryFixture.process_calls);
-    try std.testing.expect(TestContextRegistryFixture.targets_match);
+    // The instructions' context cannot name a target, so an image never
+    // changes them; the turn carries the image's path and the runtime
+    // delivers its folder's rules as a note.
+    try std.testing.expect(TestContextRegistryFixture.queued_image_folder_rules);
 }
 
 test "default lia ask omits disabled registry context without gathering" {

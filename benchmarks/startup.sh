@@ -129,19 +129,7 @@ HOME="$GENERAL_FIXTURE_HOME" hyperfine \
 
 echo ""
 
-# Benchmark 3: lia doctor --json (system checks)
-echo "--- lia doctor --json ---"
-HOME="$GENERAL_FIXTURE_HOME" hyperfine \
-  "${SHELL_OPTS[@]}" \
-  --runs "$RUNS" \
-  --warmup "$WARMUP" \
-  --export-json "${RESULTS_DIR}/doctor.json" \
-  --command-name "lia doctor --json" \
-  "$LIA_BIN doctor --json"
-
-echo ""
-
-# Benchmark 4: lia sessions --json (file I/O path)
+# Benchmark 3: lia sessions --json (file I/O path)
 echo "--- lia sessions --json ---"
 HOME="$SESSION_FIXTURE_HOME" hyperfine \
   "${SHELL_OPTS[@]}" \

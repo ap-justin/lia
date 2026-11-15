@@ -165,12 +165,12 @@ describe("lia mcp", () => {
     expect(text.code).toBe(0);
     expect(text.stdout).toBe(
       [
-        "NAME   SOURCE          TRANSPORT  STATUS",
+        "NAME   SOURCE           TRANSPORT  STATUS",
         "ctx    ~/.lia/mcp.json  http       not started",
         "off    ~/.lia/mcp.json  stdio      disabled",
         "sse    ~/.lia/mcp.json  sse        not supported",
         "keyed  ~/.lia/mcp.json  http       needs $MISSING_TOKEN",
-        "docs   .mcp.json       stdio      waiting for approval",
+        "docs   .mcp.json        stdio      waiting for approval",
         "",
       ].join("\n"),
     );
@@ -389,10 +389,6 @@ describe("lia mcp", () => {
     expect(existsSync(trace)).toBe(true);
     expect(readFileSync(trace, "utf8")).toContain("line=trace-me");
   }, 30_000);
-});
-
-describe("/mcp in the shell", () => {
-
 });
 
 describe("lia ask", () => {

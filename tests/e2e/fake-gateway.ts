@@ -281,12 +281,19 @@ export type FakeGatewayResponse =
   | Response
   | ((body: string) => Response | Promise<Response>);
 
+// A title response can also read the request's headers, such as the bearer
+// token lia sent, to answer like a gateway that rejects a stale one.
+export type FakeGatewayTitleResponse =
+  | Response
+  | ((body: string, headers: Headers) => Response | Promise<Response>);
+
 export type FakeGatewayModel = {
   id: string;
   type?: string;
   owned_by?: string;
   released?: number;
   tags?: string[];
+  token_pass?: boolean;
   context_window?: number;
   max_tokens?: number;
   pricing?: Record<string, unknown>;
@@ -315,7 +322,7 @@ export type FakeGatewayOptions = {
       | Promise<FakeGatewayModel[] | Response>);
   classifierDecision?: "clear" | "caution";
   classifierResponses?: FakeGatewayResponse[];
-  titleResponses?: FakeGatewayResponse[];
+  titleResponses?: FakeGatewayTitleResponse[];
   // Answers usage GETs (`/v1/report`, `/ai-gateway/usage-report`); see
   // usage-fakes.ts. Null falls through to the routes below.
   usage?: (url: URL, request: Request) => Response | null;
@@ -428,7 +435,7 @@ function serveFakeGateway(
       if (body.includes(TITLE_GENERATION_MARKER)) {
         titleRequests.push({ body, headers });
         const next = titleResponses.shift();
-        if (next) return typeof next === "function" ? await next(body) : next;
+        if (next) return typeof next === "function" ? await next(body, headers) : next;
         return fakeGatewayTitleDefault();
       }
       requests.push({ body, headers });
@@ -464,6 +471,26 @@ export function startFakeGateway(
     }
     return typeof next === "function" ? await next(body) : next;
   }, options);
+}
+
+export function tokenPassCatalog(hasPass: boolean): FakeGatewayModel[] {
+  return [
+    { id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] },
+    ...["moonshotai/kimi-k3", "zai/glm-5.3", "zai/glm-5.3-flash", "deepseek/deepseek-v4.1-flash"].map((id) => ({
+      id,
+      type: "language",
+      tags: ["tool-use"],
+      ...(hasPass ? { token_pass: true } : {}),
+    })),
+  ];
+}
+
+// lia asks AI Gateway's credits endpoint whether the team has Token Pass. With
+// no fake gateway, that request would reach the real AI Gateway, so it goes to
+// a closed loopback port, where it fails at once.
+export function localCreditsEnv(env: Record<string, string | undefined>): Record<string, string | undefined> {
+  if (env.LIA_GATEWAY_BASE_URL || env.LIA_TEST_GATEWAY_CREDITS_URL) return env;
+  return { ...env, LIA_TEST_GATEWAY_CREDITS_URL: "http://127.0.0.1:9/coding-agent/v1/credits" };
 }
 
 // Same server and classifier handling as startFakeGateway, but every

@@ -12,7 +12,6 @@ LINUX_BUDGETS = {
     "lia help": 0.002,
     "lia status --json": 0.002,
     "lia background --json": 0.002,
-    "lia doctor --json": 0.002,
     "lia sessions --json": 0.002,
 }
 DEFAULT_LINUX_BUDGET = 0.002

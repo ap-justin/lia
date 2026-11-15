@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
 import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import { runLia } from "../evals/eval-helpers";
+import { EVAL_ERROR_PREFIX } from "./shell-eval-error";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
@@ -450,6 +451,35 @@ describe("lia ask shell startup files", () => {
     expect(result.stderr).not.toContain("shell snapshot unavailable");
   }, TIMEOUT);
 
+  // Wrappers such as Socket Firewall's `pnpm` call a helper whose name starts
+  // with `_`, which completion functions share.
+  test("a startup-file wrapper that calls an underscore helper runs through the snapshot", async () => {
+    const root = createRoot();
+    writeStartupFiles(
+      root.home,
+      "printf 'loaded\\n' >> \"$HOME/rc.log\"\n" +
+        "_lia_wrap_helper() { printf 'LIA_WRAPPED_HELPER_OK %s\\n' \"$*\"; }\n" +
+        "liawrapped() { _lia_wrap_helper liawrapped \"$@\"; }\n",
+    );
+    const gateway = startFakeGateway([
+      userShellRun("wrapped", "liawrapped install"),
+      fakeGatewayFinalText("Wrapper checked.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runLia(
+      ["ask", "--json", "--yolo", "--no-save", "Run the wrapped command."],
+      { cwd: root.workspace, env: { ...gatewayEnv(root.home, gateway), LIA_SOUND: "0" }, timeoutMs: TIMEOUT },
+    );
+
+    expect(result.code).toBe(0);
+    expect(gateway.requests[1]!.body).toContain("LIA_WRAPPED_HELPER_OK liawrapped install");
+    expect(gateway.requests[1]!.body).not.toContain("command not found");
+    // The capture is the only full startup, so the command ran from the snapshot.
+    expect(startupLoads(root.home)).toBe(1);
+    expect(result.stderr).not.toContain("shell snapshot unavailable");
+  }, TIMEOUT);
+
   test("a user-profile command with a quoting error carries rewrite guidance", async () => {
     const root = createRoot();
     const gateway = startFakeGateway([
@@ -464,10 +494,10 @@ describe("lia ask shell startup files", () => {
     );
 
     expect(result.code).toBe(0);
-    // The snapshot runs the command through eval, so zsh reports the error as
-    // `(eval):1:` and bash as `/dev/fd/0: eval:` instead of under the shell's name.
+    // The snapshot runs the command through eval, so each shell reports the
+    // error under `eval` instead of under its own name; see shell-eval-error.ts.
     expect(result.stderr).not.toContain("shell snapshot unavailable");
-    expect(gateway.requests[1]!.body).toMatch(/\(eval\):1:|\/dev\/fd\/0: eval:/);
+    expect(gateway.requests[1]!.body).toMatch(EVAL_ERROR_PREFIX);
     expect(gateway.requests[1]!.body).toContain("The shell could not parse this command");
   }, TIMEOUT);
 

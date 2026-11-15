@@ -153,6 +153,50 @@ class WorkflowContractTests(unittest.TestCase):
                 )
                 self.assertIn("          overwrite: true\n", upload)
 
+    def test_lia_jobs_upload_the_crash_reports_macos_wrote(self) -> None:
+        repo_root = pathlib.Path(__file__).resolve().parents[3]
+        workflow = (repo_root / ".github/workflows/pgso-macos-arm64.yml").read_text()
+        for job, output in (("train", "lia-pgso-training"), ("behavior", "lia-pgso-behavior")):
+            with self.subTest(job=job):
+                job_body = re.split(
+                    r"\n  (?=\S)", workflow.split(f"\n  {job}:\n", 1)[1], maxsplit=1
+                )[0]
+                before_upload, upload = job_body.split("uses: actions/upload-artifact@", 1)
+                folder = f"{output}-${{{{ matrix.id }}}}/crash-reports"
+                self.assertIn(
+                    "      - name: Collect lia crash reports\n"
+                    "        if: always()\n"
+                    f'        run: scripts/pgso/collect-crash-reports.sh "$RUNNER_TEMP/{folder}"\n',
+                    before_upload,
+                )
+                self.assertIn(f"            ${{{{ runner.temp }}}}/{folder}\n", upload)
+
+    def test_crash_report_collection_copies_only_lia_reports(self) -> None:
+        script = pathlib.Path(__file__).resolve().parents[1] / "collect-crash-reports.sh"
+        with tempfile.TemporaryDirectory() as tmp:
+            home = pathlib.Path(tmp) / "home"
+            dest = pathlib.Path(tmp) / "out" / "crash-reports"
+            env = {**os.environ, "HOME": str(home)}
+
+            # No report folder at all: nothing to copy, and no empty folder.
+            result = subprocess.run([str(script), str(dest)], env=env, capture_output=True, text=True)
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertEqual("lia crash reports: 0\n", result.stdout)
+            self.assertFalse(dest.exists())
+
+            reports = home / "Library/Logs/DiagnosticReports"
+            reports.mkdir(parents=True)
+            for name in ("lia-2026-11-12-083254.ips", "lia-2026-11-12-083301.crash",
+                         "liapanicprobe-2026-11-12-083254.ips", "bun-2026-11-12-083254.ips"):
+                (reports / name).write_text(name)
+            result = subprocess.run([str(script), str(dest)], env=env, capture_output=True, text=True)
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertEqual("lia crash reports: 2\n", result.stdout)
+            self.assertEqual(
+                ["lia-2026-11-12-083254.ips", "lia-2026-11-12-083301.crash"],
+                sorted(path.name for path in dest.iterdir()),
+            )
+
     def test_linux_workflows_differ_only_in_architecture(self) -> None:
         workflows = pathlib.Path(__file__).resolve().parents[3] / ".github/workflows"
         expected = (workflows / "pgso-linux-arm64.yml").read_text()
@@ -289,7 +333,7 @@ class ShardPlanningTests(unittest.TestCase):
             {
                 "include": [
                     {"name": name}
-                    for name in ("help", "version", "status", "doctor", "sessions")
+                    for name in ("help", "version", "status", "sessions")
                 ]
             },
             run_plan("startup", missing_corpus, 20),
@@ -560,15 +604,15 @@ class ShardAggregationTests(unittest.TestCase):
 
     def test_measurement_aggregate_requires_all_passing_gates(self) -> None:
         measurements = aggregate_measurement_shards(
-            (self.measurement("startup-help"), self.measurement("startup-doctor")),
+            (self.measurement("startup-help"), self.measurement("startup-sessions")),
             phase="startup",
-            expected_names=("startup-help", "startup-doctor"),
+            expected_names=("startup-help", "startup-sessions"),
             expected_identity=self.identity,
             expected_artifact_sha256="e" * 64,
         )
 
         self.assertEqual(
-            ["startup-help", "startup-doctor"],
+            ["startup-help", "startup-sessions"],
             [item["name"] for item in measurements],
         )
 
