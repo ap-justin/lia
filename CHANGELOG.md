@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## lia 0.1.2
 
 ### Changes
 
@@ -12,7 +12,7 @@
 
 ### Fixes
 
-- ACP clients that use the first `model` select as their model picker, such as OpenBot, now show the models instead of the provider. `session/new`, `session/load`, `session/resume` and `session/set_config_option` list `model` before `provider`, and `provider`, `fast` and `ultrafast` have the custom categories `_provider`, `_fast` and `_ultrafast`, so `model` is the only option with category `model`. `provider` still switches through `session/set_config_option`.
+- ACP clients that use the first `model` select as their model picker, such as OpenBot, now list the models instead of the provider. `session/new`, `session/load`, `session/resume` and `session/set_config_option` put `model` before `provider`, and `provider`, `fast` and `ultrafast` use the categories `_provider`, `_fast` and `_ultrafast`, so `model` is the only option in the `model` category. `provider` still switches through `session/set_config_option`.
 
 ## lia 0.1.1
 
