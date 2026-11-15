@@ -76,7 +76,9 @@ pub const Error = error{
 };
 
 /// This API requires an output limit, so a request without one gets this.
-const default_max_tokens = 4096;
+/// Thinking shares it. The smallest documented max output of any Claude model
+/// (Opus 4 and 4.1), so no model a connection can name refuses it.
+const default_max_tokens = 32_000;
 const max_selected_tools = function_tools.max_selected_tools;
 const max_name_bytes = function_tools.max_name_bytes;
 const max_history_arguments_bytes = 1024 * 1024;
@@ -90,8 +92,8 @@ fn validate_request(request: stream_provider.RequestData, effort_declared: bool)
     if (options.reasoning != null and !effort_declared) return error.UnsupportedProviderOption;
     if (options.fast or options.prompt_caching) return error.UnsupportedProviderOption;
     if (options.provider_order.len != 0) return error.UnsupportedProviderOption;
-    // A structured reply travels as a forced tool: its schema is the tool's
-    // input schema and its name the tool's name.
+    // A structured reply travels as a tool: its schema is the tool's input
+    // schema and its name the tool's name.
     if (request.response_format) |format| {
         if (format.schema != .object) return error.UnsupportedResponseFormat;
         function_tools.validate_name(format.name) catch return error.UnsupportedResponseFormat;
@@ -209,7 +211,7 @@ pub fn build_request(alloc: Allocator, input: stream_provider.RequestData, optio
     var request = input;
     request.messages = projected orelse input.messages;
     try validate_history(alloc, request.messages);
-    // A structured reply's forced tool is the only tool the request sends.
+    // A structured reply's tool is the only tool the request sends.
     var functions: std.ArrayList(function_tools.Function) = if (request.response_format == null)
         try function_tools.select_functions(alloc, request.tools, request.tool_choice, request.vision_mode)
     else
@@ -236,6 +238,9 @@ fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provi
     try writer.print(",\"max_tokens\":{d},\"stream\":true", .{request.max_output_tokens orelse default_max_tokens});
     try write_system(writer, alloc, request.instructions);
     try write_messages(writer, alloc, request, projection);
+    const effort_fields = if (request.provider_options.reasoning != null) options.effort_fields orelse request_fragment.Fragment{} else request_fragment.Fragment{};
+    // The API refuses a forced choice (`any`, `tool`) with thinking on.
+    const may_force = !(try thinks(alloc, options.request_fields, effort_fields));
     if (request.response_format) |format| {
         try writer.writeAll(",\"tools\":[{\"name\":");
         try std.json.Stringify.value(format.name, .{}, writer);
@@ -245,11 +250,17 @@ fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provi
         }
         try writer.writeAll(",\"input_schema\":");
         try std.json.Stringify.value(format.schema, .{}, writer);
-        // Forced whatever the connection's tool-choice setting: without it the
-        // reply has no structure.
-        try writer.writeAll("}],\"tool_choice\":{\"type\":\"tool\",\"name\":");
-        try std.json.Stringify.value(format.name, .{}, writer);
-        try writer.writeByte('}');
+        // Forced whatever the connection's tool-choice setting, since without
+        // it the reply may have no structure; with thinking on, `auto` with
+        // this one tool is the most the API allows.
+        try writer.writeAll("}],\"tool_choice\":");
+        if (may_force) {
+            try writer.writeAll("{\"type\":\"tool\",\"name\":");
+            try std.json.Stringify.value(format.name, .{}, writer);
+            try writer.writeByte('}');
+        } else {
+            try writer.writeAll("{\"type\":\"auto\"}");
+        }
     } else if (functions.len != 0) {
         try writer.writeAll(",\"tools\":[");
         for (functions, 0..) |function, index| {
@@ -270,15 +281,37 @@ fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provi
             const choice: types.ToolChoice = if (request.vision_mode == .required) .required else request.tool_choice;
             try writer.writeAll(switch (choice) {
                 .auto => ",\"tool_choice\":{\"type\":\"auto\"}",
-                .required => ",\"tool_choice\":{\"type\":\"any\"}",
+                .required => if (may_force) ",\"tool_choice\":{\"type\":\"any\"}" else ",\"tool_choice\":{\"type\":\"auto\"}",
                 .none => ",\"tool_choice\":{\"type\":\"none\"}",
             });
         }
     }
     // Last, so every field above is lia's own: the settings cannot name one.
-    const effort_fields = if (request.provider_options.reasoning != null) options.effort_fields orelse request_fragment.Fragment{} else request_fragment.Fragment{};
     try request_fragment.write(writer, options.request_fields, effort_fields);
     try writer.writeByte('}');
+}
+
+/// Whether the `thinking` field the settings send, the level's over the
+/// model's (`request_fragment.write`), leaves thinking on. Model ids are
+/// opaque, so only a `"disabled"` type counts as off; a field lia cannot read
+/// counts as on, because `auto` is accepted either way.
+fn thinks(alloc: Allocator, request_fields: request_fragment.Fragment, level: request_fragment.Fragment) Allocator.Error!bool {
+    const value_json = field_json(level, "thinking") orelse field_json(request_fields, "thinking") orelse return false;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return true,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return true;
+    const kind = parsed.value.object.get("type") orelse return true;
+    return kind != .string or !std.mem.eql(u8, kind.string, "disabled");
+}
+
+fn field_json(fragment: request_fragment.Fragment, key: []const u8) ?[]const u8 {
+    for (fragment.fields) |field| {
+        if (std.mem.eql(u8, field.key, key)) return field.value_json;
+    }
+    return null;
 }
 
 /// The instructions, joined, as the one `system` string this API takes.
@@ -1373,7 +1406,7 @@ test "anthropic messages builds the exact body for a full conversation" {
     const root = parsed.value.object;
     try expect_keys(root, &.{ "model", "max_tokens", "stream", "system", "messages", "tools", "tool_choice" });
     try std.testing.expectEqualStrings("claude-local", root.get("model").?.string);
-    try std.testing.expectEqual(@as(i64, 4096), root.get("max_tokens").?.integer);
+    try std.testing.expectEqual(@as(i64, 32_000), root.get("max_tokens").?.integer);
     try std.testing.expect(root.get("stream").?.bool);
     try std.testing.expectEqualStrings("first\n\nsecond", root.get("system").?.string);
 
@@ -1452,7 +1485,7 @@ test "anthropic messages merges consecutive roles and starts with a user turn" {
     const body = try build_request(alloc, request, .{});
     defer alloc.free(body);
     try std.testing.expectEqualStrings(
-        \\{"model":"claude-local","max_tokens":4096,"stream":true,"messages":[{"role":"user","content":[{"type":"text","text":"a"},{"type":"text","text":"b"}]},{"role":"assistant","content":[{"type":"text","text":"c"},{"type":"text","text":"d"}]},{"role":"user","content":[{"type":"text","text":"e"}]}]}
+        \\{"model":"claude-local","max_tokens":32000,"stream":true,"messages":[{"role":"user","content":[{"type":"text","text":"a"},{"type":"text","text":"b"}]},{"role":"assistant","content":[{"type":"text","text":"c"},{"type":"text","text":"d"}]},{"role":"user","content":[{"type":"text","text":"e"}]}]}
     , body);
     request.messages = &.{ .{ .role = .assistant, .content = "first" }, .{ .role = .user, .content = "then" } };
     try std.testing.expectError(error.InvalidProviderPrompt, build_request(alloc, request, .{}));
@@ -1465,7 +1498,7 @@ test "anthropic messages merges consecutive roles and starts with a user turn" {
     const measured = try build_request(alloc, request, .{});
     defer alloc.free(measured);
     try std.testing.expectEqualStrings(
-        \\{"model":"claude-local","max_tokens":4096,"stream":true,"messages":[]}
+        \\{"model":"claude-local","max_tokens":32000,"stream":true,"messages":[]}
     , measured);
 }
 
@@ -1562,6 +1595,88 @@ test "anthropic messages tool choice controls" {
     try std.testing.expectError(error.UnexpectedToolCall, test_consume(alloc, test_tool_wire, request, null));
     request.tool_choice = .required;
     try std.testing.expectError(error.RequiredToolMissing, test_consume(alloc, test_text_wire, request, null));
+}
+
+test "anthropic messages output limit defaults to one every model accepts and a configured limit wins" {
+    const alloc = std.testing.allocator;
+    var request = test_request();
+    for ([_]?u32{ null, 128_000, 73 }, [_]i64{ 32_000, 128_000, 73 }) |limit, sent| {
+        request.max_output_tokens = limit;
+        const body = try build_request(alloc, request, .{});
+        defer alloc.free(body);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(sent, parsed.value.object.get("max_tokens").?.integer);
+    }
+}
+
+fn expect_tool_choice(alloc: Allocator, request: stream_provider.RequestData, options: Options, expected: []const u8) !void {
+    const body = try build_request(alloc, request, options);
+    defer alloc.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const choice = parsed.value.object.get("tool_choice").?.object;
+    try std.testing.expectEqualStrings(expected, choice.get("type").?.string);
+    try std.testing.expectEqual(std.mem.eql(u8, expected, "tool"), choice.get("name") != null);
+}
+
+test "anthropic messages sends no forced tool choice with thinking on" {
+    const alloc = std.testing.allocator;
+    const enabled: request_fragment.Fragment = .{ .fields = &.{.{ .key = "thinking", .value_json = "{\"type\":\"enabled\",\"budget_tokens\":1024}" }} };
+    const adaptive: request_fragment.Fragment = .{ .fields = &.{.{ .key = "thinking", .value_json = "{\"type\":\"adaptive\"}" }} };
+    const disabled: request_fragment.Fragment = .{ .fields = &.{.{ .key = "thinking", .value_json = "{\"type\":\"disabled\"}" }} };
+    const unreadable: request_fragment.Fragment = .{ .fields = &.{.{ .key = "thinking", .value_json = "true" }} };
+    const other: request_fragment.Fragment = .{ .fields = &.{.{ .key = "temperature", .value_json = "0.2" }} };
+    var required = test_tool_request();
+    required.tool_choice = .required;
+    var structured = test_request();
+    structured.tool_choice = .none;
+    structured.response_format = .{ .name = "vision_result", .description = "", .schema = .{ .object = .empty } };
+
+    const cases = [_]struct { request_fields: request_fragment.Fragment = .{}, level: ?request_fragment.Fragment = null, forced: bool }{
+        .{ .forced = true },
+        .{ .request_fields = other, .forced = true },
+        .{ .request_fields = disabled, .forced = true },
+        .{ .request_fields = enabled, .forced = false },
+        .{ .request_fields = adaptive, .forced = false },
+        .{ .request_fields = unreadable, .forced = false },
+        .{ .level = enabled, .forced = false },
+        // The level's field is the one sent.
+        .{ .request_fields = enabled, .level = disabled, .forced = true },
+        .{ .request_fields = disabled, .level = adaptive, .forced = false },
+    };
+    for (cases) |case| {
+        var options: Options = .{ .tool_choice_mode = .send, .request_fields = case.request_fields, .effort_fields = case.level };
+        if (case.level != null) {
+            required.provider_options.reasoning = types.ReasoningEffort.literal("high");
+            structured.provider_options.reasoning = types.ReasoningEffort.literal("high");
+        } else {
+            required.provider_options.reasoning = null;
+            structured.provider_options.reasoning = null;
+        }
+        try expect_tool_choice(alloc, required, options, if (case.forced) "any" else "auto");
+        try expect_tool_choice(alloc, structured, options, if (case.forced) "tool" else "auto");
+        options.tool_choice_mode = .omit;
+        try expect_tool_choice(alloc, structured, options, if (case.forced) "tool" else "auto");
+    }
+
+    // A level's thinking stays out without an effort, so the choice stays forced.
+    required.provider_options.reasoning = null;
+    try expect_tool_choice(alloc, required, .{ .tool_choice_mode = .send, .effort_fields = enabled }, "any");
+    // Thinking leaves an unforced choice as it was.
+    for ([_]types.ToolChoice{ .auto, .none }) |choice| {
+        var request = test_tool_request();
+        request.tool_choice = choice;
+        const body = try build_request(alloc, request, .{ .tool_choice_mode = .send, .request_fields = enabled });
+        defer alloc.free(body);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+        defer parsed.deinit();
+        if (choice == .auto) {
+            try std.testing.expectEqualStrings("auto", parsed.value.object.get("tool_choice").?.object.get("type").?.string);
+        } else {
+            try std.testing.expect(parsed.value.object.get("tool_choice") == null);
+        }
+    }
 }
 
 test "anthropic messages thinking blocks round-trip through provider state" {
