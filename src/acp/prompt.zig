@@ -9,6 +9,7 @@ const credentials = @import("../core/auth/credentials.zig");
 const model_provider = @import("../core/config/model_provider.zig");
 const host = @import("../core/hosts/host.zig");
 const session_title_generation = @import("../core/session/session_title_generation.zig");
+const token_pass_team = @import("../core/gateway/token_pass_team.zig");
 const io_mod = @import("../core/shared/io.zig");
 const select_watch = @import("../core/shared/select_watch.zig");
 const image_attachments = @import("../core/images/image_attachments.zig");
@@ -25,7 +26,6 @@ const diff_mod = @import("../core/output/diff.zig");
 const file_mutation = @import("../core/tooling/file_mutation.zig");
 const file_mutation_contract = @import("../core/tooling/file_mutation_contract.zig");
 const catalog_state = @import("../core/mcp/catalog_state.zig");
-const mcp_model_catalog = @import("../core/mcp/model_catalog.zig");
 const mcp_elicitation = @import("../core/mcp/elicitation.zig");
 const mrtr = @import("../core/mcp/mrtr.zig");
 const permission_auto_classifier = @import("../core/permissions/auto_classifier.zig");
@@ -389,15 +389,17 @@ const AcpContext = struct {
     fn sendToolCallPending(self: *AcpContext, arena: Allocator, call: ToolCall) ![]const u8 {
         if (self.published_tool_calls.getKey(call.id)) |published| return published;
         const registry = self.toolRegistry();
-        const mcp_identity = if (registry.lookup(call.name) == null) self.mcpToolIdentity(arena, call.name) else null;
-        if (mcp_identity) |identity| self.rememberToolIdentity(call.name, identity);
-        const presentation = tool_call_presentation.describeToolCall(registry, arena, call, mcp_identity);
-        const name = acpToolName(call.name);
+        // A toolbox run shows as the tool it runs.
+        const shown = try tool_call_presentation.shownCall(arena, call);
+        const mcp_identity = if (registry.lookup(shown.name) == null) self.mcpToolIdentity(arena, shown.name) else null;
+        if (mcp_identity) |identity| self.rememberToolIdentity(shown.name, identity);
+        const presentation = tool_call_presentation.describeToolCall(registry, arena, shown, mcp_identity);
+        const name = acpToolName(shown.name);
         const kind = mapToolKind(name);
         const masked_arguments = try agent_execution_memory.redactToolArgumentsJson(
             arena,
-            call.name,
-            call.arguments_json,
+            shown.name,
+            shown.arguments_json,
         );
         defer arena.free(masked_arguments);
         var parsed_arguments: ?std.json.Parsed(std.json.Value) = std.json.parseFromSlice(
@@ -821,13 +823,9 @@ pub fn handlePrompt(
         };
     }
 
-    try refreshProjectContext(
-        state,
-        alloc,
-        prompt_input.targets,
-        prompt_input.omissions,
-        prompt_input.omission_summary,
-    );
+    // The prompt's attached files stay out of the instructions: the runtime
+    // delivers their folders' rules as a note on the turn's own message.
+    try refreshProjectContext(state, alloc);
 
     session.pending_prompt_id = msg.id;
     defer session.pending_prompt_id = null;
@@ -871,6 +869,7 @@ pub fn handlePrompt(
         .permission_mode = captured_permission_mode,
         .permission_rules = session.permission_rules,
         .subagent_available = state.subagent_host != null,
+        .behind_toolbox = state.toolbox_behind.slice(),
     });
     defer tool_projection.deinit(alloc);
 
@@ -920,6 +919,11 @@ pub fn handlePrompt(
         .root_user_intent_context = root_user_intent_context,
         .grants = session.session_grants,
         .context_snapshot = context_snapshot,
+        .attached_files = .{
+            .targets = prompt_input.targets,
+            .omissions = prompt_input.omissions,
+            .omission_summary = prompt_input.omission_summary,
+        },
     };
 
     // A turn whose completions report no tokens sends no `usage_update`.
@@ -938,6 +942,11 @@ pub fn handlePrompt(
         .custom_tool_guidance = tool_projection.custom_guidance,
     });
     agent_config.session_child_capability = sessionChildCapability(session);
+    agent_config.toolbox_behind = state.toolbox_behind.slice();
+    // The toolbox menu lists the configured MCP servers, by name.
+    if (session.mcp_host) |h| {
+        agent_config.toolbox_mcp_servers = try h.catalog.serverNames(dynamic_tool_arena.allocator());
+    }
     maybeStartAcpTitleTask(state, session, owned_prompt, ctx.observer);
     defer if (session.title_task != null) completeAcpTitleTask(state, session);
     agent_runtime.processAgentPrompt(&session.session_rt.agent, &deps, null, .{
@@ -990,10 +999,17 @@ fn maybeStartAcpTitleTask(
     if (session.session_rt.agent.history.items.len != 0) return;
     const session_id = if (session.v2) |v2| v2.id() else return;
     const bundle = state.cfg.provider_set.select(session.provider);
-    const title_model = bundle.title_model orelse return;
+    const provider_title_model = bundle.title_model orelse return;
+    // A Token Pass session of a team with Token Pass titles itself with a
+    // Token Pass model.
+    const title_model = if (session.provider == .gateway)
+        token_pass_team.modelForSideCall(.title, session.model, provider_title_model)
+    else
+        provider_title_model;
     const agent_stream = bundle.agent_stream orelse return;
     const excerpt = session_title_generation.promptExcerpt(prompt_text) orelse return;
-    if (session.credential_source != .host_managed and session.api_key.len == 0) return;
+    // A custom connection may need no key; its adapter checks the one it gets.
+    if (session.credential_source != .host_managed and session.credential_source != .configured and session.api_key.len == 0) return;
     const task = session_title_generation.Task.create(.{
         .observer = observer,
         .session_id = session_id,
@@ -1003,6 +1019,7 @@ fn maybeStartAcpTitleTask(
         .gateway_team = state.gateway_team,
         .account_id = session.account_id,
         .credential_source = session.credential_source,
+        .reads_shared_sign_in = true,
         .stream_provider = agent_stream,
     }) catch return;
     task.spawn() catch |err| {
@@ -1083,12 +1100,14 @@ pub fn runSubagentChild(
             .permission_mode = admission.permission_mode,
             .permission_rules = admission.rules,
             .subagent_available = true,
+            .behind_toolbox = state.toolbox_behind.slice(),
         },
     ) catch return error.OutOfMemory;
     defer child_projection.deinit(alloc);
     var skill_catalog = state.skills.acquireCatalog();
     defer skill_catalog.deinit();
     return subagent_agent_adapter.run(.{
+        .toolbox_behind = state.toolbox_behind.slice(),
         .host = subagent_host,
         .tool_context = ctx.toolContext(),
         .provider_set = state.cfg.provider_set,
@@ -1108,9 +1127,6 @@ pub fn runSubagentChild(
 fn refreshProjectContext(
     state: *server.ServerState,
     alloc: Allocator,
-    targets: []const context_contract.ApplicableTarget,
-    omissions: []const context_contract.ContextOmissionInput,
-    omission_summary: ?context_contract.ContextOmissionSummary,
 ) context_contract.ProviderError!void {
     state.context_snapshot.deinit(alloc);
     if (!state.context_enabled) return;
@@ -1118,9 +1134,6 @@ fn refreshProjectContext(
     state.context_snapshot = state.cfg.context_registry.gatherDefaultSnapshot(alloc, .{
         .workspace_root = state.workspace_root,
         .access_scope = state.workspace_access.scope(state.workspace_root),
-        .targets = targets,
-        .omissions = omissions,
-        .omission_summary = omission_summary,
         .context_limits = state.context_limits,
     }) catch |err| {
         debug_trace.logf("context", "acp gather failed err={s}", .{@errorName(err)});
@@ -1527,7 +1540,6 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .validate_tool_call = validateToolCall,
         .snapshot_mcp_definition = snapshotMcpDefinition,
         .resolve_unselected_mcp_tool = resolveUnselectedMcpTool,
-        .prepare_skill_call = prepareSkillCall,
         .check_tool_availability = checkToolAvailability,
         .request_tool_permission = requestToolPermissionOutcomeWithRequest,
         .request_prepared_file_mutation_permission = requestPreparedFileMutationPermissionOutcomeForRuntime,
@@ -1554,6 +1566,8 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .push_diff_block = pushDiffBlock,
         .push_system_notice = pushSystemNotice,
         .push_context_notice = pushContextNotice,
+        // The same path: once per session, as a notice where the client shows them.
+        .push_session_notice = pushContextNotice,
         .push_command_output_complete = pushCommandOutputComplete,
         .push_http_error = pushHttpError,
         .refresh_gateway_credential = refreshGatewayCredential,
@@ -1619,15 +1633,20 @@ fn refreshGatewayCredential(
     source: types.CredentialSource,
     mode: auth_runtime.CredentialRefreshMode,
     expected_account_id: ?[]const u8,
-) !?[]u8 {
+    rejected_token: ?[]const u8,
+) !?agent_runtime.RefreshedGatewayCredential {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw));
-    return server.refreshModelCredential(
+    // The server refuses a team change during a request, so the request
+    // keeps its team.
+    const token = (try server.refreshModelCredential(
         @ptrCast(ctx.state),
         alloc,
         source,
         mode,
         expected_account_id,
-    );
+        rejected_token,
+    )) orelse return null;
+    return .{ .token = token };
 }
 
 /// The prompt's session while it is still the active one.
@@ -1773,6 +1792,9 @@ fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.Ar
         .interactive = false,
         .permission_mode = ctx.captured_permission_mode orelse session.permission_mode,
         .model = ctx.captured_model orelse session.model,
+        // ACP's turns have no id here, so its list is read afresh at each
+        // step; its reports never join a turn, so a change shows at once.
+        .subagents = if (ctx.state.subagent_host) |team_host| try team_host.teamNote(arena, 0) else null,
     }, arena, messages);
 }
 
@@ -1781,20 +1803,8 @@ fn appendStaticContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.Arr
     try ctx.state.cfg.context_registry.appendDefaultStatic(.{
         .project_context = ctx.modelVisibleProjectContext(),
     }, arena, messages);
-    const active_session = if (ctx.state.active_session) |*session| session else null;
-    var snapshot = if (active_session) |session|
-        if (session.mcp_host) |h|
-            try h.catalog.modelSnapshot(arena)
-        else
-            try mcp_model_catalog.Snapshot.empty(arena)
-    else
-        try mcp_model_catalog.Snapshot.empty(arena);
-    defer snapshot.deinit(arena);
-    const section = try mcp_model_catalog.render(arena, snapshot);
-    if (section.text.len > 0) {
-        try messages.append(arena, .{ .role = .system, .content = section.text });
-    }
-    if (section.notice) |notice| try pushContextNotice(raw_ctx, notice);
+    // The toolbox menu lists the MCP servers (toolbox_mcp_servers), so there
+    // is no MCP block here.
 }
 
 fn snapshotMcpDefinition(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, known: tool_mcp_runtime.Binding) !tool_mcp_runtime.DefinitionSnapshot {
@@ -1821,11 +1831,6 @@ fn validateToolCall(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall) !agen
 fn checkToolAvailability(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall) !?[]const u8 {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     return tool_runtime.checkToolAvailability(ctx.toolContext(), arena, call);
-}
-
-fn prepareSkillCall(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, locations: ?*const skill_contract.Locations) !skill_contract.CallPreparation {
-    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    return tool_runtime.prepareSkillCall(ctx.toolContext(), arena, call, locations);
 }
 
 fn requestPreparedFileMutationPermissionOutcomeForRuntime(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, prepared: *tool_admission.PreparedFileMutationCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?agent_runtime.LiveToolAuthority, advertised_dynamic_tool_names: []const []const u8) !command_admission.PermissionOutcome {
@@ -2367,6 +2372,8 @@ fn runReportTurns(
         job.delivery = .continuation;
         job.images = &.{};
         job.authorized_image_catalog = &.{};
+        // The first turn's attachments have delivered their folders' rules.
+        job.attached_files = .{};
         job.history = history;
         job.unversioned_history_count = session.session_rt.unversionedHistoryEnd();
         job.recovery_checkpoint = null;
@@ -4238,19 +4245,19 @@ test "ACP refreshes typed registry context and propagates enabled gathering erro
     var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
     defer state.deinit();
 
-    try refreshProjectContext(&state, alloc, &.{}, &.{}, null);
+    try refreshProjectContext(&state, alloc);
     try std.testing.expectEqual(@as(usize, 1), AcpContextRegistryFixture.gather_calls);
     var contribution = state.context_snapshot.contribution orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("test.acp_context", contribution.provider_id);
     try std.testing.expectEqualStrings("ACP registry context 1", contribution.content);
 
-    try refreshProjectContext(&state, alloc, &.{}, &.{}, null);
+    try refreshProjectContext(&state, alloc);
     try std.testing.expectEqual(@as(usize, 2), AcpContextRegistryFixture.gather_calls);
     contribution = state.context_snapshot.contribution orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("ACP registry context 2", contribution.content);
 
     state.context_enabled = false;
-    try refreshProjectContext(&state, alloc, &.{}, &.{}, null);
+    try refreshProjectContext(&state, alloc);
     try std.testing.expectEqual(@as(usize, 2), AcpContextRegistryFixture.gather_calls);
     try std.testing.expect(state.context_snapshot.contribution == null);
 
@@ -4258,7 +4265,7 @@ test "ACP refreshes typed registry context and propagates enabled gathering erro
     AcpContextRegistryFixture.gather_error = error.WriteFailed;
     try std.testing.expectError(
         error.WriteFailed,
-        refreshProjectContext(&state, alloc, &.{}, &.{}, null),
+        refreshProjectContext(&state, alloc),
     );
     try std.testing.expectEqual(@as(usize, 3), AcpContextRegistryFixture.gather_calls);
     try std.testing.expect(state.context_snapshot.contribution == null);
@@ -4298,7 +4305,7 @@ test "ACP registry callbacks preserve snapshot bytes before transient context" {
 
     var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
     defer state.deinit();
-    try refreshProjectContext(&state, alloc, &.{}, &.{}, null);
+    try refreshProjectContext(&state, alloc);
 
     var ctx = AcpContext{
         .alloc = alloc,
@@ -4325,11 +4332,10 @@ test "ACP registry callbacks preserve snapshot bytes before transient context" {
     try deps.append_static_context.?(deps.ctx, arena, &messages);
     try deps.append_runtime_context(deps.ctx, arena, &messages);
 
-    try std.testing.expectEqual(@as(usize, 4), messages.items.len);
+    try std.testing.expectEqual(@as(usize, 3), messages.items.len);
     try std.testing.expectEqualStrings("base system", messages.items[0].content.?);
     try std.testing.expectEqualStrings("ACP registry context 1", messages.items[1].content.?);
-    try std.testing.expect(std.mem.find(u8, messages.items[2].content.?, "<mcp_servers>") != null);
-    try std.testing.expectEqualStrings("ACP registry transient", messages.items[3].content.?);
+    try std.testing.expectEqualStrings("ACP registry transient", messages.items[2].content.?);
     try std.testing.expectEqualStrings("ACP registry context 1", AcpContextRegistryFixture.static_context.?);
     try std.testing.expectEqual(@as(usize, 1), AcpContextRegistryFixture.transient_calls);
     try std.testing.expectEqual(

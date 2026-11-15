@@ -22,6 +22,7 @@ import {
   fakeGatewayToolCall,
   reviewedActionEvidence,
   startFakeGateway,
+  tokenPassCatalog,
 } from "./fake-gateway";
 
 const TIMEOUT = 30_000;
@@ -167,8 +168,9 @@ function startGateway(
   classifierResponses: NonNullable<
     Parameters<typeof startFakeGateway>[1]
   >["classifierResponses"] = [],
+  options: Omit<NonNullable<Parameters<typeof startFakeGateway>[1]>, "classifierResponses"> = {},
 ) {
-  const gateway = startFakeGateway(responses, { classifierResponses });
+  const gateway = startFakeGateway(responses, { ...options, classifierResponses });
   gateways.push(gateway);
   return gateway;
 }
@@ -679,6 +681,61 @@ describe("lean auto mode reliability", () => {
       expect(result.stderr).not.toContain(COMMAND_APPROVAL_PROMPT);
     },
     TIMEOUT,
+  );
+
+  test(
+    "a Token Pass session is reviewed by a Token Pass model unless review_model names another or the team has no Token Pass",
+    async () => {
+      const cases = [
+        { hasPass: true, reviewModel: undefined, reviewer: "deepseek/deepseek-v4.1-flash" },
+        { hasPass: true, reviewModel: "openai/gpt-6-sol", reviewer: "openai/gpt-6-sol" },
+        { hasPass: false, reviewModel: undefined, reviewer: "openai/gpt-5.6-luna" },
+      ];
+      for (const { hasPass, reviewModel, reviewer } of cases) {
+        const root = createIsolatedRoot();
+        const marker = join(root.root, "deployment-ran");
+        const bin = installRecorder(root, "vercel", marker);
+        const deployCommand = `${join(bin, "vercel")} deploy --prod`;
+        const gateway = startGateway(
+          [
+            userCommandCall(deployCommand, "token_pass_deploy"),
+            fakeGatewayFinalText("deployment completed"),
+          ],
+          [fakeGatewayPermissionDecision("clear", "token_pass_deploy_clear")],
+          {
+            models: tokenPassCatalog(hasPass),
+            usage: (url) => url.pathname === "/coding-agent/v1/credits"
+              ? Response.json({ balance: "5.00", token_pass: hasPass ? { remaining: "79.92906" } : null })
+              : null,
+          },
+        );
+
+        const result = await runLia(
+          ["ask", "--quiet", "--json", "--no-save", "Deploy the site."],
+          {
+            cwd: root.workspace,
+            env: {
+              ...gatewayEnv(root, gateway),
+              LIA_MODEL: "zai/glm-5.3",
+              LIA_REVIEW_MODEL: reviewModel,
+              PATH: `${bin}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+            },
+            timeoutMs: TIMEOUT,
+          },
+        );
+
+        expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+        expect(gateway.classifierRequests).toHaveLength(1);
+        expect(
+          gateway.classifierRequests[0]!.headers.get("ai-language-model-id"),
+        ).toBe(reviewer);
+        if (reviewer === "deepseek/deepseek-v4.1-flash") {
+          expect(JSON.parse(gateway.classifierRequests[0]!.body).providerOptions).toBeUndefined();
+        }
+        expect(existsSync(marker)).toBe(true);
+      }
+    },
+    TIMEOUT * 2,
   );
 
   test(

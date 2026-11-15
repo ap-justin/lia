@@ -5,6 +5,15 @@ import { join } from "node:path";
 import { LIA_BIN, runLia } from "../evals/eval-helpers";
 import { logLines, rootSessionIds, storeRoot } from "./saved-sessions";
 import {
+  bearer,
+  rotateLiaLogin,
+  signInLiaLoginToTeam,
+  startFakeIssuer,
+  storedLiaLoginToken,
+  unauthorized,
+  writeLiaLogin,
+} from "./lia-login-fakes";
+import {
   fakeGatewayFinalText,
   startDynamicFakeGateway,
 } from "./fake-gateway";
@@ -242,3 +251,128 @@ test("lia ask exits promptly on SIGINT while its title request never answers", a
     rmSync(root.root, { recursive: true, force: true });
   }
 }, 30_000);
+
+// Title requests made with a refreshable sign-in. Another lia process can
+// refresh the shared lia login after this one has read it, so the token it holds
+// in memory is rejected while the store already holds a newer one. The title
+// request sends the stored token, and after a 401 sends once more only with a
+// stored token that replaced the rejected one. It never refreshes the login
+// itself (tests/tla/session_title/SessionTitle.tla BackgroundNeverRefreshes).
+
+const FIRST_PROMPT = "refactor the renderer loop to fix the crash";
+
+function loginEnv(root: FixtureRoot, gateway: { baseUrl: string; chatUrl: string }, issuer: { issuerUrl: string }) {
+  return {
+    ...baseEnv(root, gateway),
+    AI_GATEWAY_API_KEY: undefined,
+    VERCEL_OIDC_TOKEN: undefined,
+    LIA_TEST_OAUTH_ISSUER_URL: issuer.issuerUrl,
+    LIA_OAUTH_CLIENT_ID: "test-client",
+    LIA_NO_OPEN_BROWSER: "1",
+  };
+}
+
+/// A title channel that answers with the generated title only for `accepts`.
+function titleFor(accepts: (token: string) => boolean) {
+  return (_body: string, headers: Headers) =>
+    accepts(bearer(headers)) ? fakeGatewayFinalText(GENERATED_TITLE) : unauthorized();
+}
+
+function titleTokens(gateway: ReturnType<typeof startDynamicFakeGateway>): string[] {
+  return gateway.titleRequests.map((request) => bearer(request.headers));
+}
+
+function lastTitle(root: FixtureRoot): string | undefined {
+  return sessionTitles(root).at(-1);
+}
+
+function startLoginGateway(titles: Array<(body: string, headers: Headers) => Response>) {
+  return startDynamicFakeGateway(_raw => fakeGatewayFinalText("MAIN_ANSWER_OK"), {
+    models: [{ id: MAIN_MODEL, type: "language", tags: ["tool-use"] }],
+    titleResponses: titles,
+  });
+}
+
+async function askWithLogin(label: string, titles: (home: string) => Array<(body: string, headers: Headers) => Response>) {
+  const root = createFixtureRoot(label);
+  const issuer = startFakeIssuer({ refresh: () => "unexpected-refresh" });
+  writeLiaLogin(root.home, issuer.issuerUrl, "launch-token");
+  const gateway = startLoginGateway(titles(root.home));
+  try {
+    const result = await runLia(["ask", FIRST_PROMPT], { cwd: root.workspace, env: loginEnv(root, gateway, issuer), timeoutMs: 30_000 });
+    expect(result.code, result.stderr).toBe(0);
+    expect(result.stdout).toContain("MAIN_ANSWER_OK");
+    // A title request never refreshes the login all lia processes share.
+    expect(issuer.refreshes).toHaveLength(0);
+    return { tokens: titleTokens(gateway), title: lastTitle(root), stored: storedLiaLoginToken(root.home) };
+  } finally {
+    gateway.stop();
+    issuer.stop();
+    rmSync(root.root, { recursive: true, force: true });
+  }
+}
+
+test("lia ask keeps the derived title without refreshing the login when the gateway rejects the stored one", async () => {
+  const rejected = titleFor(() => false);
+  const run = await askWithLogin("login-401-stored", () => [rejected, rejected]);
+  expect(run.tokens).toEqual(["launch-token"]);
+  expect(run.stored).toBe("launch-token");
+  expect(run.title).toContain("refactor the renderer loop");
+}, 45_000);
+
+test("lia ask sends a rejected title with the login another lia already renewed, without refreshing", async () => {
+  const accept = titleFor((token) => token === "other-lia-token");
+  // The first title request arrives after another lia renewed the login.
+  const run = await askWithLogin("login-401-renewed-elsewhere", (home) => [(body, headers) => {
+    rotateLiaLogin(home, "other-lia-token");
+    return accept(body, headers);
+  }, accept, accept]);
+  expect(run.tokens).toEqual(["launch-token", "other-lia-token"]);
+  expect(run.title).toBe(GENERATED_TITLE);
+}, 45_000);
+
+test("lia ask sends the title at most twice while another lia keeps renewing the login", async () => {
+  let renewals = 0;
+  const run = await askWithLogin("login-401-always", (home) => Array.from({ length: 3 }, () => () => {
+    renewals += 1;
+    rotateLiaLogin(home, `other-lia-token-${renewals}`);
+    return unauthorized();
+  }));
+  expect(run.tokens).toEqual(["launch-token", "other-lia-token-1"]);
+  expect(run.title).toContain("refactor the renderer loop");
+}, 45_000);
+
+test("lia ask never sends the title with the login another lia signed in to another team", async () => {
+  const any = titleFor(() => true);
+  const run = await askWithLogin("login-other-team", (home) => [() => {
+    signInLiaLoginToTeam(home, "other-team-token", "team_other");
+    return unauthorized();
+  }, any, any]);
+  expect(run.tokens).toEqual(["launch-token"]);
+  expect(run.stored).toBe("other-team-token");
+  expect(run.title).toContain("refactor the renderer loop");
+}, 45_000);
+
+test("lia ask does not send the title again when the gateway refuses it with 403", async () => {
+  const forbidden = () => Response.json({ error: { message: "Model not allowed", type: "permission_error" } }, { status: 403 });
+  const run = await askWithLogin("login-403", (home) => [() => {
+    rotateLiaLogin(home, "other-lia-token");
+    return forbidden();
+  }, forbidden]);
+  expect(run.tokens).toEqual(["launch-token"]);
+}, 45_000);
+
+test("lia ask sends a static key's rejected title once", async () => {
+  const root = createFixtureRoot("static-key-401");
+  const rejected = titleFor(() => false);
+  const gateway = startLoginGateway([rejected, rejected]);
+  try {
+    const result = await runLia(["ask", FIRST_PROMPT], { cwd: root.workspace, env: baseEnv(root, gateway), timeoutMs: 30_000 });
+    expect(result.code, result.stderr).toBe(0);
+    expect(titleTokens(gateway)).toEqual(["synthetic-title"]);
+    expect(lastTitle(root)).toContain("refactor the renderer loop");
+  } finally {
+    gateway.stop();
+    rmSync(root.root, { recursive: true, force: true });
+  }
+}, 45_000);

@@ -11,6 +11,7 @@ const project_config = @import("../mcp/project_config.zig");
 const model_provider = @import("model_provider.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
+const tool_placement = @import("tool_placement.zig");
 const settings_keys = @import("settings_keys.zig");
 const theme_mod = @import("../shared/theme.zig");
 
@@ -107,6 +108,8 @@ pub const UserSettingsPatch = struct {
     provider_strict: ?bool = null,
     context: ?bool = null,
     cache_warming: ?bool = null,
+    /// One `tool_placement.<tool>` entry.
+    tool_placement: ?ToolPlacementPatch = null,
     /// Removes a plain setting, such as `fast_mode` or `sound.turn_end`,
     /// so it falls back to its default. Distinct from the fields above, where
     /// null means "leave unchanged".
@@ -134,8 +137,16 @@ pub const UserSettingsPatch = struct {
             self.provider_strict == null and
             self.context == null and
             self.cache_warming == null and
+            self.tool_placement == null and
             self.remove == null;
     }
+};
+
+pub const ToolPlacementPatch = struct {
+    /// A built-in tool that can move, `tool_placement.Tool`.
+    tool: []const u8,
+    /// `toolbox` or `direct`.
+    placement: []const u8,
 };
 
 pub const ModelPreferencePatch = struct {
@@ -969,6 +980,11 @@ fn validateUserPatch(patch: UserSettingsPatch) !void {
     if (patch.auto_compact_percent) |percent| {
         if (!compactor.isValidPercent(percent)) return error.InvalidSettingsFormat;
     }
+    if (patch.tool_placement) |entry| {
+        if (tool_placement.Tool.parse(entry.tool) == null or tool_placement.Placement.parse(entry.placement) == null) {
+            return error.InvalidSettingsFormat;
+        }
+    }
     if (patch.remove) |path| {
         if (!removablePath(path)) return error.InvalidSettingsFormat;
     }
@@ -980,7 +996,8 @@ fn removablePath(path: []const u8) bool {
     if (settings_keys.unknownPart(path) != null) return false;
     const dot = std.mem.findScalar(u8, path, '.');
     const key = settings_keys.find(path[0 .. dot orelse path.len]) orelse return false;
-    if (key.map) return false;
+    // A map's entries are free-form; only a tool's placement is one lia sets.
+    if (key.map) return tool_placement.toolOfKey(path) != null;
     return dot == null or key.children.len > 0;
 }
 
@@ -1248,6 +1265,16 @@ fn applyUserPatchToRoot(
     if (patch.provider_strict) |value| application.changed = try putBool(arena, &root.object, "provider_strict", value) or application.changed;
     if (patch.context) |value| application.changed = try putBool(arena, &root.object, "context", value) or application.changed;
     if (patch.cache_warming) |value| application.changed = try putBool(arena, &root.object, "cache_warming", value) or application.changed;
+    if (patch.tool_placement) |entry| {
+        const placements = if (root.object.getPtr("tool_placement")) |value| blk: {
+            if (value.* != .object) return error.InvalidSettingsFormat;
+            break :blk value;
+        } else blk: {
+            try root.object.put(arena, "tool_placement", .{ .object = .empty });
+            break :blk root.object.getPtr("tool_placement").?;
+        };
+        application.changed = try putString(arena, &placements.object, entry.tool, entry.placement) or application.changed;
+    }
     if (patch.remove) |path| application.changed = removePath(&root.object, path) or application.changed;
     try cleanupLegacyWorkspacePreferences(arena, root, patch, &application);
     return application;

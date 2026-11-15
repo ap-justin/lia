@@ -42,6 +42,9 @@ pub const SemanticNotice = struct {
     tone: NoticeTone,
     body: []const u8,
     visibility: NoticeVisibility = .compact_and_full,
+    /// An optional dim line under the body, indented like a wrapped body row
+    /// and without its own glyph.
+    detail: []const u8 = "",
 };
 
 /// Status glyph leading every semantic notice, keyed by tone. Tool activity
@@ -59,22 +62,26 @@ pub fn noticeGlyph(tone: NoticeTone) []const u8 {
     };
 }
 
-/// Returns a duplicate with owned topic and body bytes. The caller frees it
+/// Returns a duplicate with owned topic, body, and detail bytes. The caller frees it
 /// with `freeSemanticNotice` using the same allocator.
 pub fn dupeSemanticNotice(alloc: std.mem.Allocator, notice: SemanticNotice) std.mem.Allocator.Error!SemanticNotice {
     const topic = try alloc.dupe(u8, notice.topic);
     errdefer alloc.free(topic);
+    const body = try alloc.dupe(u8, notice.body);
+    errdefer alloc.free(body);
     return .{
         .topic = topic,
         .tone = notice.tone,
-        .body = try alloc.dupe(u8, notice.body),
+        .body = body,
         .visibility = notice.visibility,
+        .detail = try alloc.dupe(u8, notice.detail),
     };
 }
 
 pub fn freeSemanticNotice(alloc: std.mem.Allocator, notice: SemanticNotice) void {
     alloc.free(notice.topic);
     alloc.free(notice.body);
+    alloc.free(notice.detail);
 }
 
 /// Converts legacy context-notice text into a semantic notice body while
@@ -435,6 +442,10 @@ pub fn plainErrorText(raw: []const u8, buf: []u8) []const u8 {
         .{ "InvalidGatewaySseEvent", "unreadable reply" },
         .{ "MalformedGatewaySseEvent", "unreadable reply" },
         .{ "MalformedChatCompletionsChunk", "unreadable reply" },
+        .{ "InvalidResponsesEvent", "unreadable reply" },
+        .{ "MalformedResponsesEvent", "unreadable reply" },
+        .{ "MalformedMessagesEvent", "unreadable reply" },
+        .{ "ResponsesEventTooLarge", "reply too large to read" },
         .{ "InvalidProviderFinishReason", "unreadable reply" },
         .{ "GatewaySseEventTooLarge", "reply too large to read" },
         // Storage faults read as lia says them on startup and in ACP.
@@ -975,6 +986,14 @@ pub const McpToolBinding = struct {
     }
 };
 
+/// A `toolbox` open or search as the tool it replaced: `skill` with the
+/// skill's name, `mcp_select_tool` with the MCP tool or server, or
+/// `capability_search` with `*`.
+pub const ToolboxLookup = struct {
+    permission: []const u8,
+    target: []const u8,
+};
+
 pub const ToolCall = struct {
     id: []const u8,
     name: []const u8,
@@ -993,7 +1012,31 @@ pub const ToolCall = struct {
     /// command whose saved output a `read_tool_result` call reads. Borrowed
     /// only for this action. Copies and durable/provider encodings omit it.
     resolved_display_target: ?[]const u8 = null,
+    /// The tool the model called when this is the call a `toolbox {run}`
+    /// carries: lia prepares, admits, and runs this call, and its result goes
+    /// back under that name. Borrowed only for this action. Copies and
+    /// durable/provider encodings omit it.
+    carried_by: ?[]const u8 = null,
+    /// What this call stands for when it is a `toolbox` open or search, set
+    /// before admission so the permission rules and a subagent's profile
+    /// decide it as the tool it replaced. Borrowed only for this action.
+    /// Copies and durable/provider encodings omit it.
+    toolbox_lookup: ?ToolboxLookup = null,
+
+    /// The name the model called, which this call's result goes back under.
+    pub fn calledName(self: ToolCall) []const u8 {
+        return self.carried_by orelse self.name;
+    }
 };
+
+/// The prefix of every MCP tool name lia gives the model, which
+/// `src/core/mcp/tool_names.zig` builds.
+pub const mcp_tool_prefix = "mcp_";
+
+/// Whether `name` has the shape of an MCP tool name lia gives the model.
+pub fn isMcpToolName(name: []const u8) bool {
+    return std.mem.startsWith(u8, name, mcp_tool_prefix);
+}
 
 pub const WebSearchProgress = union(enum) {
     query_started: []const u8,
@@ -1331,6 +1374,19 @@ pub const ToolResultMemory = struct {
     command_output_replay: ?CommandOutputReplay = null,
     command_process_presentation: ?CommandProcessPresentation = null,
     terminal_action_presentation: ?TerminalActionPresentation = null,
+    /// Set on a running shell result whose wait ended when its command
+    /// crossed the quiet limit (`src/core/execution/quiet_notice.zig`), for
+    /// the note lia relays to a subagent's parent. Only the tool's end event
+    /// reads it; the session never saves it.
+    quiet_crossing: ?QuietCrossing = null,
+};
+
+/// A shell command that crossed the quiet limit during a wait: its command
+/// line and how long it had printed nothing. Each quiet spell crosses once
+/// (`tests/tla/subagent/QuietRelay.tla`).
+pub const QuietCrossing = struct {
+    command: []const u8,
+    quiet_ms: u64,
 };
 
 pub const ToolExecutionStep = struct {
@@ -1580,6 +1636,10 @@ pub fn dupeToolResultMemory(alloc: std.mem.Allocator, memory: ToolResultMemory) 
     else
         null;
     errdefer if (command_output_replay) |replay| freeCommandOutputReplay(alloc, replay);
+    const quiet_crossing: ?QuietCrossing = if (memory.quiet_crossing) |crossing|
+        .{ .command = try alloc.dupe(u8, crossing.command), .quiet_ms = crossing.quiet_ms }
+    else
+        null;
     return .{
         .review_feedback = memory.review_feedback,
         .tool_images = tool_images,
@@ -1594,6 +1654,7 @@ pub fn dupeToolResultMemory(alloc: std.mem.Allocator, memory: ToolResultMemory) 
         .command_output_replay = command_output_replay,
         .command_process_presentation = memory.command_process_presentation,
         .terminal_action_presentation = memory.terminal_action_presentation,
+        .quiet_crossing = quiet_crossing,
     };
 }
 
@@ -1606,6 +1667,7 @@ pub fn freeToolResultMemory(alloc: std.mem.Allocator, memory: ToolResultMemory) 
     if (memory.preview) |value| alloc.free(value);
     if (memory.committed_file_presentation) |presentation| freeCommittedFilePresentation(alloc, presentation);
     if (memory.command_output_replay) |replay| freeCommandOutputReplay(alloc, replay);
+    if (memory.quiet_crossing) |crossing| alloc.free(crossing.command);
 }
 
 test "dupeToolResultMemory copies survive teardown of every source allocation" {
@@ -1791,16 +1853,18 @@ pub const ChatMessage = struct {
     permission_feedback: bool = false,
     /// Checkpoint steering text has already had its envelope removed.
     restored_steering: bool = false,
+    /// A message lia sent the model on its own, as plain user text: a prompt
+    /// to a turn that stopped without a final answer, a tool's notice, or a
+    /// Stop hook's message to continue. A save of the turn keeps it in the
+    /// steering list inside a marker (`recovery_prompt.saved`), and a
+    /// restored one comes back with this flag and the bare text.
+    recovery_prompt: bool = false,
     /// A `.system` message lia added after the conversation started, which
     /// only the messages lane carries (D93). Plain text content only.
     context_note: bool = false,
     /// The instruction files a context note delivers. Borrowed; never sent
     /// to a provider.
     context_note_sources: []const ContextNoteSource = &.{},
-    /// What a save of the turn records for this context note instead of
-    /// `content`, which only this turn's requests send: a named skill's text
-    /// is saved as a short note (D95). Borrowed.
-    context_note_saved_text: ?[]const u8 = null,
     // Source provenance for compaction, never permission authority.
     context_origin: enum { ordinary, user_turn, handoff } = .ordinary,
     standalone_response: bool = false,
@@ -1932,6 +1996,34 @@ pub const ProviderFinishRaw = struct {
     }
 };
 
+/// Gemini's stop reason for a function call it could not write, which the AI
+/// SDK reports as the finish `error`.
+pub const malformed_function_call_reason = "MALFORMED_FUNCTION_CALL";
+
+/// Whether a reply ended because the provider could not read the model's tool
+/// call. The reply's calls never ran, and the same request can fail the same
+/// way, so lia gives the model feedback instead of a plain resend.
+pub fn isMalformedToolCallFinish(
+    finish_reason: ?ProviderFinishReason,
+    finish_reason_raw: ProviderFinishRaw,
+) bool {
+    const reason = finish_reason orelse return false;
+    return reason == .provider_error and
+        std.mem.eql(u8, finish_reason_raw.slice(), malformed_function_call_reason);
+}
+
+test "only a provider error named MALFORMED_FUNCTION_CALL is a malformed tool call" {
+    const malformed = ProviderFinishRaw.init("MALFORMED_FUNCTION_CALL");
+    try std.testing.expect(isMalformedToolCallFinish(.provider_error, malformed));
+    try std.testing.expect(!isMalformedToolCallFinish(.other, malformed));
+    try std.testing.expect(!isMalformedToolCallFinish(.stop, malformed));
+    try std.testing.expect(!isMalformedToolCallFinish(null, malformed));
+    try std.testing.expect(!isMalformedToolCallFinish(.provider_error, ProviderFinishRaw.init("provider_error")));
+    try std.testing.expect(!isMalformedToolCallFinish(.provider_error, ProviderFinishRaw.init("malformed_function_call")));
+    try std.testing.expect(!isMalformedToolCallFinish(.provider_error, ProviderFinishRaw.init("MALFORMED_FUNCTION_CALL_X")));
+    try std.testing.expect(!isMalformedToolCallFinish(.provider_error, ProviderFinishRaw.init("")));
+}
+
 test "provider finish raw keeps a bounded printable copy" {
     try std.testing.expectEqualStrings("UNEXPECTED_TOOL_CALL", ProviderFinishRaw.init("UNEXPECTED_TOOL_CALL").slice());
     try std.testing.expectEqualStrings("", ProviderFinishRaw.init("").slice());
@@ -1951,12 +2043,20 @@ fn fuzzProviderFinishRaw(_: void, smith: *std.testing.Smith) anyerror!void {
         try std.testing.expect(byte >= 0x21 and byte <= 0x7e);
         try std.testing.expectEqual(if (source >= 0x21 and source <= 0x7e) source else '?', byte);
     }
+    // Only the exact reason marks a malformed tool call: a longer one cut to
+    // the capacity, or one whose unprintable bytes became '?', does not.
+    try std.testing.expectEqual(
+        std.mem.eql(u8, input, malformed_function_call_reason),
+        isMalformedToolCallFinish(.provider_error, raw),
+    );
+    try std.testing.expect(!isMalformedToolCallFinish(.other, raw));
 }
 
 test "fuzz provider finish raw" {
     try std.testing.fuzz({}, fuzzProviderFinishRaw, .{
         .corpus = &(@import("fuzz_seed").slices(.{
             "UNEXPECTED_TOOL_CALL",
+            "MALFORMED_FUNCTION_CALL",
             "",
             "BAD\x07REASON",
             "\xc3\xa9 \x00\xff",
@@ -2052,6 +2152,57 @@ pub fn validGatewayTeam(team: []const u8) bool {
         else => return false,
     };
     return true;
+}
+
+/// The name lia shows for a Vercel team: the slug when it is a valid team
+/// name, else the id when it is, else none. A saved login's slug is not
+/// checked when it loads, so the refused-login notice, the status view's team
+/// (`displayTeam` in `auth_runtime.zig`), and the usage label name a team
+/// through here.
+pub fn displayGatewayTeam(slug: ?[]const u8, id: ?[]const u8) ?[]const u8 {
+    if (slug) |value| if (validGatewayTeam(value)) return value;
+    if (id) |value| if (validGatewayTeam(value)) return value;
+    return null;
+}
+
+test "displayGatewayTeam shows only a valid team name" {
+    try std.testing.expectEqualStrings("vercel-labs", displayGatewayTeam("vercel-labs", "team_123").?);
+    try std.testing.expectEqualStrings("team_123", displayGatewayTeam("\x1b]2;title\x07\x1b[2J", "team_123").?);
+    try std.testing.expectEqualStrings("team_123", displayGatewayTeam("", "team_123").?);
+    try std.testing.expectEqualStrings("team_123", displayGatewayTeam(null, "team_123").?);
+    try std.testing.expectEqualStrings("team_123", displayGatewayTeam("\xe2\x80\xaeslug", "team_123").?);
+    try std.testing.expect(displayGatewayTeam("bad slug", "team a") == null);
+    try std.testing.expect(displayGatewayTeam(null, null) == null);
+    const longest = text_utils.repeat("a", 128);
+    try std.testing.expectEqualStrings(longest, displayGatewayTeam(longest, "team_123").?);
+    try std.testing.expectEqualStrings("team_123", displayGatewayTeam(text_utils.repeat("a", 129), "team_123").?);
+}
+
+fn fuzzDisplayGatewayTeam(_: void, smith: *std.testing.Smith) anyerror!void {
+    var slug_buffer: [192]u8 = undefined;
+    const slug_len: usize = @intCast(smith.slice(&slug_buffer));
+    var id_buffer: [192]u8 = undefined;
+    const id_len: usize = @intCast(smith.slice(&id_buffer));
+    const slug = slug_buffer[0..slug_len];
+    const id = id_buffer[0..id_len];
+    const shown = displayGatewayTeam(slug, id) orelse {
+        try std.testing.expect(!validGatewayTeam(slug) and !validGatewayTeam(id));
+        return;
+    };
+    try std.testing.expect(validGatewayTeam(shown));
+    try std.testing.expect(shown.ptr == slug.ptr or shown.ptr == id.ptr);
+    for (shown) |byte| try std.testing.expect(byte >= 0x21 and byte <= 0x7e);
+}
+
+test "fuzzed team slugs and ids show only a valid team name" {
+    try std.testing.fuzz({}, fuzzDisplayGatewayTeam, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "vercel-labs",
+            "",
+            "\x1b]2;title\x07\x1b[2J",
+            "\xe2\x80\xaeslug",
+        }) ++ @import("fuzz_corpus").gateway_team_display.*),
+    });
 }
 
 pub fn validCredentialAccountId(account_id: []const u8) bool {
@@ -2793,6 +2944,10 @@ pub const QuestionOption = struct {
 
 pub const QuestionBatchEntry = struct {
     question: []const u8,
+    /// The question and the option descriptions are Markdown and may have
+    /// several lines, as `ask_user_question` sends them. Other prompts show
+    /// their text as written.
+    markdown: bool = false,
     options: []const QuestionOption,
     /// Submission prompts return JSON {"value": string} or {"option": index},
     /// keeping typed text distinct from action labels such as Decline.
@@ -3550,17 +3705,16 @@ test "dupeToolCall preserves argument integrity" {
 }
 
 test "dupeToolCall drops action scoped bindings" {
-    const skill: skill_contract.PreparedSkill = .{ .skill = .{ .name = "workflow", .description = "", .path = "/skills/workflow", .source = .global_lia } };
     const source: ToolCall = .{
-        .id = "skill",
-        .name = "skill",
-        .arguments_json = "{\"location\":\"/skills/workflow\"}",
-        .resolved_skill = &skill,
+        .id = "open",
+        .name = "toolbox",
+        .arguments_json = "{\"open\":\"/skills/workflow\"}",
+        .toolbox_lookup = .{ .permission = "skill", .target = "workflow" },
         .resolved_display_target = "more output from zig build test",
     };
     const copy = try dupeToolCall(std.testing.allocator, source);
     defer freeToolCall(std.testing.allocator, copy);
-    try std.testing.expect(copy.resolved_skill == null);
+    try std.testing.expect(copy.toolbox_lookup == null);
     try std.testing.expect(copy.resolved_display_target == null);
     try std.testing.expectEqualStrings(source.arguments_json, copy.arguments_json);
 }

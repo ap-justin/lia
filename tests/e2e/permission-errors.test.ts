@@ -14,6 +14,7 @@ import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
   fakeGatewayPermissionDecision,
+  fakeGatewayToolCall,
   fakeShellRun,
   startFakeGateway,
 } from "./fake-gateway";
@@ -83,6 +84,74 @@ function permissionEnv(
 }
 
 describe("generic permission typed errors", () => {
+  test(
+    "a deny rule stops a shell call whose request wrapper is JSON text",
+    async () => {
+      const root = createIsolatedRoot("lia-permission-error-text-");
+      const marker = join(root.workspace, "denied-marker.txt");
+      const toolCallId = "permission_denied_text_call";
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall(toolCallId, "shell", {
+          request: JSON.stringify({ action: "run", command: `touch ${JSON.stringify(marker)}`, timeout_ms: 600_000 }),
+        }),
+        fakeGatewayFinalText("permission error observed"),
+      ]);
+      try {
+        writeFileSync(
+          join(root.home, ".lia", "settings.json"),
+          JSON.stringify({
+            workspaces: {
+              [root.workspace]: {
+                permission: {
+                  bash: {
+                    "touch *denied-marker.txt*": "deny",
+                  },
+                },
+              },
+            },
+          }),
+        );
+
+        const result = await runLia(["ask", "--json", "--no-save", "--auto", "Run the denied command."], {
+          cwd: root.workspace,
+          env: {
+            HOME: root.home,
+            AI_GATEWAY_API_KEY: "permission-error-fake-key",
+            VERCEL_OIDC_TOKEN: undefined,
+            LIA_GATEWAY_BASE_URL: gateway.baseUrl,
+            LIA_GATEWAY_CHAT_URL: gateway.chatUrl,
+            LIA_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+            LIA_MODEL: FAKE_GATEWAY_MODEL,
+            LIA_AUTO_UPGRADE: "0",
+          },
+          timeoutMs: TIMEOUT,
+        });
+        const json = parseLiaJson(result);
+        expect(json.tool_calls).toContainEqual({
+          name: "shell",
+          status: "error",
+          action: "run",
+          error: {
+            category: "rejected",
+            code: "rejected",
+          },
+        });
+        expect(existsSync(marker)).toBe(false);
+        expect(gateway.requests).toHaveLength(2);
+
+        const echo = (JSON.parse(executionDeniedReason(gateway.requests[1]!.body, toolCallId)) as { error: PermissionEcho }).error;
+        expect(echo.type).toBe("tool_permission_denied");
+        expect(echo.tool_name).toBe("shell");
+        expect(echo.reason).toBe("policy_denied");
+        expect(echo.denied).toBe(true);
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
   test(
     "returns typed JSON for denied terminal",
     async () => {

@@ -106,7 +106,7 @@ export function fixture(label: string, at?: string, models?: object[]) {
       LIA_E2E_GATEWAY_CHAT_URL: gateway.chatUrl, LIA_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
       LIA_MODEL: FAKE_GATEWAY_MODEL, LIA_PERMISSION_MODE: "full-access", LIA_SOUND: "0", NO_COLOR: "1",
       // A v1 writer build that still has the store switch writes v1 even when
-      // the driver's own environment sets it; tmux passes that environment on.
+      // the driver's own environment sets it.
       ...(v2 ? {} : { LIA_SESSIONS_V2: "0" }),
     };
     return { ...e, ...injected };
@@ -154,9 +154,7 @@ export function fixture(label: string, at?: string, models?: object[]) {
 
   // Until `stop`, every lia this fixture starts runs with the path fault
   // on these absolute paths: "refuse" fails every move or removal of them,
-  // "pause" blocks a rename of exactly one, for `pauseMs` when given. The
-  // tmux app gets it too: it is started through /usr/bin/env, whose
-  // arguments keep DYLD_* for the lia it starts.
+  // "pause" blocks a rename of exactly one, for `pauseMs` when given.
   function faultPaths(mode: "refuse" | "pause", paths: string[], pauseMs?: number) {
     const dir = mkdtempSync(join(root, `${mode}-fault-`));
     const arm = join(dir, "armed"), record = join(dir, "hits.txt");

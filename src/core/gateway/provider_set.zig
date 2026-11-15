@@ -18,6 +18,9 @@ pub const Bundle = struct {
         gateway_prompt_caching: bool = false,
         lia_search: bool = false,
         vision_fallback: bool = false,
+        /// The model the image fallback asks, borrowed from the provider's
+        /// definition. Null: lia's own vision model, which the gateway serves.
+        vision_model: ?[]const u8 = null,
         /// Whether a request carries lia's output limit.
         sends_output_limit: bool = true,
     };

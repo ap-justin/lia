@@ -14,6 +14,20 @@ import { runLia } from "../evals/eval-helpers";
 
 const serialTest = test.serial;
 
+const NO_AUTH = {
+  AI_GATEWAY_API_KEY: "",
+  VERCEL_OIDC_TOKEN: "",
+  LIA_MODEL: undefined,
+  NO_COLOR: "1",
+};
+
+/** The names of the checks `lia doctor --json` failed, in order. */
+function failedDoctorChecks(stdout: string): string[] {
+  return JSON.parse(stdout).checks
+    .filter((check: { status: string }) => check.status === "fail")
+    .map((check: { name: string }) => check.name);
+}
+
 describe("config persistence", () => {
   serialTest("config diagnostics preserve invalid, oversized, and unsafe primaries", async () => {
     const root = mkdtempSync(join(tmpdir(), "lia-config-diagnostics-"));
@@ -62,11 +76,13 @@ describe("config persistence", () => {
       });
       expect(inertStatus.code).toBe(0);
       expect(inertStatus.stderr).not.toContain("legacy_workspace_preferences");
+      // No credential here, so doctor's auth check fails and nothing else does.
       const inertDoctor = await runLia(["doctor", "--json"], {
         cwd: workspaceRoot,
-        env: { HOME: home },
+        env: { ...NO_AUTH, HOME: home, LIA_DISABLE_KEYCHAIN: "1" },
       });
-      expect(inertDoctor.code).toBe(0);
+      expect(inertDoctor.code).toBe(1);
+      expect(failedDoctorChecks(inertDoctor.stdout)).toEqual(["auth"]);
       expect(inertDoctor.stdout).not.toContain("legacy_workspace_preferences");
 
       expect(readFileSync(settingsPath, "utf8")).toBe(inertOutputSettings);
@@ -75,9 +91,10 @@ describe("config persistence", () => {
       writeFileSync(settingsPath, oversized, { mode: 0o600 });
       const oversizedDoctor = await runLia(["doctor", "--json"], {
         cwd: workspaceRoot,
-        env: { HOME: home },
+        env: { ...NO_AUTH, HOME: home, LIA_DISABLE_KEYCHAIN: "1" },
       });
-      expect(oversizedDoctor.code).toBe(0);
+      expect(oversizedDoctor.code).toBe(1);
+      expect(failedDoctorChecks(oversizedDoctor.stdout)).toEqual(["config", "auth"]);
       expect(oversizedDoctor.stdout).toContain("settings_too_large");
       expect(readFileSync(settingsPath, "utf8")).toBe(oversized);
 

@@ -152,8 +152,7 @@ export function buildEvalProcessEnv(
   model: string,
 ): Record<string, string | undefined> {
   return {
-    ...dotEnvVars,
-    ...process.env,
+    ...envWithoutLiaHome({ ...dotEnvVars, ...process.env }),
     NO_COLOR: "1",
     HOME: home,
     PATH: process.env.PATH ?? "",
@@ -461,7 +460,17 @@ export interface LiaRunResult {
   elapsedMs: number;
   pid: number | null;
   processStateAtTimeout: string;
+  // Empty unless needsProcessSnapshot says to take it.
   processStateAfterClose: string;
+}
+
+// A system-wide ps can take seconds on a busy machine, so a plain nonzero
+// exit, which many tests expect, skips it unless the caller asks for it.
+export function needsProcessSnapshot(
+  close: { code: number | null; signal: NodeJS.Signals | null; timedOut: boolean },
+  requested = false,
+): boolean {
+  return close.timedOut || close.signal !== null || (requested && close.code !== 0);
 }
 
 function captureLiaProcessState(): string {
@@ -479,6 +488,16 @@ function captureLiaProcessState(): string {
   }
 }
 
+// A copy of env without LIA_HOME, which moves lia's profile out of HOME, so lia
+// gets a developer's LIA_HOME only when a test passes one itself.
+export function envWithoutLiaHome(
+  env: Record<string, string | undefined> = process.env,
+): Record<string, string | undefined> {
+  const copy = { ...env };
+  delete copy.LIA_HOME;
+  return copy;
+}
+
 export async function runLia(
   args: string[],
   opts: {
@@ -486,6 +505,9 @@ export async function runLia(
     env?: Record<string, string | undefined>;
     stdin?: string | Uint8Array;
     timeoutMs?: number;
+    // Take the process snapshot on any nonzero exit, for a caller that
+    // prints it when lia fails.
+    processSnapshot?: boolean;
   } = {},
 ): Promise<LiaRunResult> {
   if (!existsSync(LIA_BIN)) {
@@ -496,11 +518,14 @@ export async function runLia(
 
   return new Promise<LiaRunResult>((resolvePromise) => {
     const env: Record<string, string | undefined> = {
-      ...dotEnvVars,
-      ...process.env,
+      ...envWithoutLiaHome({ ...dotEnvVars, ...process.env }),
       NO_COLOR: "1",
       HOME: process.env.HOME ?? "",
       PATH: process.env.PATH ?? "",
+      // Spawned runs must stay silent: lia plays host audio through afplay on
+      // macOS even when stdout and stderr are pipes. A test that exercises
+      // sound passes its own LIA_SOUND value.
+      LIA_SOUND: "0",
     };
     for (const [key, value] of Object.entries(opts.env ?? {})) {
       if (value === undefined) {
@@ -543,7 +568,9 @@ export async function runLia(
         elapsedMs: performance.now() - startedAtMs,
         pid: child.pid ?? null,
         processStateAtTimeout,
-        processStateAfterClose: code === 0 && !timedOut ? "" : captureLiaProcessState(),
+        processStateAfterClose: needsProcessSnapshot({ code, signal, timedOut }, opts.processSnapshot)
+          ? captureLiaProcessState()
+          : "",
       });
     });
   });

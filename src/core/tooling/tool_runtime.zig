@@ -1,4 +1,5 @@
 const std = @import("std");
+const toolbox = @import("toolbox.zig");
 const observation = @import("../agent/runtime/observation.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
@@ -18,11 +19,15 @@ const tool_contracts = @import("../agent/runtime/tool_contracts.zig");
 const tool_names = @import("../mcp/tool_names.zig");
 const result_commit = @import("result_commit.zig");
 const vision_executor = @import("../agent/runtime/vision_executor.zig");
+const image_provider = @import("../agent/runtime/image_provider.zig");
+const token_pass = @import("../gateway/token_pass.zig");
+const token_pass_team = @import("../gateway/token_pass_team.zig");
 const change_tracker = @import("../workspace/change_tracker.zig");
 const diff_mod = @import("../output/diff.zig");
 const file_mutation = @import("file_mutation.zig");
 const file_mutation_contract = @import("file_mutation_contract.zig");
 const hooks = @import("../hooks/hooks.zig");
+const model_context_encoding = @import("../shared/model_context_encoding.zig");
 const permission_auto_classifier = @import("../permissions/auto_classifier.zig");
 const glob_pattern = @import("../workspace/glob_pattern.zig");
 const permission_prompter = @import("../permissions/permission_prompter.zig");
@@ -57,6 +62,7 @@ const mcp_call_capability = @import("mcp_call_capability.zig");
 const model_tool_schema = @import("model_tool_schema.zig");
 const auto_classifier_context = @import("../permissions/auto_classifier_context.zig");
 const capability_retrieval = @import("capability_retrieval.zig");
+const sort_utils = @import("../shared/sort_utils.zig");
 const lexical_relevance = @import("../shared/lexical_relevance.zig");
 const mcp_tool_lookup = @import("../mcp/tool_lookup.zig");
 const tool_presentation = @import("tool_presentation.zig");
@@ -234,6 +240,10 @@ pub const Context = struct {
     nested_tool_lifecycle: ?ToolLifecyclePublisher = null,
     subagent_status_renderer: ?types.SubagentStatusRenderer = null,
     advertised_dynamic_tool_names: []const []const u8 = &.{},
+    /// The built-in tools this agent offers through toolbox.
+    toolbox_behind: []const []const u8 = &.{},
+    /// The MCP servers the toolbox menu lists.
+    toolbox_mcp_servers: []const []const u8 = &.{},
     permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
     auto_classifier: permission_auto_classifier.Classifier =
         permission_auto_classifier.Classifier.disabled(),
@@ -384,8 +394,8 @@ pub fn validateToolCall(ctx: Context, arena: Allocator, call: ToolCall) !tool_co
         };
     };
     switch (spec.executor_kind) {
-        // Preserve execution-time argument failures for MCP control tool calls.
-        .mcp_select_tool => return .{ .valid = .{} },
+        // An MCP tool's server checks its arguments when it runs.
+        .mcp_tool => return .{ .valid = .{} },
         // File mutation arguments are decoded once by shared permission preflight.
         .write_file, .edit_file => return .{ .valid = .{} },
         else => {},
@@ -421,6 +431,8 @@ pub fn executeToolCallAuthorized(
     };
     var execution_ctx = ctx;
     execution_ctx.observer = request.observer orelse ctx.observer;
+    execution_ctx.toolbox_behind = request.toolbox_behind;
+    execution_ctx.toolbox_mcp_servers = request.toolbox_mcp_servers;
     execution_ctx.skill_locations = request.skill_locations orelse ctx.skill_locations;
     if (request.permission_mode) |permission_mode| {
         execution_ctx.permission_mode = permission_mode;
@@ -458,6 +470,10 @@ pub fn executeToolCallAuthorized(
     execution_ctx.command_replay_unavailable = request.command_replay_unavailable;
 
     const started_at_ms = io_mod.milliTimestamp();
+    const call_dir = workspace_access.AccessScope.primaryDirectoryOf(
+        execution_ctx.access_scope,
+        execution_ctx.workspace_root,
+    );
     const uses_file_mutation_contract = if (registeredToolSpec(
         execution_ctx,
         request.call.name,
@@ -501,21 +517,69 @@ pub fn executeToolCallAuthorized(
             .outcome = classifyToolExecutionError(err),
             .started_at_ms = started_at_ms,
             .subagent_id = execution_ctx.lifecycle_scope.subagent_id orelse 0,
+            .call_id = request.call.id,
+            .dir = call_dir,
+            // The tool returned no result, so nothing shows that a command
+            // ran: a run cancelled or out of time before it started ends here,
+            // as does a shell that could not start.
+            .reads_startup_files = false,
         });
         return if (err == error.CancelledBeforeExecution) error.Cancelled else err;
     };
+    const outcome = classifyReturnedToolCallOutcome(result);
     diagnostics.recordToolCallResult(.{
         .name = request.call.name,
         .arguments_json = request.call.arguments_json,
         .model_output = result.model_output,
-        .outcome = classifyReturnedToolCallOutcome(result),
+        .outcome = outcome,
         .started_at_ms = started_at_ms,
         .subagent_id = execution_ctx.lifecycle_scope.subagent_id orelse 0,
+        .call_id = request.call.id,
+        .dir = call_dir,
+        // Only a command that ran leaves a command result, which makes the call
+        // `command_failed`; a call refused before its command started, and one
+        // that succeeded, are not resolved again.
+        .reads_startup_files = outcome == .command_failed and
+            callReadsStartupFiles(execution_ctx, request.call_allocator, request.call),
     });
     if (request.command_replay_capture) |continued| {
         replay_continuation_transferred = result.command_replay_capture == continued;
     }
     return result;
+}
+
+/// Whether `call` is a run whose command reads the startup files the shell
+/// snapshot holds: one that admission's `runCommandContext` resolves to the
+/// `user` environment, as its routine-command rule does, in the login shell
+/// the snapshot captures. `interact` and `stop` calls, a `clean` profile, a
+/// clean start, a tty run in another shell, and a call that does not resolve
+/// read none of them.
+fn callReadsStartupFiles(ctx: Context, alloc: Allocator, call: ToolCall) bool {
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const command = tool_admission.runCommandContext(ctx.admissionInput(), arena, call) catch return false;
+    const shell = switch (command.environment) {
+        .user => |path| path,
+        else => return false,
+    };
+    var login_shell_buffer: [4096]u8 = undefined;
+    const configured = shell_resolver.configuredLoginShellInto(&login_shell_buffer);
+    const login = switch (shell_resolver.environment(arena, configured, null) catch return false) {
+        .user => |path| path,
+        else => return false,
+    };
+    return sameShellPath(arena, shell, login);
+}
+
+/// Whether two shell paths name one file, as `/bin/bash` and `/usr/bin/bash`
+/// do where `/bin` links to `/usr/bin`. A path that does not resolve matches
+/// only itself.
+fn sameShellPath(arena: Allocator, a: []const u8, b: []const u8) bool {
+    if (std.mem.eql(u8, a, b)) return true;
+    const real_a = io_mod.realpathAlloc(arena, a) catch return false;
+    const real_b = io_mod.realpathAlloc(arena, b) catch return false;
+    return std.mem.eql(u8, real_a, real_b);
 }
 
 fn classifyToolExecutionError(err: anyerror) diagnostics.ToolCallOutcome {
@@ -721,13 +785,13 @@ fn executeWorkspaceToolCallInner(
         }
     }
     const spec = registeredToolSpec(ctx, call.name) orelse
-        return semanticFailure(try arena.print("Unsupported tool: {s}", .{call.name}));
+        return semanticFailure(try arena.print("Unsupported tool: {f}", .{model_context_encoding.scalar(call.name)}));
     if (ctx.tool_registry.tools.len != 1 or
         !std.mem.eql(u8, spec.name, "shell") or
         spec.executor_kind != .run_command or
         spec.runtime_provider != .run_command)
     {
-        return semanticFailure(try arena.print("Unsupported tool: {s}", .{call.name}));
+        return semanticFailure(try arena.print("Unsupported tool: {f}", .{model_context_encoding.scalar(call.name)}));
     }
 
     var command_backend = RunCommandBackendState{ .runtime = ctx };
@@ -778,7 +842,7 @@ fn resolveToolDispatchPrelude(
             try tool_mcp_runtime.notSelectedOutput(arena, call.name),
         ) },
         .unsupported => .{ .completed = semanticFailure(
-            try arena.print("Unsupported tool: {s}", .{call.name}),
+            try tool_mcp_registry.unsupportedOutput(arena, call.name, call.carried_by),
         ) },
     };
 }
@@ -833,7 +897,6 @@ fn executeRegisteredTool(
     authorized_image_catalog: []const types.ImageAttachment,
     registry: tool_dispatch.Registry,
 ) !ToolExecutionResult {
-    var selected_dynamic_tool_sink = SelectedDynamicToolSinkState{ .allocator = arena };
     var context_notice_sink = ContextNoticeSinkState{ .allocator = arena };
     var command_backend = RunCommandBackendState{ .runtime = ctx };
     var vision_provider = VisionProviderState{
@@ -850,6 +913,7 @@ fn executeRegisteredTool(
         .completion_sink = &dispatch_metadata.subagent_completion,
     };
     var mcp_call_bridge = McpCallBridgeState{ .runtime = ctx };
+    var toolbox_run = ToolboxRunState{ .runtime = ctx };
     var dispatch_ctx = typedDispatchContextForCall(ctx, arena, call);
     dispatch_metadata.attach(&dispatch_ctx);
     var result_commit_token: ?result_commit.Token = null;
@@ -872,6 +936,7 @@ fn executeRegisteredTool(
     if (ctx.mcp_ctx != null and ctx.mcp_call_tool != null) {
         dispatch_ctx.mcp_call_capability = mcp_call_bridge.capability();
     }
+    dispatch_ctx.toolbox_run = toolbox_run.capability();
     const runtime_provider = if (registry.lookup(call.name)) |tool|
         tool.runtime_provider
     else
@@ -895,7 +960,6 @@ fn executeRegisteredTool(
         },
     }
     dispatch_ctx.mcp_execution_error_sink = &mcp_execution_error;
-    attachSelectedDynamicToolSink(&dispatch_ctx, &selected_dynamic_tool_sink);
     attachContextNoticeSink(&dispatch_ctx, &context_notice_sink);
     const dispatched = try tool_dispatch.dispatchAuthorizedToolCall(
         dispatch_ctx,
@@ -912,7 +976,7 @@ fn executeRegisteredTool(
     }
     if (mcp_execution_error) |err| {
         dispatched.deinit(arena);
-        if (err == error.McpAdvertisedToolChanged) return refreshChangedMcpTool(ctx, arena, call.name);
+        if (err == error.McpAdvertisedToolChanged) return refreshChangedMcpTool(ctx, arena, call);
         return err;
     }
 
@@ -927,7 +991,6 @@ fn executeRegisteredTool(
         execution.finish_turn = true;
         execution.status_detail = "McpInputRequired";
     }
-    execution.selected_dynamic_tools = selected_dynamic_tool_sink.tools.items;
     execution.context_notices = context_notice_sink.notices.items;
     execution.result_commit = result_commit_token;
     if (dispatch_ctx.cancel_flag) |cancel_flag| {
@@ -964,36 +1027,145 @@ fn authorizeBridgeCall(
     const state: *McpCallBridgeState = @ptrCast(@alignCast(raw));
     const ctx = state.runtime;
     if (ctx.tool_registry.lookup(tool) != null) {
-        return .{ .deny = try arena.print("{s} is a built-in tool; lia mcp call runs MCP tools only.", .{tool}) };
+        return .{ .deny = try arena.print("{f} is a built-in tool; lia mcp call runs MCP tools only.", .{text_utils.terminalSafe(tool)}) };
     }
     const resolved = (try resolveUnselectedMcpTool(ctx, arena, tool)) orelse {
-        return .{ .deny = try arena.print("No MCP tool named {s} is available to this agent. Find tool names with capability_search.", .{tool}) };
+        return .{ .deny = try arena.print("No MCP tool named {f} is available to this agent. Find tool names with toolbox search.", .{text_utils.terminalSafe(tool)}) };
     };
     // A qualified spelling (`server.tool`) resolves to the exposed name, and
     // rules, grants, and the call itself all go by that name.
     const call: ToolCall = .{ .id = request_id, .name = resolved.name, .arguments_json = arguments_json };
+    return switch (try checkNestedCall(ctx, arena, call, resolved)) {
+        .allow => .{ .allow = .{ .binding = resolved.mcp_binding, .tool = resolved.name } },
+        .deny => |why| .{ .deny = why },
+    };
+}
+
+const NestedCheck = union(enum) {
+    /// The context the call runs in.
+    allow: Context,
+    /// Why not, for the model.
+    deny: []const u8,
+};
+
+/// The permission check of a call the agent makes through another tool, a
+/// shell command's `lia mcp call` or `toolbox {run}`: it is checked as the
+/// agent's own direct call of `call.name`, and the configured and saved
+/// rules, the prompt, and automatic review see exactly this call. An MCP
+/// tool the agent never selected, `mcp`, joins the names the check knows,
+/// with its definition for the review.
+fn checkNestedCall(ctx: Context, arena: Allocator, call: ToolCall, mcp: ?tool_mcp_runtime.SelectedTool) !NestedCheck {
     var check = ctx;
-    const names = try arena.alloc([]const u8, ctx.advertised_dynamic_tool_names.len + 1);
-    @memcpy(names[0..ctx.advertised_dynamic_tool_names.len], ctx.advertised_dynamic_tool_names);
-    names[names.len - 1] = resolved.name;
-    check.advertised_dynamic_tool_names = names;
-    check.mcp_review_schema_json = try bridgeReviewSchema(arena, resolved);
-    check.expected_mcp_binding = resolved.mcp_binding;
+    if (mcp) |resolved| {
+        const names = try arena.alloc([]const u8, ctx.advertised_dynamic_tool_names.len + 1);
+        @memcpy(names[0..ctx.advertised_dynamic_tool_names.len], ctx.advertised_dynamic_tool_names);
+        names[names.len - 1] = call.name;
+        check.advertised_dynamic_tool_names = names;
+        check.mcp_review_schema_json = try bridgeReviewSchema(arena, resolved);
+        check.expected_mcp_binding = resolved.mcp_binding;
+    }
     check.permission_review_turn = .{
         .observer = ctx.observer,
         .model = ctx.model,
         .pending_assistant = .{ .role = .assistant, .tool_calls = try arena.dupe(ToolCall, &.{call}) },
-        .target_call_id = request_id,
+        .target_call_id = call.id,
         .origin = if (ctx.lifecycle_scope.kind == .subagent) .subagent else .root,
         .trusted_root_context = auto_classifier_context.rootUserRequestContext(ctx.root_user_intent_context) orelse "",
         .current_turn_untrusted_messages = ctx.current_turn_messages,
     };
     const outcome = try tool_admission.requestPermissionOutcome(check.admissionInput(), arena, call, ctx.permission_mode, ctx.session_grants);
-    if (!outcome.decision.isDenied() and outcome.tool_failure == null) {
-        return .{ .allow = .{ .binding = resolved.mcp_binding, .tool = resolved.name } };
-    }
+    if (!outcome.decision.isDenied() and outcome.tool_failure == null) return .{ .allow = check };
     return .{ .deny = outcome.tool_failure orelse outcome.feedback orelse
-        try arena.print("Permission to run {s} was not granted ({s}).", .{ resolved.name, @tagName(outcome.decision) }) };
+        try arena.print("Permission to run {f} was not granted ({s}).", .{ text_utils.terminalSafe(call.name), @tagName(outcome.decision) }) };
+}
+
+/// Lends this tool call's permission check and execution to `toolbox {run}`
+/// while the call runs (`tool_dispatch.ToolboxRun`).
+const ToolboxRunState = struct {
+    runtime: Context,
+
+    fn capability(self: *ToolboxRunState) tool_dispatch.ToolboxRun {
+        return .{ .context = @ptrCast(self), .explain_fn = explainToolboxRun, .describe_fn = describeToolboxTool, .search_fn = searchToolboxBuiltins };
+    }
+};
+
+/// The definition `toolbox {open}` gives a tool: a built-in's own, or for an
+/// MCP tool the one its selection would have sent, with its full input
+/// schema and its server's instructions.
+fn describeToolboxTool(raw: *anyopaque, arena: Allocator, tool: []const u8) anyerror!?tool_dispatch.ToolboxDescription {
+    const state: *ToolboxRunState = @ptrCast(@alignCast(raw));
+    if (std.mem.eql(u8, tool, toolbox.tool_name)) return null;
+    const spec = state.runtime.tool_registry.lookup(tool) orelse return switch (try lookupToolboxMcpTool(state.runtime, arena, tool)) {
+        .found => |found| .{ .definition = .{ .json = found.tool.schema_json, .notice = found.notice } },
+        .rejected => |why| .{ .unavailable = why },
+        .missing => null,
+    };
+    if (!spec.model_visible) return null;
+    return .{ .definition = .{ .json = try model_tool_schema.builtinFunctionSchemaJsonAlloc(arena, spec.model_schema) } };
+}
+
+/// The built-in tools behind toolbox that match `query`, best first, by
+/// name and description, as the menu lists them.
+fn searchToolboxBuiltins(raw: *anyopaque, arena: Allocator, query: *const lexical_relevance.PreparedQuery) anyerror![]const tool_dispatch.ToolboxMatch {
+    const state: *ToolboxRunState = @ptrCast(@alignCast(raw));
+    const Scored = struct {
+        match: tool_dispatch.ToolboxMatch,
+        score: lexical_relevance.Score,
+
+        fn better(_: void, a: @This(), b: @This()) bool {
+            return lexical_relevance.order(a.score, b.score) == .gt;
+        }
+    };
+    var scored: std.ArrayList(Scored) = .empty;
+    for (state.runtime.toolbox_behind) |name| {
+        const spec = state.runtime.tool_registry.lookup(name) orelse continue;
+        const score = lexical_relevance.score(query, &.{name}, &.{name}, &.{spec.description}) orelse continue;
+        try scored.append(arena, .{
+            .match = .{ .name = name, .description = toolbox.shortLine(spec.description, 100).text },
+            .score = score,
+        });
+    }
+    sort_utils.sort(Scored, scored.items, {}, Scored.better);
+    debug_trace.logf("toolbox", "search builtins behind={d} matches={d}", .{ state.runtime.toolbox_behind.len, scored.items.len });
+    const matches = try arena.alloc(tool_dispatch.ToolboxMatch, scored.items.len);
+    for (scored.items, matches) |item, *match| match.* = item.match;
+    return matches;
+}
+
+/// Why `toolbox {run}` didn't run `tool`. The agent loop runs every tool a
+/// run can carry as its own direct call of it, so what reaches here is
+/// toolbox itself, a host's own tool, or one lia can't find or can't use now.
+fn explainToolboxRun(raw: *anyopaque, arena: Allocator, tool: []const u8) anyerror![]const u8 {
+    const state: *ToolboxRunState = @ptrCast(@alignCast(raw));
+    const ctx = state.runtime;
+    if (std.mem.eql(u8, tool, toolbox.tool_name)) return "toolbox can't run toolbox.";
+    if (ctx.tool_registry.lookup(tool)) |spec| {
+        if (!toolbox.runs(spec.*)) return arena.print("{f} is one of this host's tools; call it directly.", .{model_context_encoding.scalar(tool)});
+        return arena.print("{f} didn't run: toolbox runs a tool only as part of the agent's turn.", .{model_context_encoding.scalar(tool)});
+    }
+    if (!types.isMcpToolName(tool) and containsName(ctx.advertised_dynamic_tool_names, tool)) {
+        return arena.print("{f} is one of this host's tools; call it directly.", .{model_context_encoding.scalar(tool)});
+    }
+    return switch (try lookupToolboxMcpTool(ctx, arena, tool)) {
+        .rejected => |why| why,
+        .found => arena.print("{f} is available now; run it again with toolbox.", .{model_context_encoding.scalar(tool)}),
+        .missing => {
+            // A server-qualified spelling that fits several tools names them,
+            // as a direct call by that name did.
+            if (tool_names.looksQualified(tool)) switch (try lookupUnselectedMcpTool(ctx, arena, tool)) {
+                .ambiguous => |candidates| {
+                    var list: std.Io.Writer.Allocating = .init(arena);
+                    for (candidates, 0..) |candidate, index| {
+                        if (index > 0) try list.writer.writeAll(", ");
+                        try list.writer.writeAll(candidate);
+                    }
+                    return arena.print("{f} fits more than one MCP tool: {s}. Run one of them by its exact name.", .{ model_context_encoding.scalar(tool), list.written() });
+                },
+                else => {},
+            };
+            return arena.print("No tool named {f} is in the toolbox. Use toolbox search to find it.", .{model_context_encoding.scalar(tool)});
+        },
+    };
 }
 
 /// The review schema a selected MCP tool would carry: its name,
@@ -1104,8 +1276,8 @@ fn callBridgeTool(
         .access = ctx.mcp_access,
     }) catch |err| {
         if (err == error.OutOfMemory) return err;
-        return .{ .status = .failed, .bytes = try arena.print("The MCP call to {s} failed: {s}", .{ tool, @errorName(err) }) };
-    }) orelse return .{ .status = .failed, .bytes = try arena.print("No MCP tool named {s} is available.", .{tool}) };
+        return .{ .status = .failed, .bytes = try arena.print("The MCP call to {f} failed: {s}", .{ text_utils.terminalSafe(tool), @errorName(err) }) };
+    }) orelse return .{ .status = .failed, .bytes = try arena.print("No MCP tool named {f} is available.", .{text_utils.terminalSafe(tool)}) };
     return switch (result.status) {
         .success => .{ .status = .ok, .bytes = try bridgeResultData(arena, result.model_output) },
         .tool_failure => .{ .status = .tool_error, .bytes = try bridgeResultData(arena, result.model_output) },
@@ -1166,7 +1338,7 @@ const max_bridge_list_pages = 100;
 const bridge_search_page_bytes = 256 * 1024;
 
 /// Answers `lia mcp call list`, `search`, and `help` with the tools this agent
-/// may use: the same search and schemas as its own `capability_search`, with
+/// may use: the same search and schemas as its own `toolbox` search, with
 /// the same access and permission rules.
 fn lookupBridge(
     raw: *anyopaque,
@@ -1180,14 +1352,14 @@ fn lookupBridge(
     switch (question) {
         .help => |tool| {
             if (ctx.tool_registry.lookup(tool) != null) {
-                return .{ .status = .failed, .bytes = try arena.print("{s} is a built-in tool; lia mcp call runs MCP tools only.", .{tool}) };
+                return .{ .status = .failed, .bytes = try arena.print("{f} is a built-in tool; lia mcp call runs MCP tools only.", .{text_utils.terminalSafe(tool)}) };
             }
             const resolved = (try resolveUnselectedMcpTool(ctx, arena, tool)) orelse {
-                return .{ .status = .failed, .bytes = try arena.print("No MCP tool named {s} is available to this agent. Find tool names with lia mcp call search.", .{tool}) };
+                return .{ .status = .failed, .bytes = try arena.print("No MCP tool named {f} is available to this agent. Find tool names with lia mcp call search.", .{text_utils.terminalSafe(tool)}) };
             };
             mcp_tool_lookup.writeHelp(arena, &out.writer, resolved.schema_json) catch |err| switch (err) {
                 error.OutOfMemory, error.WriteFailed => return error.OutOfMemory,
-                error.InvalidToolSchema => return .{ .status = .failed, .bytes = try arena.print("The schema of {s} could not be read.", .{tool}) },
+                error.InvalidToolSchema => return .{ .status = .failed, .bytes = try arena.print("The schema of {f} could not be read.", .{text_utils.terminalSafe(tool)}) },
             };
         },
         .list, .search => |text| {
@@ -1313,6 +1485,44 @@ test "a bridge call of a server-qualified spelling is checked and called under t
     try std.testing.expectEqual(mcp_call_capability.CallStatus.ok, outcome.status);
     try std.testing.expectEqualStrings("mcp ok", outcome.bytes);
     try std.testing.expectEqual(@as(usize, 1), server.calls);
+}
+
+/// The bridge's messages carry the tool name a command typed. They go to the
+/// command's output, so a control byte in the name must show as an escape.
+fn expectBridgeNameQuoted(message: []const u8) !void {
+    try std.testing.expect(std.mem.find(u8, message, "mcp_s_\\x1b]0;x\\x07\\x00t") != null);
+    for (message) |byte| try std.testing.expect(byte >= 0x20 and byte != 0x7f);
+}
+
+test "bridge messages name a requested tool as visible escapes, not raw bytes" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // The name is a word from a command line, so it can hold any byte.
+    const name = "mcp_s_\x1b]0;x\x07\x00t";
+    var marker: u8 = 0;
+    var missing = TestRuntime{ .mcp_ctx = @ptrCast(&marker), .mcp_call_tool = McpFixture.callNull };
+    defer missing.deinit(std.testing.allocator);
+    var failing = TestRuntime{ .mcp_ctx = @ptrCast(&marker), .mcp_call_tool = McpFixture.callFailure };
+    defer failing.deinit(std.testing.allocator);
+    var cancel: std.atomic.Value(bool) = .init(false);
+
+    var state = McpCallBridgeState{ .runtime = missing.context() };
+    const denied = try authorizeBridgeCall(@ptrCast(&state), arena, "call-1", name, "{}");
+    try std.testing.expect(denied == .deny);
+    try expectBridgeNameQuoted(denied.deny);
+
+    const help = try lookupBridge(@ptrCast(&state), arena, .{ .help = name }, &cancel);
+    try std.testing.expectEqual(mcp_call_capability.CallStatus.failed, help.status);
+    try expectBridgeNameQuoted(help.bytes);
+
+    const gone = try callBridgeTool(missing.context(), arena, "call-1", name, "{}", .{}, &cancel);
+    try std.testing.expectEqual(mcp_call_capability.CallStatus.failed, gone.status);
+    try expectBridgeNameQuoted(gone.bytes);
+
+    const failed = try callBridgeTool(failing.context(), arena, "call-1", name, "{}", .{}, &cancel);
+    try std.testing.expectEqual(mcp_call_capability.CallStatus.failed, failed.status);
+    try expectBridgeNameQuoted(failed.bytes);
 }
 
 const RunCommandBackendState = struct {
@@ -1464,8 +1674,53 @@ fn lookupExactMcpTool(ctx: Context, arena: Allocator, name: []const u8) !tool_mc
     };
 }
 
-fn refreshChangedMcpTool(ctx: Context, arena: Allocator, name: []const u8) !ToolExecutionResult {
-    var unavailable_output: []const u8 = "MCP tool definition changed before execution and is no longer available. Search for current tools.";
+const ToolboxMcpLookup = union(enum) {
+    found: struct {
+        tool: tool_mcp_runtime.SelectedTool,
+        /// What a context limit cut from its schema.
+        notice: ?[]const u8,
+    },
+    /// Why the tool can't be used now, such as its server being unavailable.
+    rejected: []const u8,
+    missing,
+};
+
+/// An MCP tool for toolbox, with the reason when it exists but can't be used
+/// now, which `resolveUnselectedMcpTool` leaves out.
+fn lookupToolboxMcpTool(ctx: Context, arena: Allocator, name: []const u8) !ToolboxMcpLookup {
+    const runtime_context = ctx.mcp_ctx orelse return .missing;
+    const schema_fn = ctx.mcp_tool_schema orelse return .missing;
+    const projection = (schema_fn(
+        runtime_context,
+        arena,
+        name,
+        ctx.permission_rules,
+        ctx.context_limits,
+        ctx.mcp_access,
+        runtimeCancelFlag(ctx),
+    ) catch |err| switch (err) {
+        error.OutOfMemory, error.Cancelled => return err,
+        else => return .missing,
+    }) orelse return .missing;
+    return switch (projection) {
+        .selected => |payload| .{ .found = .{ .tool = .{ .name = name, .schema_json = payload.model_output, .mcp_binding = payload.mcp_binding }, .notice = payload.notice } },
+        .rejected => |payload| .{ .rejected = payload.model_output },
+    };
+}
+
+/// The result of an MCP call refused because the tool's definition changed
+/// between admission and execution. A sent tool gets its current schema in
+/// the next request; a toolbox run's (`call.carried_by`) schema never joins
+/// the tools, so its result says how to see the current arguments instead. The
+/// name is the model's, so a run's result writes it as visible text.
+fn refreshChangedMcpTool(ctx: Context, arena: Allocator, call: ToolCall) !ToolExecutionResult {
+    const name = call.name;
+    const toolbox_run = call.carried_by != null;
+    const shown = model_context_encoding.scalar(name);
+    var unavailable_output: []const u8 = if (toolbox_run)
+        try arena.print("{f}'s definition changed before it ran, and it is no longer available. Use toolbox search to find current tools.", .{shown})
+    else
+        "MCP tool definition changed before execution and is no longer available. Search for current tools.";
     var notice: ?[]const u8 = null;
     if (ctx.mcp_ctx) |runtime_context| if (ctx.mcp_tool_schema) |schema_fn| {
         const current = schema_fn(runtime_context, arena, name, ctx.permission_rules, ctx.context_limits, ctx.mcp_access, runtimeCancelFlag(ctx)) catch |err| switch (err) {
@@ -1478,7 +1733,10 @@ fn refreshChangedMcpTool(ctx: Context, arena: Allocator, name: []const u8) !Tool
                 selected[0] = .{ .name = name, .schema_json = payload.model_output, .mcp_binding = payload.mcp_binding };
                 return .{
                     .status = .failure,
-                    .model_output = "MCP tool definition changed before execution. Its current schema is loaded; review it before issuing a new call.",
+                    .model_output = if (toolbox_run)
+                        try arena.print("{f}'s definition changed before it ran, so it didn't run. Open it with toolbox to see its current arguments, then call toolbox with run: \"{f}\" and those arguments.", .{ shown, shown })
+                    else
+                        "MCP tool definition changed before execution. Its current schema is loaded; review it before issuing a new call.",
                     .selected_dynamic_tools = selected,
                     .context_notices = if (payload.notice) |value| notices: {
                         const values = try arena.alloc([]const u8, 1);
@@ -1507,10 +1765,38 @@ fn refreshChangedMcpTool(ctx: Context, arena: Allocator, name: []const u8) !Tool
     };
 }
 
-const SelectedDynamicToolSinkState = struct {
-    allocator: Allocator,
-    tools: std.ArrayList(tool_mcp_runtime.SelectedTool) = .empty,
-};
+fn changedMcpSchema(_: *anyopaque, arena: Allocator, _: []const u8, _: types.PermissionRuleSet, _: context_limits.Values, _: tool_mcp_runtime.Access, _: ?*std.atomic.Value(bool)) anyerror!?tool_mcp_runtime.ToolSchemaResult {
+    return .{ .selected = .{ .model_output = try arena.dupe(u8, "{\"type\":\"function\",\"name\":\"mcp_fixture_echo\"}") } };
+}
+
+fn goneMcpSchema(_: *anyopaque, _: Allocator, _: []const u8, _: types.PermissionRuleSet, _: context_limits.Values, _: tool_mcp_runtime.Access, _: ?*std.atomic.Value(bool)) anyerror!?tool_mcp_runtime.ToolSchemaResult {
+    return null;
+}
+
+test "a toolbox run whose MCP definition changed before it ran says to open it again" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var host: u8 = 0;
+    var rt = TestRuntime{ .mcp_ctx = &host, .mcp_tool_schema = changedMcpSchema };
+    defer rt.deinit(std.testing.allocator);
+
+    // A run's schema never joins the tools, so its result can't say it is loaded.
+    const run = try refreshChangedMcpTool(rt.context(), arena, .{ .id = "1", .name = "mcp_fixture\x07echo", .arguments_json = "{}", .carried_by = "toolbox" });
+    try std.testing.expect(run.status == .failure);
+    try std.testing.expectEqualStrings(
+        "mcp_fixture&#x07;echo's definition changed before it ran, so it didn't run. Open it with toolbox to see its current arguments, then call toolbox with run: \"mcp_fixture&#x07;echo\" and those arguments.",
+        run.model_output,
+    );
+    // A sent tool's call keeps its message: the next request sends the current schema.
+    const sent = try refreshChangedMcpTool(rt.context(), arena, .{ .id = "2", .name = "mcp_fixture_echo", .arguments_json = "{}" });
+    try std.testing.expectEqualStrings("MCP tool definition changed before execution. Its current schema is loaded; review it before issuing a new call.", sent.model_output);
+    try std.testing.expectEqual(@as(usize, 1), sent.selected_dynamic_tools.len);
+
+    rt.mcp_tool_schema = goneMcpSchema;
+    const gone = try refreshChangedMcpTool(rt.context(), arena, .{ .id = "3", .name = "mcp_fixture_echo", .arguments_json = "{}", .carried_by = "toolbox" });
+    try std.testing.expectEqualStrings("mcp_fixture_echo's definition changed before it ran, and it is no longer available. Use toolbox search to find current tools.", gone.model_output);
+}
 
 const ContextNoticeSinkState = struct {
     allocator: Allocator,
@@ -1530,29 +1816,6 @@ fn recordContextNoticeForDispatch(raw_ctx: ?*anyopaque, notice: []const u8) erro
     try state.notices.append(state.allocator, duplicate);
 }
 
-fn attachSelectedDynamicToolSink(
-    dispatch_ctx: *tool_dispatch.DispatchContext,
-    state: *SelectedDynamicToolSinkState,
-) void {
-    dispatch_ctx.selected_dynamic_tool_ctx = state;
-    dispatch_ctx.on_selected_dynamic_tool = recordSelectedDynamicToolForDispatch;
-}
-
-fn recordSelectedDynamicToolForDispatch(
-    raw_ctx: ?*anyopaque,
-    name: []const u8,
-    schema_json: []const u8,
-    binding: ?tool_mcp_runtime.Binding,
-) error{OutOfMemory}!void {
-    const state_ptr = raw_ctx orelse return;
-    const state: *SelectedDynamicToolSinkState = @ptrCast(@alignCast(state_ptr));
-    const owned_name = try state.allocator.dupe(u8, name);
-    errdefer state.allocator.free(owned_name);
-    const owned_schema_json = try state.allocator.dupe(u8, schema_json);
-    errdefer state.allocator.free(owned_schema_json);
-    try state.tools.append(state.allocator, .{ .name = owned_name, .schema_json = owned_schema_json, .mcp_binding = binding });
-}
-
 fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchContext {
     var capabilities = tool_dispatch.ToolCapabilities.for_host(
         host_capabilities.current(),
@@ -1568,6 +1831,8 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
         .change_tracker = ctx.tracker,
         .skills_dir = ctx.skills_dir,
         .skill_locations = ctx.skill_locations,
+        .toolbox_mcp_servers = ctx.toolbox_mcp_servers,
+        .toolbox_behind = ctx.toolbox_behind,
         .context_limits = ctx.context_limits,
         .ignored_list_entries = ctx.ignored_list_entries,
         .max_list_entries = ctx.max_list_entries,
@@ -1589,6 +1854,7 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
         },
         .lifecycle_allocator = ctx.session_allocator,
         .cancel_flag = runtimeCancelFlag(ctx),
+        .tool_yield_flag = &ctx.worker.tool_yield_requested,
         .output_chunk_lifecycle_id = ctx.output_chunk_lifecycle_id,
         .output_chunk_ctx = ctx.output_chunk_ctx,
         .on_output_chunk = ctx.on_output_chunk,
@@ -1624,7 +1890,20 @@ fn terminal_lease_cleanup_dispatch_context(
 ) tool_dispatch.DispatchContext {
     var dispatch = typedDispatchContext(ctx, arena);
     dispatch.cancel_flag = null;
+    dispatch.tool_yield_flag = null;
     return dispatch;
+}
+
+/// Stops the shell commands that steering moved to the background during
+/// turn `turn_id`, after the user cancelled that turn. The stop ignores the
+/// turn's cancel flag, which is set by then.
+pub fn stop_steering_detached_commands(ctx: Context, turn_id: u64) !void {
+    var arena_state = std.heap.ArenaAllocator.init(ctx.session_allocator);
+    defer arena_state.deinit();
+    return shell_impl.stopSteeringDetached(
+        terminal_lease_cleanup_dispatch_context(ctx, arena_state.allocator()),
+        turn_id,
+    );
 }
 
 pub fn release_agent_terminal_lease(ctx: Context, session_id: []const u8) !void {
@@ -1683,16 +1962,8 @@ fn typedDispatchContextForCall(
     var dispatch = typedDispatchContext(ctx, arena);
     dispatch.tool_call_id = call.id;
     dispatch.tool_call_name = call.name;
-    dispatch.resolved_skill = call.resolved_skill;
+    dispatch.tool_call_carried_by = call.carried_by;
     return dispatch;
-}
-
-pub fn prepareSkillCall(ctx: Context, arena: Allocator, call: ToolCall, locations: ?*const skill_contract.Locations) !skill_contract.CallPreparation {
-    const tool = ctx.tool_registry.lookup(call.name) orelse return error.UnsupportedTool;
-    const prepare = tool.prepare_skill_call_fn orelse return error.UnsupportedTool;
-    var dispatch = typedDispatchContextForCall(ctx, arena, call);
-    dispatch.skill_locations = locations;
-    return prepare(dispatch, call.arguments_json);
 }
 
 const VisionProviderState = struct {
@@ -1747,6 +2018,13 @@ fn executeVisionRequest(
         .cancel_flag = state.runtime.cancel_flag,
         .trace_ctx = .{},
         .output_limit = state.runtime.context_limits.image_adapter_output_bytes,
+        // A Token Pass session of a team with Token Pass reads images with a
+        // Token Pass model. A custom connection reads images with its own
+        // vision_model.
+        .model = if (state.runtime.provider == .gateway)
+            token_pass_team.modelForSideCall(.vision, state.runtime.model, image_provider.default_model)
+        else
+            state.runtime.provider_capabilities.vision_model orelse image_provider.default_model,
     };
     if (request.image_ids() != null) {
         if (authority != .ordinary) return error.InvalidVisionExecutionAuthority;
@@ -2762,11 +3040,9 @@ const test_tool_registry = tool_dispatch.Registry{ .tools = &.{
     test_builtin_tools.web_fetch,
     test_builtin_tools.web_search,
     test_captured_shell,
-    test_builtin_tools.capability_search,
-    test_builtin_tools.skill,
     test_builtin_tools.install_skill,
     test_builtin_tools.subagent,
-    test_builtin_tools.mcp_select_tool,
+    test_builtin_tools.toolbox,
     test_builtin_tools.ask_user_question,
     test_builtin_tools.read_tool_result,
 } };
@@ -3515,6 +3791,50 @@ test "removed tool names are not callable" {
     }
 }
 
+test "a call of a tool lia does not know names it as visible text in the result the model reads" {
+    var rt = TestRuntime{};
+    defer rt.deinit(std.testing.allocator);
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const cases = [_]struct { name: []const u8, shown: []const u8 }{
+        .{ .name = "missing_tool", .shown = "Unsupported tool: missing_tool" },
+        .{ .name = "", .shown = "Unsupported tool: " },
+        .{ .name = "x\x1b]0;owned\x07y", .shown = "Unsupported tool: x&#x1b;]0;owned&#x07;y" },
+        .{ .name = "a\x00b\r\nc", .shown = "Unsupported tool: a&#x00;b&#x0d;&#x0a;c" },
+    };
+    for (cases) |case| {
+        const call: ToolCall = .{ .id = "odd-tool", .name = case.name, .arguments_json = "{}" };
+        // The same text through the way a native call is run and the way a
+        // wasi host runs a workspace call.
+        const executed = try executeToolCall(rt.context(), arena, call);
+        try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, executed.status);
+        try std.testing.expectEqualStrings(case.shown, executed.model_output);
+        const workspace = try executeWorkspaceToolCallInner(rt.context(), arena, call, .ordinary, true);
+        try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, workspace.status);
+        try std.testing.expectEqualStrings(case.shown, workspace.model_output);
+    }
+}
+
+test "a workspace call of a tool that is not the one shell tool answers as an unsupported tool" {
+    var rt = TestRuntime{};
+    defer rt.deinit(std.testing.allocator);
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // `read_file` is registered, but a workspace call runs only a registry
+    // of the shell tool alone.
+    const result = try executeWorkspaceToolCallInner(rt.context(), arena, .{
+        .id = "other-tool",
+        .name = "read_file",
+        .arguments_json = "{}",
+    }, .ordinary, true);
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
+    try std.testing.expectEqualStrings("Unsupported tool: read_file", result.model_output);
+}
+
 fn registryOwnedWebFetchCall(
     ctx: tool_dispatch.DispatchContext,
     input: tool_dispatch.ToolInput,
@@ -3550,36 +3870,12 @@ fn registryOwnedAskQuestionCall(
     return .{ .success = try ctx.allocator.dupe(u8, "registry-owned ask_user_question") };
 }
 
-fn registryOwnedSkillCall(
-    ctx: tool_dispatch.DispatchContext,
-    input: tool_dispatch.ToolInput,
-) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
-    _ = input;
-    return .{ .success = try ctx.allocator.dupe(u8, "registry-owned skill") };
-}
-
 fn registryOwnedInstallSkillCall(
     ctx: tool_dispatch.DispatchContext,
     input: tool_dispatch.ToolInput,
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     _ = input;
     return .{ .success = try ctx.allocator.dupe(u8, "registry-owned install_skill") };
-}
-
-fn registryOwnedCapabilitySearchCall(
-    ctx: tool_dispatch.DispatchContext,
-    input: tool_dispatch.ToolInput,
-) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
-    _ = input;
-    return .{ .success = try ctx.allocator.dupe(u8, "registry-owned capability_search") };
-}
-
-fn registryOwnedMcpSelectCall(
-    ctx: tool_dispatch.DispatchContext,
-    input: tool_dispatch.ToolInput,
-) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
-    _ = input;
-    return .{ .success = try ctx.allocator.dupe(u8, "registry-owned mcp_select_tool") };
 }
 
 const QuestionBridgeThreadState = struct {
@@ -3892,21 +4188,16 @@ test "terminal exec execution uses supplied registry entry" {
     try std.testing.expectEqualStrings("registry-owned terminal exec", result.model_output);
 }
 
-test "stateful skill tool execution uses supplied registry entries" {
+test "stateful install_skill execution uses its supplied registry entry" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var registered_skill = test_builtin_tools.skill;
-    registered_skill.call = registryOwnedSkillCall;
     var registered_install_skill = test_builtin_tools.install_skill;
     registered_install_skill.call = registryOwnedInstallSkillCall;
 
-    const tools = [_]tool_dispatch.Tool{
-        registered_skill,
-        registered_install_skill,
-    };
+    const tools = [_]tool_dispatch.Tool{registered_install_skill};
     const registry = tool_dispatch.Registry{ .tools = tools[0..] };
 
     var rt = TestRuntime{ .tool_registry = registry };
@@ -3917,77 +4208,12 @@ test "stateful skill tool execution uses supplied registry entries" {
         args: []const u8,
         expected: []const u8,
     }{
-        .{ .name = "skill", .args = "{\"name\":\"workflow\"}", .expected = "registry-owned skill" },
         .{ .name = "install_skill", .args = "{\"source\":\"/tmp/skills\",\"skill\":\"workflow\"}", .expected = "registry-owned install_skill" },
     };
 
     for (cases) |case| {
         const result = try executeToolCall(rt.context(), arena, .{
             .id = "stateful",
-            .name = case.name,
-            .arguments_json = case.args,
-        });
-        try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, result.status);
-        try std.testing.expectEqualStrings(case.expected, result.model_output);
-    }
-}
-
-test "capability and MCP selection execution preserve argument failures" {
-    const alloc = std.testing.allocator;
-    var rt = TestRuntime{};
-    defer rt.deinit(alloc);
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const cases = [_]struct {
-        name: []const u8,
-        args: []const u8,
-        expected: []const u8,
-    }{
-        .{ .name = "capability_search", .args = "{\"query\":1}", .expected = "capability_search field \"query\" must be a string" },
-        .{ .name = "mcp_select_tool", .args = "{\"name\":1}", .expected = "mcp_select_tool requires an exact dynamic tool name." },
-    };
-
-    for (cases) |case| {
-        const result = try executeToolCall(rt.context(), arena, .{
-            .id = "mcp_validation",
-            .name = case.name,
-            .arguments_json = case.args,
-        });
-        try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
-        try std.testing.expectEqualStrings(case.expected, result.model_output);
-    }
-}
-
-test "capability and MCP selection execution use supplied registry entries" {
-    const alloc = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var registered_search = test_builtin_tools.capability_search;
-    registered_search.call = registryOwnedCapabilitySearchCall;
-    var registered_select = test_builtin_tools.mcp_select_tool;
-    registered_select.call = registryOwnedMcpSelectCall;
-    const tools = [_]tool_dispatch.Tool{ registered_search, registered_select };
-    const registry = tool_dispatch.Registry{ .tools = tools[0..] };
-
-    var rt = TestRuntime{ .tool_registry = registry };
-    defer rt.deinit(alloc);
-
-    const cases = [_]struct {
-        name: []const u8,
-        args: []const u8,
-        expected: []const u8,
-    }{
-        .{ .name = "capability_search", .args = "{\"query\":\"read\"}", .expected = "registry-owned capability_search" },
-        .{ .name = "mcp_select_tool", .args = "{\"name\":\"mcp_fs_read\"}", .expected = "registry-owned mcp_select_tool" },
-    };
-
-    for (cases) |case| {
-        const result = try executeToolCall(rt.context(), arena, .{
-            .id = "mcp_registry",
             .name = case.name,
             .arguments_json = case.args,
         });
@@ -4288,6 +4514,102 @@ test "parent web_fetch tool-call metric omits URL and fetched result content" {
     try std.testing.expectEqual(@as(u32, 0), buf[0].args_total_bytes);
     try std.testing.expectEqual(@as(u32, 0), buf[0].result_total_bytes);
     try expectNotContains(buf[0].result(), "FETCHED_PAGE_SECRET_RAW");
+}
+
+test "a call reads the startup files only when admission resolves it to a user-profile run" {
+    const builtin_tools = @import("../../builtins/tools.zig");
+    var rt = TestRuntime{ .tool_registry = builtin_tools.registry };
+    defer rt.deinit(std.testing.allocator);
+    const cases = [_]struct { arguments_json: []const u8, reads: bool }{
+        .{ .arguments_json = "{\"action\":\"run\",\"command\":\"ls -d missing .\"}", .reads = true },
+        .{ .arguments_json = "{\"action\":\"run\",\"command\":\"ls -d missing .\",\"profile\":\"user\"}", .reads = true },
+        .{ .arguments_json = "{\"action\":\"run\",\"command\":\"ls -d missing .\",\"profile\":\"clean\"}", .reads = false },
+        // A clean start skips the startup files of any shell.
+        .{
+            .arguments_json = "{\"action\":\"run\",\"tty\":true,\"command\":\"ls\",\"shell\":{\"kind\":\"executable\",\"path\":\"/bin/sh\",\"clean_start\":true}}",
+            .reads = false,
+        },
+        // `interact` types into a session, here one that does not exist, and
+        // `stop` ends one; neither starts a command.
+        .{ .arguments_json = "{\"action\":\"interact\",\"session_id\":\"missing\",\"chars\":\"ls -d /missing; exit 3\\n\"}", .reads = false },
+        .{ .arguments_json = "{\"action\":\"stop\",\"session_id\":\"missing\",\"force\":true}", .reads = false },
+        // The orchestrator adds the action a call leaves out before the call
+        // is stored, so a stored call without one never ran.
+        .{ .arguments_json = "{\"command\":\"ls\"}", .reads = false },
+        .{ .arguments_json = "not json", .reads = false },
+    };
+    for (cases) |case| {
+        const call: ToolCall = .{ .id = "case", .name = "shell", .arguments_json = case.arguments_json };
+        std.testing.expectEqual(case.reads, callReadsStartupFiles(rt.context(), std.testing.allocator, call)) catch |err| {
+            std.debug.print("arguments: {s}\n", .{case.arguments_json});
+            return err;
+        };
+    }
+    const read: ToolCall = .{ .id = "read", .name = "read_file", .arguments_json = "{\"path\":\"missing.txt\"}" };
+    try std.testing.expect(!callReadsStartupFiles(rt.context(), std.testing.allocator, read));
+
+    // A tty run reads the snapshot's startup files only in the login shell
+    // the snapshot captured; another shell reads its own.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var login_buffer: [4096]u8 = undefined;
+    const login = switch (try shell_resolver.environment(arena, shell_resolver.configuredLoginShellInto(&login_buffer), null)) {
+        .user => |path| path,
+        else => return error.TestUnexpectedResult,
+    };
+    const other: []const u8 = if (std.mem.endsWith(u8, login, "/zsh")) "/bin/bash" else "/bin/zsh";
+    const tty_cases = [_]struct { shell: ?[]const u8, reads: bool }{
+        .{ .shell = null, .reads = true },
+        .{ .shell = login, .reads = true },
+        .{ .shell = other, .reads = false },
+    };
+    for (tty_cases) |case| {
+        const shell_field = if (case.shell) |path|
+            try arena.print(",\"shell\":{{\"kind\":\"executable\",\"path\":\"{s}\"}}", .{path})
+        else
+            "";
+        const arguments_json = try arena.print("{{\"action\":\"run\",\"tty\":true,\"command\":\"ls -d missing .\"{s}}}", .{shell_field});
+        const call: ToolCall = .{ .id = "tty", .name = "shell", .arguments_json = arguments_json };
+        std.testing.expectEqual(case.reads, callReadsStartupFiles(rt.context(), std.testing.allocator, call)) catch |err| {
+            std.debug.print("login {s}, arguments: {s}\n", .{ login, arguments_json });
+            return err;
+        };
+    }
+    // Two spellings of one file name one shell; a path that does not resolve
+    // matches only itself.
+    try std.testing.expect(sameShellPath(arena, "/bin/../bin/sh", "/bin/sh"));
+    try std.testing.expect(sameShellPath(arena, "/missing/zsh", "/missing/zsh"));
+    try std.testing.expect(!sameShellPath(arena, "/missing/zsh", "/missing/../missing/zsh"));
+}
+
+test "trace keeps a user-profile run cancelled before it starts as reading no startup files" {
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+    // Set before the call, so the runner stops before it starts a shell.
+    var cancel = std.atomic.Value(bool).init(true);
+    const builtin_tools = @import("../../builtins/tools.zig");
+    var rt = TestRuntime{ .tool_registry = builtin_tools.registry, .cancel_flag = &cancel };
+    defer rt.deinit(std.testing.allocator);
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    // The shell tool reports the cancel as a failed result with no command
+    // result; a cancel the runner raises instead ends as an error.
+    if (executeTestRunCommand(rt.context(), arena_state.allocator(), .{
+        .id = "cancelled_run",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"ls -d missing .\"}",
+    })) |result| {
+        try std.testing.expect(result.cancelled);
+        try std.testing.expect(result.command_result_json == null);
+    } else |err| try std.testing.expectEqual(error.Cancelled, err);
+    var kept: [1]diagnostics.FailedToolCall = undefined;
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.snapshotFailedToolCalls(&kept));
+    try std.testing.expectEqualStrings("cancelled_run", kept[0].callId());
+    try std.testing.expect(kept[0].outcome != .succeeded and kept[0].outcome != .command_failed);
+    // The trace writes `redefined` only for a call marked as reading them.
+    try std.testing.expect(!kept[0].reads_startup_files);
 }
 
 test "tool-call metrics retain caller identity across returned results" {
@@ -6840,7 +7162,6 @@ const McpFixture = struct {
 
     const PermissionContext = struct {
         search_rule_count: usize = 0,
-        schema_rule_count: usize = 0,
     };
 
     const AuthorityContext = struct {
@@ -6911,15 +7232,9 @@ const McpFixture = struct {
         ctx.search_rule_count = permission_rules.rules.len;
         return search(raw_ctx, arena, request, permission_rules, limits);
     }
-
-    fn schemaRecordingRules(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, permission_rules: types.PermissionRuleSet, limits: context_limits.Values, access: tool_mcp_runtime.Access, cancel_flag: ?*std.atomic.Value(bool)) anyerror!?tool_mcp_runtime.ToolSchemaResult {
-        const ctx: *PermissionContext = @ptrCast(@alignCast(raw_ctx));
-        ctx.schema_rule_count = permission_rules.rules.len;
-        return schema(raw_ctx, arena, name, permission_rules, limits, access, cancel_flag);
-    }
 };
 
-test "capability search and MCP selection forward permission rules through registered execution" {
+test "toolbox search forwards permission rules to MCP search" {
     var permission_context = McpFixture.PermissionContext{};
     var rules = [_]types.PermissionRule{
         .{ .permission = @constCast("mcp_other"), .pattern = @constCast("*"), .action = .deny },
@@ -6927,7 +7242,6 @@ test "capability search and MCP selection forward permission rules through regis
     var rt = TestRuntime{
         .mcp_ctx = @ptrCast(&permission_context),
         .mcp_search_tools = McpFixture.searchRecordingRules,
-        .mcp_tool_schema = McpFixture.schemaRecordingRules,
         .permission_rules = .{ .rules = &rules },
     };
     defer rt.deinit(std.testing.allocator);
@@ -6938,33 +7252,21 @@ test "capability search and MCP selection forward permission rules through regis
 
     _ = try executeToolCall(rt.context(), arena, .{
         .id = "search",
-        .name = "capability_search",
-        .arguments_json = "{\"query\":\"read\",\"server\":\"fixture\"}",
-    });
-    _ = try executeToolCall(rt.context(), arena, .{
-        .id = "select",
-        .name = "mcp_select_tool",
-        .arguments_json = "{\"name\":\"mcp_fs_read\"}",
+        .name = "toolbox",
+        .arguments_json = "{\"search\":\"read\",\"server\":\"fixture\"}",
     });
 
     try std.testing.expectEqual(@as(usize, 1), permission_context.search_rule_count);
-    try std.testing.expectEqual(@as(usize, 1), permission_context.schema_rule_count);
 
     rt.permission_mode = .yolo;
     permission_context = .{};
     _ = try executeToolCall(rt.context(), arena, .{
         .id = "yolo-search",
-        .name = "capability_search",
-        .arguments_json = "{\"query\":\"read\",\"server\":\"fixture\"}",
-    });
-    _ = try executeToolCall(rt.context(), arena, .{
-        .id = "yolo-select",
-        .name = "mcp_select_tool",
-        .arguments_json = "{\"name\":\"mcp_fs_read\"}",
+        .name = "toolbox",
+        .arguments_json = "{\"search\":\"read\",\"server\":\"fixture\"}",
     });
 
     try std.testing.expectEqual(@as(usize, 0), permission_context.search_rule_count);
-    try std.testing.expectEqual(@as(usize, 0), permission_context.schema_rule_count);
 }
 
 test "MCP dynamic tool cannot execute before it is advertised" {
@@ -6986,41 +7288,7 @@ test "MCP dynamic tool cannot execute before it is advertised" {
         .arguments_json = "{}",
     });
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
-    try expectContains(result.model_output, "not selected");
-    try std.testing.expectEqual(@as(usize, 0), counting.calls);
-}
-
-test "MCP select does not authorize same-response dynamic execution" {
-    var counting = McpFixture.CountingContext{};
-    var rt = TestRuntime{
-        .mcp_ctx = @ptrCast(&counting),
-        .mcp_has_tool = McpFixture.hasTrue,
-        .mcp_call_tool = McpFixture.callCounting,
-        .mcp_tool_schema = McpFixture.schema,
-    };
-    defer rt.deinit(std.testing.allocator);
-
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const selected = try executeToolCall(rt.context(), arena, .{
-        .id = "select",
-        .name = "mcp_select_tool",
-        .arguments_json = "{\"name\":\"mcp_fs_read\"}",
-    });
-    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, selected.status);
-    try std.testing.expectEqualStrings("mcp_fs_read", selected.selected_dynamic_tools[0].name);
-    try expectContains(selected.selected_dynamic_tools[0].schema_json, "context_limit_rejection");
-    try expectContains(selected.selected_dynamic_tools[0].schema_json, "<context_limit action='literal' />");
-
-    const result = try executeToolCall(rt.context(), arena, .{
-        .id = "dynamic",
-        .name = "mcp_fs_read",
-        .arguments_json = "{}",
-    });
-    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
-    try expectContains(result.model_output, "not selected");
+    try expectContains(result.model_output, "is not one of the tools in this request");
     try std.testing.expectEqual(@as(usize, 0), counting.calls);
 }
 
@@ -7043,11 +7311,49 @@ test "MCP unadvertised dynamic names stay unsupported without a runtime call" {
         .arguments_json = "{}",
     });
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
-    try expectContains(result.model_output, "not selected");
+    try expectContains(result.model_output, "is not one of the tools in this request");
 
     var no_rt = TestRuntime{};
     defer no_rt.deinit(std.testing.allocator);
     try expectToolOutput(no_rt.context(), "mcp_unknown", "{}", "Unsupported tool: mcp_unknown");
+}
+
+test "a toolbox run of an MCP tool the server removed says it is no longer available" {
+    var marker: u8 = 0;
+    const advertised = [_][]const u8{ "mcp_fixture\x07echo", "mcp_fixture_echo" };
+    // The host no longer has an admitted tool, so its call comes back empty.
+    var gone_rt = TestRuntime{
+        .mcp_ctx = @ptrCast(&marker),
+        .mcp_has_tool = McpFixture.hasTrue,
+        .mcp_call_tool = McpFixture.callNull,
+        .advertised_dynamic_tool_names = &advertised,
+    };
+    defer gone_rt.deinit(std.testing.allocator);
+    // Without an MCP runtime the call is unsupported before it dispatches.
+    var no_rt = TestRuntime{};
+    defer no_rt.deinit(std.testing.allocator);
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const run_message = "mcp_fixture&#x07;echo is no longer available. Use toolbox search to find current tools.";
+    const cases = [_]struct { rt: *TestRuntime, name: []const u8, carried_by: ?[]const u8, message: []const u8 }{
+        .{ .rt = &gone_rt, .name = "mcp_fixture\x07echo", .carried_by = "toolbox", .message = run_message },
+        .{ .rt = &no_rt, .name = "mcp_fixture\x07echo", .carried_by = "toolbox", .message = run_message },
+        // A direct call of the same tool keeps the generic message on both paths.
+        .{ .rt = &gone_rt, .name = "mcp_fixture_echo", .carried_by = null, .message = "Unsupported tool: mcp_fixture_echo" },
+        .{ .rt = &no_rt, .name = "mcp_fixture_echo", .carried_by = null, .message = "Unsupported tool: mcp_fixture_echo" },
+    };
+    for (cases) |case| {
+        const result = try executeToolCall(case.rt.context(), arena, .{
+            .id = "1",
+            .name = case.name,
+            .arguments_json = "{}",
+            .carried_by = case.carried_by,
+        });
+        try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
+        try std.testing.expectEqualStrings(case.message, result.model_output);
+    }
 }
 
 test "MCP dynamic tool executes after its schema was advertised" {
@@ -7249,7 +7555,7 @@ test "install_skill explicit tool installs local skill source" {
     );
 }
 
-test "skill tool preserves resource and discovery notices separately" {
+test "toolbox skill open preserves resource and discovery notices separately" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -7289,25 +7595,18 @@ test "skill tool preserves resource and discovery notices separately" {
     defer arena_state.deinit();
     var ctx = rt.context();
     ctx.context_limits.skill_chunk_bytes = .{ .value = .{ .bytes = 96 }, .source = .command_line };
-    const call: ToolCall = .{ .id = "1", .name = "skill", .arguments_json = "{\"name\":\"workflow\"}" };
-    const preparation = try prepareSkillCall(ctx, arena_state.allocator(), call, null);
-    defer @import("../skills/skill_invocation.zig").freeCallPreparation(arena_state.allocator(), preparation);
-    const selected = preparation.selected;
-    for ([_]bool{ false, true }) |bound| {
-        var effective_call = call;
-        if (bound) effective_call.resolved_skill = &selected;
-        const result = try executeToolCall(ctx, arena_state.allocator(), effective_call);
-        try expectContains(result.model_output, "<skill_content name=\"workflow\" resource=\"SKILL.md\" offset=\"0\"");
-        try expectContains(result.model_output, "use the workflow skill");
-        try expectNotContains(result.model_output, "assets/data.txt");
-        try std.testing.expect(result.system_notice == null);
-        try std.testing.expectEqual(@as(usize, 2), result.context_notices.len);
-        try expectContains(result.context_notices[0], "[context] skill resource \"workflow/SKILL.md\" truncated");
-        try expectContains(result.context_notices[1], "skill discovery warning:");
-    }
+    const call: ToolCall = .{ .id = "1", .name = "toolbox", .arguments_json = "{\"open\":\"workflow\"}" };
+    const result = try executeToolCall(ctx, arena_state.allocator(), call);
+    try expectContains(result.model_output, "<skill_content name=\"workflow\" resource=\"SKILL.md\" offset=\"0\"");
+    try expectContains(result.model_output, "use the workflow skill");
+    try expectNotContains(result.model_output, "assets/data.txt");
+    try std.testing.expect(result.system_notice == null);
+    try std.testing.expectEqual(@as(usize, 2), result.context_notices.len);
+    try expectContains(result.context_notices[0], "[context] skill resource \"workflow/SKILL.md\" truncated");
+    try expectContains(result.context_notices[1], "skill discovery warning:");
 }
 
-test "skill tool loads the exact advertised duplicate and rejects ambiguous or untrusted locations" {
+test "toolbox open loads the exact advertised duplicate and rejects ambiguous or untrusted locations" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -7365,39 +7664,33 @@ test "skill tool loads the exact advertised duplicate and rejects ambiguous or u
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const exact_managed_args = try arena.print("{{\"name\":\"workflow\",\"location\":\"{s}\"}}", .{managed_skill});
-    const exact = try executeToolCall(rt.context(), arena, .{ .id = "exact", .name = "skill", .arguments_json = exact_managed_args });
+    const exact_managed_args = try arena.print("{{\"open\":\"{s}\"}}", .{managed_skill});
+    const exact = try executeToolCall(rt.context(), arena, .{ .id = "exact", .name = "toolbox", .arguments_json = exact_managed_args });
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, exact.status);
     try expectContains(exact.model_output, "MANAGED BODY B");
     try expectNotContains(exact.model_output, "b-only.txt");
     try expectNotContains(exact.model_output, "WORKSPACE BODY A");
     try expectNotContains(exact.model_output, "a-only.txt");
 
-    const duplicate = try executeToolCall(rt.context(), arena, .{ .id = "duplicate", .name = "skill", .arguments_json = exact_managed_args });
+    const duplicate = try executeToolCall(rt.context(), arena, .{ .id = "duplicate", .name = "toolbox", .arguments_json = exact_managed_args });
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, duplicate.status);
     try expectContains(duplicate.model_output, "MANAGED BODY B");
     try expectNotContains(duplicate.model_output, "already loaded");
 
-    const ambiguous = try executeToolCall(rt.context(), arena, .{ .id = "ambiguous", .name = "skill", .arguments_json = "{\"name\":\"workflow\"}" });
+    const ambiguous = try executeToolCall(rt.context(), arena, .{ .id = "ambiguous", .name = "toolbox", .arguments_json = "{\"open\":\"workflow\"}" });
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, ambiguous.status);
     try expectContains(ambiguous.model_output, "ambiguous");
     try expectContains(ambiguous.model_output, workspace_skill);
     try expectContains(ambiguous.model_output, managed_skill);
 
-    const outside_args = try arena.print("{{\"name\":\"workflow\",\"location\":\"{s}\"}}", .{outside_skill});
-    const outside = try executeToolCall(rt.context(), arena, .{ .id = "outside", .name = "skill", .arguments_json = outside_args });
+    const outside_args = try arena.print("{{\"open\":\"{s}\"}}", .{outside_skill});
+    const outside = try executeToolCall(rt.context(), arena, .{ .id = "outside", .name = "toolbox", .arguments_json = outside_args });
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, outside.status);
     try expectNotContains(outside.model_output, "OUTSIDE BODY SENTINEL");
     try expectNotContains(outside.model_output, "outside-only.txt");
-
-    const mismatch_args = try arena.print("{{\"name\":\"other\",\"location\":\"{s}\"}}", .{managed_skill});
-    const mismatch = try executeToolCall(rt.context(), arena, .{ .id = "mismatch", .name = "skill", .arguments_json = mismatch_args });
-    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, mismatch.status);
-    try expectContains(mismatch.model_output, "does not match");
-    try expectNotContains(mismatch.model_output, "MANAGED BODY B");
 }
 
-test "name-only skill call rediscovers a duplicate added after the first read" {
+test "toolbox open by name rediscovers a duplicate added after the first read" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -7423,7 +7716,7 @@ test "name-only skill call rediscovers a duplicate added after the first read" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const first = try executeToolCall(rt.context(), arena, .{ .id = "first", .name = "skill", .arguments_json = "{\"name\":\"workflow\"}" });
+    const first = try executeToolCall(rt.context(), arena, .{ .id = "first", .name = "toolbox", .arguments_json = "{\"open\":\"workflow\"}" });
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, first.status);
     try expectContains(first.model_output, "MANAGED BODY A");
 
@@ -7434,13 +7727,13 @@ test "name-only skill call rediscovers a duplicate added after the first read" {
         try file.writeStreamingAll(io_mod.getIo(), "---\nname: workflow\ndescription: workspace workflow\n---\n\nWORKSPACE BODY B\n");
     }
 
-    const rediscovered = try executeToolCall(rt.context(), arena, .{ .id = "rediscovered", .name = "skill", .arguments_json = "{\"name\":\"workflow\"}" });
+    const rediscovered = try executeToolCall(rt.context(), arena, .{ .id = "rediscovered", .name = "toolbox", .arguments_json = "{\"open\":\"workflow\"}" });
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, rediscovered.status);
     try expectContains(rediscovered.model_output, "ambiguous");
     try expectNotContains(rediscovered.model_output, "already loaded");
 }
 
-test "supplied session grant authorizes skill in a fresh session" {
+test "a session grant for skill authorizes a toolbox open of that skill" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -7454,14 +7747,48 @@ test "supplied session grant authorizes skill in a fresh session" {
 
     const decision = (try tool_admission.requestPermissionOutcome(rt.context().admissionInput(), arena_state.allocator(), .{
         .id = "1",
-        .name = "skill",
-        .arguments_json = "{\"name\":\"workflow\"}",
+        .name = "toolbox",
+        .arguments_json = "{\"open\":\"workflow\"}",
+        .toolbox_lookup = .{ .permission = "skill", .target = "workflow" },
     }, .ask, &grants)).decision;
 
     try std.testing.expectEqual(ToolPermissionDecision.once, decision);
 }
 
-test "skill tool reports missing skill" {
+test "rules for the tools toolbox replaced decide its opens and searches" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var rules = [_]types.PermissionRule{
+        .{ .permission = @constCast("skill"), .pattern = @constCast("workflow"), .action = .deny },
+        .{ .permission = @constCast("capability_search"), .pattern = @constCast("*"), .action = .deny },
+        .{ .permission = @constCast("mcp_select_tool"), .pattern = @constCast("mcp_fs_*"), .action = .deny },
+    };
+    var rt = TestRuntime{ .permission_rules = .{ .rules = &rules } };
+    defer rt.deinit(alloc);
+
+    const Case = struct { arguments: []const u8, lookup: types.ToolboxLookup, denied: bool };
+    const cases = [_]Case{
+        .{ .arguments = "{\"open\":\"workflow\"}", .lookup = .{ .permission = "skill", .target = "workflow" }, .denied = true },
+        .{ .arguments = "{\"open\":\"other\"}", .lookup = .{ .permission = "skill", .target = "other" }, .denied = false },
+        .{ .arguments = "{\"search\":\"read\"}", .lookup = .{ .permission = "capability_search", .target = "*" }, .denied = true },
+        .{ .arguments = "{\"open\":\"mcp_fs_read\"}", .lookup = .{ .permission = "mcp_select_tool", .target = "mcp_fs_read" }, .denied = true },
+        .{ .arguments = "{\"open\":\"mcp_git_log\"}", .lookup = .{ .permission = "mcp_select_tool", .target = "mcp_git_log" }, .denied = false },
+    };
+    for (cases) |case| {
+        const decision = (try tool_admission.requestPermissionOutcome(rt.context().admissionInput(), arena, .{
+            .id = "1",
+            .name = "toolbox",
+            .arguments_json = case.arguments,
+            .toolbox_lookup = case.lookup,
+        }, .ask, &.{})).decision;
+        try std.testing.expectEqual(case.denied, decision == .deny or decision == .policy_denied);
+    }
+}
+
+test "toolbox open reports a missing skill with the next step" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -7480,10 +7807,10 @@ test "skill tool reports missing skill" {
     defer rt.deinit(alloc);
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
-    const result = try executeToolCall(rt.context(), arena_state.allocator(), .{ .id = "1", .name = "skill", .arguments_json = "{\"name\":\"missing\"}" });
+    const result = try executeToolCall(rt.context(), arena_state.allocator(), .{ .id = "1", .name = "toolbox", .arguments_json = "{\"open\":\"missing\"}" });
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
-    try expectContains(result.model_output, "Skill \"missing\" not found.");
-    try expectContains(result.model_output, "Refresh available skills");
+    try expectContains(result.model_output, "Nothing named missing is in the toolbox menu.");
+    try expectContains(result.model_output, "Use toolbox search to find it.");
 }
 
 const vision_test_registry_tools = [_]tool_dispatch.Tool{test_builtin_tools.vision};

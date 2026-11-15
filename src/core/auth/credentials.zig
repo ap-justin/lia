@@ -119,6 +119,19 @@ pub const CatalogAccess = union(enum) {
         };
     }
 
+    /// The same access with another token for the same sign-in, such as one
+    /// renewed after the first was rejected. Public access is unchanged.
+    pub fn withCredential(self: CatalogAccess, credential: []const u8) CatalogAccess {
+        return switch (self) {
+            .authenticated => |access| blk: {
+                var renewed = access;
+                renewed.credential = credential;
+                break :blk .{ .authenticated = renewed };
+            },
+            .public_only, .host_managed => self,
+        };
+    }
+
     pub fn withExplicitAuthority(self: CatalogAccess) CatalogAccess {
         return switch (self) {
             .public_only => |access| .{ .public_only = access },
@@ -232,7 +245,16 @@ pub const stored_key_backend_label = if (builtin.target.os.tag == .macos) "macOS
 /// lia login session is refreshed first.
 pub const LoadMode = enum { stored, refresh_if_needed };
 
-const LiaLoginRefreshMode = enum { if_needed, force };
+/// When `refreshLiaLoginCredentialLocked` rotates the saved lia login.
+const LiaLoginRefreshMode = union(enum) {
+    /// Only when the saved login is past its refresh deadline.
+    if_needed,
+    /// Whatever the saved login holds.
+    force,
+    /// The gateway rejected this access token: as `oauth.rejectedLoginRotates`
+    /// decides.
+    replace_rejected: []const u8,
+};
 
 pub const missing_credential_message = "lia needs access to Vercel AI Gateway. Run lia login to sign in, lia login vercel --api-key to use an API key, or set AI_GATEWAY_API_KEY.";
 pub const unreadable_store_message = "lia could not read the stored API key from " ++ stored_key_backend_label ++ ". A key may be saved but unreadable. Set LIA_TRACE_LOG for the failing step, or set AI_GATEWAY_API_KEY.";
@@ -639,11 +661,27 @@ fn loadStoredLiaLoginCredential(alloc: std.mem.Allocator) !?Credential {
     return takeCredentialFromSession(&session, null);
 }
 
+/// Reads the stored credential of a source lia can refresh, as saved, and
+/// never calls the issuer, even for an expired one. Null for every other
+/// source and when nothing is stored. The caller owns the result.
+pub fn loadStoredSource(alloc: std.mem.Allocator, source: Source) !?Credential {
+    return switch (source) {
+        .fx_login => loadStoredLiaLoginCredential(alloc),
+        .vercel_oidc_token, .ai_gateway_api_key, .stored_key, .host_managed, .configured => null,
+    };
+}
+
+/// Refreshes the saved lia login after the gateway rejected `rejected_token`.
+/// The login rotates only while it still holds that token or is past its
+/// refresh deadline; when another lia already replaced it, the saved login is
+/// returned as it is. Null rotates it whatever it holds.
 pub fn refreshLiaLoginCredential(
     alloc: std.mem.Allocator,
     transport: oauth_transport.Provider,
+    rejected_token: ?[]const u8,
 ) !?Credential {
-    return refreshLiaLoginCredentialLocked(alloc, transport, .force);
+    const mode: LiaLoginRefreshMode = if (rejected_token) |token| .{ .replace_rejected = token } else .force;
+    return refreshLiaLoginCredentialLocked(alloc, transport, mode);
 }
 
 fn refreshLiaLoginCredentialLocked(
@@ -659,11 +697,23 @@ fn refreshLiaLoginCredentialLocked(
     defer session.deinit(alloc);
 
     var refreshed_at_ms: ?i64 = null;
-    if (mode == .force or session.expired(io_mod.milliTimestamp())) {
+    if (liaLoginNeedsRotation(mode, session.access_token, session.expired(io_mod.milliTimestamp()))) {
         try refreshLiaSession(alloc, transport, &mutation, &session);
         refreshed_at_ms = io_mod.milliTimestamp();
+    } else if (mode == .replace_rejected) {
+        debug_trace.logf("auth", "lia login refresh skipped reason=saved_login_replaced", .{});
     }
     return takeCredentialFromSession(&session, refreshed_at_ms);
+}
+
+/// Whether a refresh in `mode` rotates the saved login, which holds
+/// `saved_access_token` and is `saved_expired` when past its refresh deadline.
+fn liaLoginNeedsRotation(mode: LiaLoginRefreshMode, saved_access_token: []const u8, saved_expired: bool) bool {
+    return switch (mode) {
+        .if_needed => saved_expired,
+        .force => true,
+        .replace_rejected => |rejected| oauth.rejectedLoginRotates(saved_access_token, rejected, saved_expired),
+    };
 }
 
 pub fn refreshLiaSession(
@@ -691,12 +741,12 @@ pub fn refreshLiaSession(
     ) catch |err| {
         if (err == error.InvalidOAuthResponse) {
             debug_trace.logf("auth", "retiring lia login session reason={s}", .{@errorName(err)});
-            try retire_lia_session(alloc, mutation);
+            try retire_lia_session(alloc, mutation, session);
             return error.NoRefreshToken;
         }
         if (refresh_rejection_requires_sign_in(err)) {
             debug_trace.logf("auth", "retiring terminal lia login session reason={s}", .{@errorName(err)});
-            try retire_lia_session(alloc, mutation);
+            try retire_lia_session(alloc, mutation, session);
         }
         return err;
     };
@@ -704,7 +754,7 @@ pub fn refreshLiaSession(
 
     const rotated_refresh_token = refreshed.refresh_token orelse {
         debug_trace.logf("auth", "retiring lia login session reason=NoRefreshToken", .{});
-        try retire_lia_session(alloc, mutation);
+        try retire_lia_session(alloc, mutation, session);
         return error.NoRefreshToken;
     };
     const expires_at_ms = oauth.expiryTimestampMs(
@@ -712,7 +762,7 @@ pub fn refreshLiaSession(
         refreshed.expires_in,
     ) catch |err| {
         debug_trace.logf("auth", "retiring lia login session reason={s}", .{@errorName(err)});
-        try retire_lia_session(alloc, mutation);
+        try retire_lia_session(alloc, mutation, session);
         return error.NoRefreshToken;
     };
 
@@ -729,7 +779,7 @@ pub fn refreshLiaSession(
     };
     mutation.save(alloc, replacement) catch |err| {
         debug_trace.logf("auth", "retiring lia login session after refresh save failed err={s}", .{@errorName(err)});
-        retire_lia_session(alloc, mutation) catch |cleanup_err| {
+        retire_lia_session(alloc, mutation, session) catch |cleanup_err| {
             debug_trace.logf("auth", "lia login session retirement failed err={s}", .{@errorName(cleanup_err)});
         };
         return error.OAuthSessionCleanupUncertain;
@@ -768,9 +818,35 @@ fn refresh_rejection_requires_sign_in(err: anyerror) bool {
 fn retire_lia_session(
     alloc: std.mem.Allocator,
     mutation: *oauth_session.Mutation,
+    session: *const oauth_session.Session,
 ) !void {
+    keepRetiredTeam(alloc, mutation, session);
     const result = mutation.delete(alloc) catch return error.OAuthSessionCleanupUncertain;
     if (result.local_cleanup_failed) return error.OAuthSessionCleanupUncertain;
+}
+
+/// A later sign-in, in this lia process or another, starts on the retired
+/// login's team; a login without one leaves no older team behind. A failure
+/// only changes which team that sign-in starts on, so it is traced, not
+/// returned.
+fn keepRetiredTeam(
+    alloc: std.mem.Allocator,
+    mutation: *oauth_session.Mutation,
+    session: *const oauth_session.Session,
+) void {
+    if (oauth_session.hasKeepableTeam(session.team_id, session.team_slug)) {
+        mutation.keepTeam(alloc, session.team_id, session.team_slug) catch |err| {
+            debug_trace.logf("auth", "retired lia login team not kept err={s}", .{@errorName(err)});
+            return;
+        };
+        debug_trace.logf("auth", "retired lia login team kept", .{});
+        return;
+    }
+    const forgotten = mutation.forgetTeam() catch |err| {
+        debug_trace.logf("auth", "kept team not forgotten reason=retired_login_has_no_team err={s}", .{@errorName(err)});
+        return;
+    };
+    if (forgotten) debug_trace.logf("auth", "kept team forgotten reason=retired_login_has_no_team", .{});
 }
 
 fn takeCredentialFromSession(session: *oauth_session.Session, refreshed_at_ms: ?i64) Credential {
@@ -1231,41 +1307,8 @@ test "a failed lia-login refresh is still reported when nothing else resolves" {
 /// the issuer rejects, which is what an expired or revoked login looks like on
 /// disk. Paired with `oauth_transport.unavailable_provider`, the refresh fails.
 const ExpiredLiaLoginFixture = struct {
-    alloc: std.mem.Allocator,
-    tmp: std.testing.TmpDir,
-    env: *CredentialTestEnv,
-    home: []u8,
-
-    fn install(alloc: std.mem.Allocator) !ExpiredLiaLoginFixture {
-        var tmp = std.testing.tmpDir(.{});
-        errdefer tmp.cleanup();
-        const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "");
-        errdefer alloc.free(home);
-
-        try tmp.dir.createDirPath(io_mod.getIo(), ".lia");
-        const auth_path = try std.Io.Dir.path.join(alloc, &.{ home, ".lia", "auth.json" });
-        defer alloc.free(auth_path);
-        var file = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), auth_path, .{
-            .truncate = true,
-            .permissions = std.Io.File.Permissions.fromMode(0o600),
-        });
-        defer file.close(io_mod.getIo());
-        try file.writeStreamingAll(
-            io_mod.getIo(),
-            "{\"version\":1,\"issuer\":\"https://vercel.com\",\"client_id\":\"client\"," ++
-                "\"access_token\":\"access\",\"refresh_token\":\"rejected-refresh\"," ++
-                "\"expires_at_ms\":1,\"scope\":\"openid offline_access\"," ++
-                "\"token_type\":\"Bearer\",\"team_slug\":\"team-slug\",\"team_id\":\"team-id\"}",
-        );
-
-        const env = try CredentialTestEnv.install(alloc, &.{.{ "HOME", home }});
-        return .{ .alloc = alloc, .tmp = tmp, .env = env, .home = home };
-    }
-
-    fn deinit(self: *ExpiredLiaLoginFixture) void {
-        self.env.deinit();
-        self.alloc.free(self.home);
-        self.tmp.cleanup();
+    fn install(alloc: std.mem.Allocator) !SavedLoginFixture {
+        return savedLiaLogin(alloc, "access", "rejected-refresh", 1);
     }
 };
 
@@ -1316,6 +1359,202 @@ const LiaLoginRefreshProbe = struct {
     }
 };
 
+test "the stored lia login is read as saved, without a refresh" {
+    const alloc = std.testing.allocator;
+    var fixture = try ExpiredLiaLoginFixture.install(alloc);
+    defer fixture.deinit();
+
+    // The session is expired, and the issuer is unreachable: a refresh would fail.
+    var stored = (try loadStoredSource(alloc, .fx_login)).?;
+    defer stored.deinit(alloc);
+    try std.testing.expectEqualStrings("access", stored.token);
+    try std.testing.expectEqual(Source.fx_login, stored.source);
+    try std.testing.expectEqualStrings("team-id", stored.gatewayTeam().?);
+
+    var persisted = (try oauth_session.load(alloc)).?;
+    defer persisted.deinit(alloc);
+    try std.testing.expectEqualStrings("rejected-refresh", persisted.refresh_token);
+
+    for ([_]Source{ .vercel_oidc_token, .ai_gateway_api_key, .stored_key, .host_managed, .configured }) |source| {
+        try std.testing.expect((try loadStoredSource(alloc, source)) == null);
+    }
+}
+
+/// A HOME holding one saved login file, as another lia would have left it:
+/// `login` written as JSON to `~/.lia/<file_name>`.
+const SavedLoginFixture = struct {
+    alloc: std.mem.Allocator,
+    tmp: std.testing.TmpDir,
+    env: *CredentialTestEnv,
+    home: []u8,
+    auth_path: []u8,
+
+    fn install(alloc: std.mem.Allocator, file_name: []const u8, login: anytype) !SavedLoginFixture {
+        var tmp = std.testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "");
+        errdefer alloc.free(home);
+        try tmp.dir.createDirPath(io_mod.getIo(), ".lia");
+        const auth_path = try std.Io.Dir.path.join(alloc, &.{ home, ".lia", file_name });
+        errdefer alloc.free(auth_path);
+
+        var body: std.Io.Writer.Allocating = .init(alloc);
+        defer body.deinit();
+        try std.json.Stringify.value(login, .{}, &body.writer);
+        var file = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), auth_path, .{
+            .truncate = true,
+            .permissions = std.Io.File.Permissions.fromMode(0o600),
+        });
+        defer file.close(io_mod.getIo());
+        try file.writeStreamingAll(io_mod.getIo(), body.written());
+
+        const env = try CredentialTestEnv.install(alloc, &.{.{ "HOME", home }});
+        return .{ .alloc = alloc, .tmp = tmp, .env = env, .home = home, .auth_path = auth_path };
+    }
+
+    fn readSaved(self: *const SavedLoginFixture) ![]u8 {
+        var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), self.auth_path, .{});
+        defer file.close(io_mod.getIo());
+        return io_mod.readFileToEnd(self.alloc, &file, 64 * 1024);
+    }
+
+    fn deinit(self: *SavedLoginFixture) void {
+        self.env.deinit();
+        self.alloc.free(self.auth_path);
+        self.alloc.free(self.home);
+        self.tmp.cleanup();
+    }
+};
+
+/// A lia login whose saved tokens and expiry the test chooses.
+fn savedLiaLogin(alloc: std.mem.Allocator, access_token: []const u8, refresh_token: []const u8, expires_at_ms: i64) !SavedLoginFixture {
+    return SavedLoginFixture.install(alloc, profile_paths.auth_file_name, .{
+        .version = 1,
+        .issuer = "https://vercel.com",
+        .client_id = "client",
+        .access_token = access_token,
+        .refresh_token = refresh_token,
+        .expires_at_ms = expires_at_ms,
+        .scope = "openid offline_access",
+        .token_type = "Bearer",
+        .team_slug = "team-slug",
+        .team_id = "team-id",
+    });
+}
+
+const rotated_lia_login_body = "{\"access_token\":\"rotated-access\",\"refresh_token\":\"rotated-refresh\",\"expires_in\":3600,\"scope\":\"openid offline_access\",\"token_type\":\"Bearer\"}";
+
+/// Forces a refresh of the fixture's login after the gateway rejected
+/// `rejected`, and checks that it rotated exactly when `rotates`: the issuer
+/// was asked and the new token returned and saved, or else the saved login
+/// was returned untouched.
+fn expectReplaceRejected(fixture: *const SavedLoginFixture, saved: []const u8, rejected: []const u8, rotates: bool) !void {
+    const alloc = fixture.alloc;
+    const before = try fixture.readSaved();
+    defer alloc.free(before);
+    var refresh = LiaLoginRefreshProbe{ .token_disposition = .accepted, .token_body = rotated_lia_login_body };
+    var credential = (try refreshLiaLoginCredential(alloc, refresh.provider(), rejected)) orelse return error.TestUnexpectedResult;
+    defer credential.deinit(alloc);
+    const after = try fixture.readSaved();
+    defer alloc.free(after);
+    if (rotates) {
+        try std.testing.expectEqual(@as(usize, 2), refresh.calls);
+        try std.testing.expectEqualStrings("rotated-access", credential.token);
+        try std.testing.expect(std.mem.find(u8, after, "rotated-access") != null);
+    } else {
+        try std.testing.expectEqual(@as(usize, 0), refresh.calls);
+        try std.testing.expectEqualStrings(saved, credential.token);
+        try std.testing.expectEqualStrings(before, after);
+    }
+}
+
+const hour_ms: i64 = 60 * 60 * 1000;
+
+test "a forced lia login refresh after a 401 uses the login another lia saved" {
+    var fixture = try savedLiaLogin(std.testing.allocator, "saved-by-another-lia", "saved-refresh", io_mod.milliTimestamp() + hour_ms);
+    defer fixture.deinit();
+    try expectReplaceRejected(&fixture, "saved-by-another-lia", "rejected-access", false);
+}
+
+test "a forced lia login refresh after a 401 rotates the saved login that holds the rejected token" {
+    var fixture = try savedLiaLogin(std.testing.allocator, "rejected-access", "saved-refresh", io_mod.milliTimestamp() + hour_ms);
+    defer fixture.deinit();
+    try expectReplaceRejected(&fixture, "rejected-access", "rejected-access", true);
+}
+
+test "a forced lia login refresh after a 401 rotates a replaced login past its refresh deadline" {
+    // The refresh deadline is a minute before expiry (oauth_session expiry_skew_ms).
+    var fixture = try savedLiaLogin(std.testing.allocator, "saved-by-another-lia", "saved-refresh", io_mod.milliTimestamp() + 30 * 1000);
+    defer fixture.deinit();
+    try expectReplaceRejected(&fixture, "saved-by-another-lia", "rejected-access", true);
+}
+
+/// A token from a two-letter alphabet, so that equal tokens, prefixes, and
+/// tokens one byte longer come up often.
+fn fuzzLoginToken(smith: *std.testing.Smith, buf: []u8) []const u8 {
+    const len: usize = smith.valueRangeAtMost(u8, 1, @intCast(buf.len));
+    for (buf[0..len]) |*byte| byte.* = if (smith.value(bool)) 'a' else 'b';
+    return buf[0..len];
+}
+
+/// A saved login and the token its provider rejected, drawn for the
+/// replace-rejected fuzz targets. Its tokens point into its own buffers, so it
+/// is drawn in place and never copied.
+const FuzzRejectedLogin = struct {
+    saved_buf: [8]u8 = undefined,
+    rejected_buf: [9]u8 = undefined,
+    saved: []const u8 = "",
+    rejected: []const u8 = "",
+    expires_at_ms: i64 = 0,
+    expired: bool = false,
+
+    fn draw(self: *FuzzRejectedLogin, smith: *std.testing.Smith) void {
+        self.saved = fuzzLoginToken(smith, &self.saved_buf);
+        self.rejected = switch (smith.valueRangeAtMost(u8, 0, 3)) {
+            0 => self.saved,
+            1 => self.saved[0..smith.valueRangeAtMost(u8, 0, @intCast(self.saved.len - 1))],
+            2 => blk: {
+                @memcpy(self.rejected_buf[0..self.saved.len], self.saved);
+                self.rejected_buf[self.saved.len] = if (smith.value(bool)) 'a' else 'b';
+                break :blk self.rejected_buf[0 .. self.saved.len + 1];
+            },
+            else => fuzzLoginToken(smith, &self.rejected_buf),
+        };
+        // Clear of the refresh deadline a minute before expiry, on either
+        // side, so the milliseconds the refresh itself takes can't move it.
+        self.expired = smith.value(bool);
+        const offset_ms: i64 = if (self.expired)
+            smith.valueRangeAtMost(i64, -hour_ms, 59 * 1000)
+        else
+            smith.valueRangeAtMost(i64, 61 * 1000, hour_ms);
+        self.expires_at_ms = io_mod.milliTimestamp() + offset_ms;
+    }
+
+    /// Whether a forced refresh after the 401 must rotate the saved login.
+    fn rotates(self: *const FuzzRejectedLogin) bool {
+        return self.expired or std.mem.eql(u8, self.saved, self.rejected);
+    }
+};
+
+fn fuzzLiaLoginReplaceRejected(_: void, smith: *std.testing.Smith) !void {
+    var drawn: FuzzRejectedLogin = .{};
+    drawn.draw(smith);
+    var fixture = try savedLiaLogin(std.testing.allocator, drawn.saved, "saved-refresh", drawn.expires_at_ms);
+    defer fixture.deinit();
+    try expectReplaceRejected(&fixture, drawn.saved, drawn.rejected, drawn.rotates());
+}
+
+test "a forced lia login refresh rotates only a rejected or expired saved login on fuzzed tokens and deadlines" {
+    try std.testing.fuzz({}, fuzzLiaLoginReplaceRejected, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "",
+            "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+            "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff",
+            "abababababababababababab",
+        }) ++ @import("fuzz_corpus").lia_login_replace_rejected.*),
+    });
+}
+
 test "an invalid lia login refresh retires the rejected session" {
     const alloc = std.testing.allocator;
     var fixture = try ExpiredLiaLoginFixture.install(alloc);
@@ -1327,7 +1566,7 @@ test "an invalid lia login refresh retires the rejected session" {
 
     try std.testing.expectError(
         error.InvalidGrant,
-        refreshLiaLoginCredential(alloc, refresh.provider()),
+        refreshLiaLoginCredential(alloc, refresh.provider(), null),
     );
     try std.testing.expectEqual(@as(usize, 2), refresh.calls);
 
@@ -1345,7 +1584,7 @@ test "a lia login refresh without a rotated refresh token retires the session" {
         .token_body = "{\"access_token\":\"new-access\",\"expires_in\":3600,\"scope\":\"openid offline_access\",\"token_type\":\"Bearer\"}",
     };
 
-    if (refreshLiaLoginCredential(alloc, refresh.provider())) |maybe_credential| {
+    if (refreshLiaLoginCredential(alloc, refresh.provider(), null)) |maybe_credential| {
         if (maybe_credential) |credential_value| {
             var credential = credential_value;
             credential.deinit(alloc);
@@ -1372,7 +1611,7 @@ test "a malformed successful lia login refresh retires the session" {
 
     try std.testing.expectError(
         error.NoRefreshToken,
-        refreshLiaLoginCredential(alloc, refresh.provider()),
+        refreshLiaLoginCredential(alloc, refresh.provider(), null),
     );
     try std.testing.expectEqual(@as(usize, 2), refresh.calls);
 
@@ -1385,17 +1624,15 @@ test "a lia login refresh retires the consumed token when durable replacement fa
     const alloc = std.testing.allocator;
     var fixture = try ExpiredLiaLoginFixture.install(alloc);
     defer fixture.deinit();
-    const auth_path = try std.Io.Dir.path.join(alloc, &.{ fixture.home, ".lia", "auth.json" });
-    defer alloc.free(auth_path);
     var refresh = LiaLoginRefreshProbe{
         .token_disposition = .accepted,
         .token_body = "{\"access_token\":\"new-access\",\"refresh_token\":\"rotated-refresh\",\"expires_in\":3600,\"scope\":\"openid offline_access\",\"token_type\":\"Bearer\"}",
-        .auth_path_to_make_read_only = auth_path,
+        .auth_path_to_make_read_only = fixture.auth_path,
     };
 
     try std.testing.expectError(
         error.OAuthSessionCleanupUncertain,
-        refreshLiaLoginCredential(alloc, refresh.provider()),
+        refreshLiaLoginCredential(alloc, refresh.provider(), null),
     );
     try std.testing.expectEqual(@as(usize, 2), refresh.calls);
 
@@ -1486,4 +1723,46 @@ test "credential source presence reads metadata without parsing session secrets"
             sourcePresence(host.unavailable_secret_store, case.source),
         );
     }
+}
+
+/// Answers a lia login refresh. A cancel arrives while the token request is
+/// on the wire, and a request that carries the cancelled flag is cut off, as
+/// the real transport does.
+const CancelDuringLiaLoginRefresh = struct {
+    cancel: *std.atomic.Value(bool),
+
+    fn provider(self: *CancelDuringLiaLoginRefresh) oauth_transport.Provider {
+        return .{ .context = self, .execute_fn = execute };
+    }
+
+    fn execute(raw: ?*anyopaque, alloc: std.mem.Allocator, request: oauth_transport.Request) !oauth_transport.Response {
+        const self: *CancelDuringLiaLoginRefresh = @ptrCast(@alignCast(raw.?));
+        if (request.method == .get) return .{
+            .disposition = .accepted,
+            .body = try alloc.dupe(u8, "{\"issuer\":\"https://vercel.com\",\"device_authorization_endpoint\":\"https://vercel.com/oauth/device\",\"token_endpoint\":\"https://vercel.com/oauth/token\"}"),
+        };
+        self.cancel.store(true, .seq_cst);
+        if (request.cancel_flag) |flag| if (flag.load(.seq_cst)) return error.Cancelled;
+        return .{
+            .disposition = .accepted,
+            .body = try alloc.dupe(u8, "{\"access_token\":\"renewed-access\",\"refresh_token\":\"renewed-refresh\",\"expires_in\":3600,\"scope\":\"openid offline_access\",\"token_type\":\"Bearer\"}"),
+        };
+    }
+};
+
+test "a cancel while a lia login refresh is on the wire never cuts it off, and the new login is saved" {
+    const alloc = std.testing.allocator;
+    var fixture = try ExpiredLiaLoginFixture.install(alloc);
+    defer fixture.deinit();
+    var cancel = std.atomic.Value(bool).init(false);
+    var issuer: CancelDuringLiaLoginRefresh = .{ .cancel = &cancel };
+    var cancellable: oauth_transport.Cancellable = .{ .inner = issuer.provider(), .cancel_flag = &cancel };
+
+    var credential = (try refreshLiaLoginCredential(alloc, cancellable.provider(), null)).?;
+    defer credential.deinit(alloc);
+    try std.testing.expect(cancel.load(.seq_cst));
+    try std.testing.expectEqualStrings("renewed-access", credential.token);
+    var persisted = (try oauth_session.load(alloc)).?;
+    defer persisted.deinit(alloc);
+    try std.testing.expectEqualStrings("renewed-refresh", persisted.refresh_token);
 }
