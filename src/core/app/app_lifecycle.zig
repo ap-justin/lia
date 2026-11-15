@@ -73,6 +73,9 @@ pub const StartupState = struct {
     session_title_generation: bool = true,
     /// Resolved `cache_warming` preference.
     cache_warming: bool = true,
+    /// The `cache_warming` setting as written, null when no settings file
+    /// names it. ACP keeps warming off unless this turns it on.
+    cache_warming_setting: ?bool = null,
     notification_turn_end: bool = false,
     notification_attention_required: bool = false,
     notification_max: bool = false,
@@ -675,6 +678,7 @@ pub fn resolveSettings(alloc: Allocator, state: *StartupState, detailed: *const 
     }
     state.session_title_generation = settings.session_titles orelse true;
     state.cache_warming = settings.cache_warming orelse true;
+    state.cache_warming_setting = settings.cache_warming;
     const sound_override = soundEnvOverride();
     const sound_on_override: ?bool = if (sound_override) |level| level != .off else null;
     const max_override: ?bool = if (sound_override) |level| level == .max else null;

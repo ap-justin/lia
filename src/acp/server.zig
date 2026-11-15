@@ -340,7 +340,9 @@ pub const ServerState = struct {
     first_call_tool_choice: types.ToolChoice = .auto,
     context_enabled: bool = true,
     session_titles: bool = true,
-    cache_warming: bool = true,
+    /// Off unless `"cache_warming": true` is in settings: an editor's bot sits
+    /// idle between events, and each ping costs money.
+    cache_warming: bool = false,
     active_session: ?ActiveSessionState = null,
     active_prompt: ?*ActivePrompt = null,
     /// The `lia-login` browser sign-in this connection is running.
@@ -2467,7 +2469,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.first_call_tool_choice = startup.first_call_tool_choice;
     state.context_enabled = startup.context_enabled;
     state.session_titles = startup.session_title_generation;
-    state.cache_warming = startup.cache_warming;
+    state.cache_warming = startup.cache_warming_setting orelse false;
 
     var loaded_skills = try app_runtime_setup.loadSkills(alloc, state.workspace_root, builtin_skills.root_policy);
     errdefer loaded_skills.deinit(alloc);

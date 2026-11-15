@@ -13655,15 +13655,16 @@ describe("acp: model-backed protocol", () => {
 // Claude cache warming (src/core/agent/runtime/cache_warmer.zig) in an ACP
 // session: the session's runtime owns the warmer, so a new session closes
 // the old one's. LIA_TEST_CACHE_WARMING_TTL_MS sets a two-second lifetime.
-test("ACP keeps an idle Claude session's cache warm until the next session replaces it", async () => {
-  const root = createIsolatedRoot("lia-acp-cache-warming-");
-  const isPing = (body: string) => JSON.parse(body).maxOutputTokens === 1;
-  const gateway = startDynamicFakeGateway((body) => fakeGatewaySse([
-    ...(isPing(body) ? [] : [{ type: "text-delta", id: "answer_1", delta: "WARM_REPLY_DONE" }]),
+// ACP warms only when settings say `"cache_warming": true`.
+const warmingIsPing = (body: string) => JSON.parse(body).maxOutputTokens === 1;
+
+function startWarmingGateway() {
+  return startDynamicFakeGateway((body) => fakeGatewaySse([
+    ...(warmingIsPing(body) ? [] : [{ type: "text-delta", id: "answer_1", delta: "WARM_REPLY_DONE" }]),
     {
       type: "finish",
       finishReason: { unified: "stop", raw: "stop" },
-      usage: { inputTokens: { total: 9_000, noCache: 0, cacheRead: isPing(body) ? 4_242 : 1_000, cacheWrite: 0 }, outputTokens: { total: 1 } },
+      usage: { inputTokens: { total: 9_000, noCache: 0, cacheRead: warmingIsPing(body) ? 4_242 : 1_000, cacheWrite: 0 }, outputTokens: { total: 1 } },
     },
   ]), {
     models: [{
@@ -13675,6 +13676,13 @@ test("ACP keeps an idle Claude session's cache warm until the next session repla
       reasoning_options: [{ type: "effort", values: ["low", "medium", "high"] }],
     }],
   });
+}
+
+test("ACP keeps an idle Claude session's cache warm until the next session replaces it", async () => {
+  const root = createIsolatedRoot("lia-acp-cache-warming-");
+  writeFileSync(join(root.home, ".lia", "settings.json"), JSON.stringify({ cache_warming: true }));
+  const isPing = warmingIsPing;
+  const gateway = startWarmingGateway();
   let client: AcpClient | undefined;
   try {
     client = await AcpClient.create({
@@ -13697,6 +13705,30 @@ test("ACP keeps an idle Claude session's cache warm until the next session repla
     const before = pings().length;
     await Bun.sleep(4_000);
     expect(pings().length).toBe(before);
+    expect(client.stderr).toBe("");
+  } finally {
+    await client?.close();
+    gateway.stop();
+    rmSync(root.root, { recursive: true, force: true });
+  }
+}, 45000);
+
+test("ACP does not warm the cache unless settings turn cache_warming on", async () => {
+  const root = createIsolatedRoot("lia-acp-cache-warming-off-");
+  const gateway = startWarmingGateway();
+  let client: AcpClient | undefined;
+  try {
+    client = await AcpClient.create({
+      cwd: root.workspace,
+      env: { ...fakeGatewayEnv(root, gateway), LIA_MODEL: "anthropic/claude-opus-5.5", LIA_TEST_CACHE_WARMING_TTL_MS: "2000" },
+    });
+    await client.request("initialize", { protocolVersion: 1 }, 1);
+    const created = await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 2) as any;
+    if (created.error) throw new Error(JSON.stringify(created));
+    sendPrompt(client, 3, "do not warm this");
+    await readUntilResponses(client, [3]);
+    await Bun.sleep(5_000);
+    expect(gateway.requests.filter((request) => warmingIsPing(request.body))).toHaveLength(0);
     expect(client.stderr).toBe("");
   } finally {
     await client?.close();
