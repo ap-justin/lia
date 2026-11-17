@@ -5748,6 +5748,63 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ACP _session/steering joins the running turn and says when no turn runs",
+    async () => {
+      const root = createIsolatedRoot("lia-acp-ext-steer-");
+      const firstRequest = deferred<void>();
+      const releaseFirst = deferred<void>();
+      const gateway = startFakeGateway([
+        async () => {
+          firstRequest.resolve();
+          await releaseFirst.promise;
+          return finalText("Reading the first tab.");
+        },
+        finalText("Summarized the other tab."),
+      ]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        const init = await client.request("initialize", { protocolVersion: 1 }, 1) as any;
+        expect(init.result._meta.steering).toEqual({ supported: true });
+        expect(init.result.agentCapabilities._meta.lia.steering).toBe(true);
+        const created = await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 2) as any;
+        const sessionId = created.result.sessionId as string;
+        await client.readLine();
+
+        const idle = await client.request("_session/steering", { sessionId, prompt: [{ type: "text", text: "too early" }] }, 3) as any;
+        expect(idle.error).toBeUndefined();
+        expect(idle.result).toEqual({ outcome: "promptRequired" });
+
+        const unknown = await client.request("_session/steering", { sessionId: "nope", prompt: [{ type: "text", text: "x" }] }, 4) as any;
+        expect(unknown.error).toMatchObject({ code: -32002, data: { uri: "nope" } });
+
+        sendPrompt(client, 100, "Summarize the first tab.");
+        await firstRequest.promise;
+        const taken = await client.request("_session/steering", { sessionId, prompt: [{ type: "text", text: "No, the other tab." }] }, 5) as any;
+        expect(taken.error).toBeUndefined();
+        expect(taken.result.outcome).not.toBe("promptRequired");
+        releaseFirst.resolve();
+
+        const { responses } = await readUntilResponses(client, [100]);
+        expect(responses.get(100)!.result.stopReason).toBe("end_turn");
+        expect(gateway.requests).toHaveLength(2);
+        expect(gateway.requests[0]!.body).not.toContain("No, the other tab.");
+        expect(gateway.requests[1]!.body).toContain("No, the other tab.");
+        expect(gateway.requests[0]!.body).not.toContain("too early");
+        expect(client.stderr).toBe("");
+      } finally {
+        releaseFirst.resolve();
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    LIVE_TIMEOUT,
+  );
+
+  test(
     "ACP reports queued steering as cancelled when the turn is cancelled",
     async () => {
       const root = createIsolatedRoot("lia-acp-steer-cancel-");

@@ -71,6 +71,7 @@ const AcpMethod = enum {
     session_list,
     session_remove,
     session_prompt,
+    session_steering,
     session_set_config_option,
     session_set_mode,
     mcp_message,
@@ -88,6 +89,7 @@ const AcpMethod = enum {
         if (std.mem.eql(u8, method, "session/list")) return .session_list;
         if (std.mem.eql(u8, method, "session/remove")) return .session_remove;
         if (std.mem.eql(u8, method, "session/prompt")) return .session_prompt;
+        if (std.mem.eql(u8, method, "_session/steering")) return .session_steering;
         if (std.mem.eql(u8, method, "session/set_config_option")) return .session_set_config_option;
         if (std.mem.eql(u8, method, "session/set_mode")) return .session_set_mode;
         if (std.mem.eql(u8, method, "mcp/message")) return .mcp_message;
@@ -105,6 +107,7 @@ const AcpMethod = enum {
             .session_load,
             .session_resume,
             .session_close,
+            .session_steering,
             => false,
             .session_list,
             .session_remove,
@@ -1601,6 +1604,8 @@ pub fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !v
 
     if (method == .authenticate) return handleAuthenticate(state, alloc, msg);
 
+    if (method == .session_steering) return handleSessionSteering(state, alloc, msg);
+
     if (method == .session_prompt and state.active_prompt != null) {
         return handleSteeringPrompt(state, alloc, msg);
     }
@@ -1635,6 +1640,7 @@ pub fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !v
         .request_cancel,
         .session_cancel,
         .session_remove,
+        .session_steering,
         .mcp_message,
         .unknown,
         => state.writer.writeError(alloc, msg.id, .{
@@ -1897,6 +1903,59 @@ fn handleSteeringPrompt(state: *ServerState, alloc: Allocator, msg: *const jsonr
         }),
     };
     debug_trace.logf("acp", "queued steering prompt bytes={d}", .{text.len});
+}
+
+/// `_session/steering`: queues text for the running turn the way
+/// `_meta.lia.steer` does and answers at once. `{"outcome":"promptRequired"}`
+/// tells the client no turn is running, so the message was not kept and it
+/// should send a prompt instead. A session lia does not have is "not found".
+fn handleSessionSteering(state: *ServerState, alloc: Allocator, msg: *const jsonrpc.Message) !void {
+    const params = msg.params_raw orelse return state.writer.writeError(alloc, msg.id, .{
+        .code = ErrorCode.invalid_params,
+        .message = "Missing params",
+    });
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, params, .{}) catch
+        return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Invalid params" });
+    defer parsed.deinit();
+    const session_id = blk: {
+        if (parsed.value == .object) if (parsed.value.object.get("sessionId")) |value| {
+            if (value == .string and value.string.len > 0) break :blk value.string;
+        };
+        return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Missing sessionId" });
+    };
+    if (parsedSessionTargetDecision(state, parsed.value) != .exact) {
+        return sessions.writeSessionNotFound(state, alloc, msg.id, session_id);
+    }
+    const prompt_required = "{\"outcome\":\"promptRequired\"}";
+    if (state.active_prompt == null) return state.writer.writeResponse(alloc, msg.id, prompt_required);
+    const text = steeringPromptText(alloc, parsed.value.object) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.UnsupportedSteeringContent => return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = "Steering prompts accept text content blocks only",
+        }),
+    };
+    defer alloc.free(text);
+    const session = if (state.active_session) |*active| active else unreachable;
+    session.steering.enqueueRequest(state.alloc, text, null) catch |err| switch (err) {
+        // The turn already stopped taking input.
+        error.SteeringNotActive => return state.writer.writeResponse(alloc, msg.id, prompt_required),
+        error.OutOfMemory => return error.OutOfMemory,
+        error.EmptySteeringMessage => return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = "Steering prompt text cannot be empty",
+        }),
+        error.SteeringMessageTooLarge => return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = "Steering prompt text exceeds the 64 KiB limit",
+        }),
+        error.SteeringQueueFull => return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_request,
+            .message = "Steering queue is full",
+        }),
+    };
+    debug_trace.logf("acp", "queued _session/steering bytes={d}", .{text.len});
+    return state.writer.writeResponse(alloc, msg.id, "{\"outcome\":\"queued\"}");
 }
 
 /// Joins the text blocks of a steering prompt. Caller owns the result.

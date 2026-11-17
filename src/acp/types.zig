@@ -431,6 +431,10 @@ pub fn writeInitializeResponse(w: *std.Io.Writer, capabilities: AgentCapabilitie
     try writeJsonStr(build_options.app_version, w);
     try w.writeAll("},\"authMethods\":");
     try writeAuthMethods(w, auth);
+    // OpenBot reads `_meta.steering` at the top of the result, apart from
+    // lia's own `_meta.lia.steering` under `agentCapabilities`. It then steers
+    // a running turn with `_session/steering`.
+    if (capabilities.steering) try w.writeAll(",\"_meta\":{\"steering\":{\"supported\":true}}");
     try w.writeByte('}');
 }
 
@@ -749,6 +753,8 @@ test "writeInitializeResponse contains required fields" {
     try std.testing.expectEqual(@as(usize, 0), session_capabilities.get("systemPrompt").?.object.count());
     const lia_meta = agent_capabilities.get("_meta").?.object.get("lia").?.object;
     try std.testing.expect(lia_meta.get("steering").?.bool);
+    const steering_meta = parsed.value.object.get("_meta").?.object.get("steering").?.object;
+    try std.testing.expect(steering_meta.get("supported").?.bool);
 }
 
 test "writeInitializeResponse withholds MCP transports a host rejects" {
