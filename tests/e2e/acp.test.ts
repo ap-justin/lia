@@ -4142,6 +4142,7 @@ describe("acp: model-independent", () => {
           reply("One.", { inputTokens: { total: 100, cacheRead: 60, cacheWrite: 10 }, outputTokens: { total: 5 } }, "0.25"),
           reply("Two.", { inputTokens: { total: 120, cacheRead: 100 }, outputTokens: { total: 7 } }, "0.5"),
           reply("Three.", { inputTokens: { total: 130 }, outputTokens: { total: 3 } }),
+          reply("Four.", { inputTokens: { total: 90 }, outputTokens: { total: 22 } }, "0.25"),
         ],
         { models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"], context_window: 128_000 }] },
       );
@@ -4174,7 +4175,15 @@ describe("acp: model-independent", () => {
           { sessionUpdate: "usage_update", used: 133, size: 128_000, cost: { amount: 0.75, currency: "USD" } },
         ]);
         expect(third.promptResult.result.usage.inputTokens).toBe(350);
-        expect(sessionId).toBeTruthy();
+
+        // A loaded session continues from the saved totals.
+        await client.close();
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await client.request("initialize", { protocolVersion: 1 }, 10);
+        expect(((await client.request("session/load", { sessionId, cwd: root.workspace, mcpServers: [] }, 11)) as any).error).toBeUndefined();
+        const fourth = await runPrompt(client, "fourth", TIMEOUT);
+        expect(updates(fourth.messages).at(-1)).toMatchObject({ used: 112, cost: { amount: 1, currency: "USD" } });
+        expect(fourth.promptResult.result.usage).toMatchObject({ inputTokens: 440, outputTokens: 37 });
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();

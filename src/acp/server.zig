@@ -190,8 +190,8 @@ pub const ActiveSessionState = struct {
     /// The saved session.
     v2: ?*session_adapter.Session = null,
     session_write_mutex: std.Io.Mutex = .init,
-    /// What every model call of this session has used and cost since lia
-    /// opened it, reported to the client as running totals.
+    /// What every model call of this session has used and cost, from the saved
+    /// totals at load on, reported to the client as running totals.
     usage_mutex: std.Io.Mutex = .init,
     usage_totals: types.Usage = .{},
     model: []u8,

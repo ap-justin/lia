@@ -800,6 +800,12 @@ fn activateSession(state: *server.ServerState, activation: SessionActivation) !v
         .v2 = activation.v2,
         .client_system_prompt = client_system_prompt,
         .tool_identities = tool_identities,
+        // A loaded session reports totals from its first prompt on, not from
+        // the load, so a client that records differences stays in step.
+        .usage_totals = activation.v2.usageTotals() catch |err| blk: {
+            debug_trace.logf("acp", "event=usage_totals_unreadable session={s} err={s}", .{ activation.session_id, @errorName(err) });
+            break :blk .{};
+        },
         .model = activation.model,
         .provider = activation.provider,
         .mode = start.id,
