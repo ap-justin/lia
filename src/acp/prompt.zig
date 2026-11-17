@@ -1082,6 +1082,11 @@ pub fn runSubagentChild(
     };
     const session_id = active.session_id;
     const captured_mode = active.mode;
+    const host_instructions = subagentHostInstructions(alloc, active.client_system_prompt) catch {
+        state.subagent_authority_mutex.unlock(io_mod.getIo());
+        return error.OutOfMemory;
+    };
+    defer alloc.free(host_instructions);
     state.subagent_authority_mutex.unlock(io_mod.getIo());
     var ctx = AcpContext{
         .alloc = alloc,
@@ -1120,6 +1125,7 @@ pub fn runSubagentChild(
         .tool_context = ctx.toolContext(),
         .provider_set = state.cfg.provider_set,
         .system_prompt = state.cfg.prompt_policy.systemPromptFor(state.terminal_ui),
+        .host_instructions = host_instructions,
         .model_prompt_overlay = state.cfg.prompt_policy.modelPromptOverlay(admission.model),
         .skill_catalog = .{ .skills = skill_catalog.items, .diagnostics = skill_catalog.diagnostics },
         .advertised_tool_names = child_projection.advertised_names,
@@ -1130,6 +1136,15 @@ pub fn runSubagentChild(
         .project_context = state.context_snapshot.modelVisibleBytes(),
         .lifecycle_view = state.lifecycle_view,
     }, turn, message, admission, cancel);
+}
+
+/// A child's project context skips the workspace `AGENTS.md` as the root's
+/// does, so a child of a session led by the developer block gets that block
+/// in its place. Other client prompts stay with the root. Caller owns the
+/// result.
+fn subagentHostInstructions(alloc: Allocator, client_prompt: []const u8) Allocator.Error![]u8 {
+    if (!client_instructions.isDeveloperInstructions(client_prompt)) return alloc.dupe(u8, "");
+    return client_instructions.compose(alloc, "", client_prompt);
 }
 
 /// Makes `block` the session's client prompt, replacing the one before, and
@@ -1146,6 +1161,9 @@ fn keepDeveloperInstructions(
         try v2.setClientPrompt(block);
     }
     const copy = try state.alloc.dupe(u8, block);
+    // A running subagent child copies the prompt under this lock.
+    state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
+    defer state.subagent_authority_mutex.unlock(io_mod.getIo());
     if (session.client_system_prompt.len > 0) state.alloc.free(session.client_system_prompt);
     session.client_system_prompt = copy;
 }
@@ -4272,6 +4290,18 @@ test "ACP propagateGrant stores deduped runtime session grants" {
     const tool_ctx = ctx.toolContext();
     try std.testing.expectEqual(session.session_grants.len, tool_ctx.permission_grants.len);
     try std.testing.expect(tool_ctx.permission_grants.ptr == session.session_grants.ptr);
+}
+
+test "a subagent gets the developer block that replaced the workspace AGENTS.md" {
+    const alloc = std.testing.allocator;
+    const block = "<openbot-developer-instructions>\nRun the tests.\n</openbot-developer-instructions>";
+    const composed = try subagentHostInstructions(alloc, block);
+    defer alloc.free(composed);
+    try std.testing.expect(std.mem.indexOf(u8, composed, block) != null);
+
+    const other = try subagentHostInstructions(alloc, "You run inside Mini.");
+    defer alloc.free(other);
+    try std.testing.expectEqualStrings("", other);
 }
 
 test "ACP refreshes typed registry context and propagates enabled gathering errors" {
