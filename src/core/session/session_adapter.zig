@@ -2826,6 +2826,17 @@ pub const Session = struct {
         self.usage = total;
     }
 
+    /// The session's usage totals across every process that ran it.
+    pub fn usageTotals(self: *Session) !types.Usage {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        if (self.usage) |total| return total;
+        var scratch = std.heap.ArenaAllocator.init(self.alloc);
+        defer scratch.deinit();
+        self.usage = try self.savedUsage(scratch.allocator());
+        return self.usage.?;
+    }
+
     /// The totals the log's newest `set usage` holds. A value written
     /// before D92, or one lia cannot read, counts from zero.
     fn savedUsage(self: *Session, sa: Allocator) !types.Usage {
@@ -6885,6 +6896,26 @@ test "a session whose first turn never ended takes its first prompt as title at 
     // Written once; later turns leave it.
     try r.commitTurn(.{ .assistant = .{ .user = .{ .text = @constCast("again") }, .assistant = @constCast("ok") } }, types.ConversationLanguage.default());
     try testing.expectEqual(@as(usize, 1), try countTitleSets(t.store.manager, id));
+}
+
+test "a resumed session's usage totals start from what the log saved (D92)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    try testing.expectEqual(types.Usage{}, try s.usageTotals());
+    try commitPrompt(s, "first");
+    try s.recordUsage(.{ .input_tokens = 120, .output_tokens = 30, .cost_usd = 0.25 });
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    try testing.expectEqual(types.Usage{ .input_tokens = 120, .output_tokens = 30, .cost_usd = 0.25 }, try r.usageTotals());
+    try r.recordUsage(.{ .input_tokens = 5 });
+    try testing.expectEqual(@as(?u64, 125), (try r.usageTotals()).input_tokens);
 }
 
 test "a resumed session keeps the title it has (D52)" {

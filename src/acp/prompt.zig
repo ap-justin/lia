@@ -804,7 +804,17 @@ pub fn handlePrompt(
         image_attachments.inlineCapturedSnapshots(alloc, prompt_input.images) catch |err|
             return promptInputFailure(err);
     }
-    const prompt_text = prompt_input.text;
+    // OpenBot's developer instructions lead the prompt as a tagged block. They
+    // go to the system slot, not the user's message. A block that cannot be
+    // kept as session instructions stays in the user text, so it never fails
+    // the prompt.
+    var developer_split = client_instructions.splitDeveloperInstructions(prompt_input.text);
+    if (developer_split) |split| if (!client_instructions.storable(split.block)) {
+        const reason = if (split.block.len > client_instructions.developer_max_bytes) "too_large" else "invalid_text";
+        debug_trace.logf("acp", "event=developer_instructions_as_user_text reason={s} bytes={d}", .{ reason, split.block.len });
+        developer_split = null;
+    };
+    var prompt_text = if (developer_split) |split| split.rest else prompt_input.text;
 
     if (prompt_input.continue_recovery and prompt_text.len != 0) {
         return .{
@@ -825,7 +835,14 @@ pub fn handlePrompt(
 
     // The prompt's attached files stay out of the instructions: the runtime
     // delivers their folders' rules as a note on the turn's own message.
-    try refreshProjectContext(state, alloc);
+    if (developer_split) |split| {
+        keepDeveloperInstructions(state, session, split.block) catch |err| {
+            debug_trace.logf("acp", "event=developer_instructions_as_user_text reason=save_failed err={s}", .{@errorName(err)});
+            prompt_text = prompt_input.text;
+        };
+    }
+    // The block carries the workspace `AGENTS.md`, so lia does not load it too.
+    try refreshProjectContext(state, alloc, client_instructions.isDeveloperInstructions(session.client_system_prompt));
 
     session.pending_prompt_id = msg.id;
     defer session.pending_prompt_id = null;
@@ -926,8 +943,6 @@ pub fn handlePrompt(
         },
     };
 
-    // A turn whose completions report no tokens sends no `usage_update`.
-    session.context_used.store(0, .release);
     ctx.resetTurnOutcome(session);
     const deps = agentRuntimeDeps(&ctx);
     var dynamic_tool_arena = std.heap.ArenaAllocator.init(alloc);
@@ -974,7 +989,6 @@ pub fn handlePrompt(
     prompt_input.retainImageSnapshots();
     completeAcpTitleTask(state, session);
     try sessions.sendActiveSessionInfoUpdate(state, alloc);
-    try sessions.sendActiveSessionUsageUpdate(state, alloc);
     debug_trace.logf("acp", "event=prompt_updates_sent session={s}", .{session.session_id});
 
     if (session.cancel_flag.load(.seq_cst)) return .{ .stop_reason = .cancelled };
@@ -1074,6 +1088,11 @@ pub fn runSubagentChild(
     };
     const session_id = active.session_id;
     const captured_mode = active.mode;
+    const host_instructions = subagentHostInstructions(alloc, active.client_system_prompt) catch {
+        state.subagent_authority_mutex.unlock(io_mod.getIo());
+        return error.OutOfMemory;
+    };
+    defer alloc.free(host_instructions);
     state.subagent_authority_mutex.unlock(io_mod.getIo());
     var ctx = AcpContext{
         .alloc = alloc,
@@ -1112,6 +1131,7 @@ pub fn runSubagentChild(
         .tool_context = ctx.toolContext(),
         .provider_set = state.cfg.provider_set,
         .system_prompt = state.cfg.prompt_policy.systemPromptFor(state.terminal_ui),
+        .host_instructions = host_instructions,
         .model_prompt_overlay = state.cfg.prompt_policy.modelPromptOverlay(admission.model),
         .skill_catalog = .{ .skills = skill_catalog.items, .diagnostics = skill_catalog.diagnostics },
         .advertised_tool_names = child_projection.advertised_names,
@@ -1124,9 +1144,40 @@ pub fn runSubagentChild(
     }, turn, message, admission, cancel);
 }
 
+/// A child's project context skips the workspace `AGENTS.md` as the root's
+/// does, so a child of a session led by the developer block gets that block
+/// in its place. Other client prompts stay with the root. Caller owns the
+/// result.
+fn subagentHostInstructions(alloc: Allocator, client_prompt: []const u8) Allocator.Error![]u8 {
+    if (!client_instructions.isDeveloperInstructions(client_prompt)) return alloc.dupe(u8, "");
+    return client_instructions.compose(alloc, "", client_prompt);
+}
+
+/// Makes `block` the session's client prompt, replacing the one before, and
+/// saves it so a loaded session keeps it. The same block again changes nothing.
+fn keepDeveloperInstructions(
+    state: *server.ServerState,
+    session: *server.ActiveSessionState,
+    block: []const u8,
+) !void {
+    if (std.mem.eql(u8, session.client_system_prompt, block)) return;
+    if (session.v2) |v2| {
+        session.session_write_mutex.lockUncancelable(io_mod.getIo());
+        defer session.session_write_mutex.unlock(io_mod.getIo());
+        try v2.setClientPrompt(block);
+    }
+    const copy = try state.alloc.dupe(u8, block);
+    // A running subagent child copies the prompt under this lock.
+    state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
+    defer state.subagent_authority_mutex.unlock(io_mod.getIo());
+    if (session.client_system_prompt.len > 0) state.alloc.free(session.client_system_prompt);
+    session.client_system_prompt = copy;
+}
+
 fn refreshProjectContext(
     state: *server.ServerState,
     alloc: Allocator,
+    skip_workspace_root_rules: bool,
 ) context_contract.ProviderError!void {
     state.context_snapshot.deinit(alloc);
     if (!state.context_enabled) return;
@@ -1135,6 +1186,7 @@ fn refreshProjectContext(
         .workspace_root = state.workspace_root,
         .access_scope = state.workspace_access.scope(state.workspace_root),
         .context_limits = state.context_limits,
+        .skip_workspace_root_rules = skip_workspace_root_rules,
     }) catch |err| {
         debug_trace.logf("context", "acp gather failed err={s}", .{@errorName(err)});
         return err;
@@ -1655,13 +1707,21 @@ fn promptSession(ctx: *AcpContext) ?*server.ActiveSessionState {
     return if (std.mem.eql(u8, active.session_id, ctx.session_id)) active else null;
 }
 
+/// Called after every model call. The session's totals take the call's
+/// usage, and a `usage_update` goes out at once, so a client that bills by
+/// report sees each call and not only the turn's end. A cost the provider did
+/// not report leaves `cost` out of the update.
 fn reportUsage(raw_ctx: *anyopaque, usage: types.Usage) void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const active = promptSession(ctx) orelse return;
-    const input = usage.input_tokens orelse return;
-    const output = usage.output_tokens orelse return;
-    const used = std.math.add(u64, input, output) catch return;
-    active.context_used.store(std.math.cast(usize, used) orelse std.math.maxInt(usize), .release);
+    const totals = active.addUsage(usage);
+    const used: ?u64 = if (usage.input_tokens) |input| if (usage.output_tokens) |output|
+        std.math.add(u64, input, output) catch std.math.maxInt(u64)
+    else
+        null else null;
+    sessions.sendSessionUsageUpdate(ctx.state, ctx.alloc, active, used, totals.cost_usd) catch |err| {
+        debug_trace.logf("acp", "event=usage_update_failed session={s} err={s}", .{ active.session_id, @errorName(err) });
+    };
 }
 
 fn modelCatalogFailure(raw_ctx: *anyopaque) ?gateway_model_catalog.FailureCategory {
@@ -4238,6 +4298,18 @@ test "ACP propagateGrant stores deduped runtime session grants" {
     try std.testing.expect(tool_ctx.permission_grants.ptr == session.session_grants.ptr);
 }
 
+test "a subagent gets the developer block that replaced the workspace AGENTS.md" {
+    const alloc = std.testing.allocator;
+    const block = "<openbot-developer-instructions>\nRun the tests.\n</openbot-developer-instructions>";
+    const composed = try subagentHostInstructions(alloc, block);
+    defer alloc.free(composed);
+    try std.testing.expect(std.mem.indexOf(u8, composed, block) != null);
+
+    const other = try subagentHostInstructions(alloc, "You run inside Mini.");
+    defer alloc.free(other);
+    try std.testing.expectEqualStrings("", other);
+}
+
 test "ACP refreshes typed registry context and propagates enabled gathering errors" {
     const alloc = std.testing.allocator;
     AcpContextRegistryFixture.reset();
@@ -4245,19 +4317,19 @@ test "ACP refreshes typed registry context and propagates enabled gathering erro
     var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
     defer state.deinit();
 
-    try refreshProjectContext(&state, alloc);
+    try refreshProjectContext(&state, alloc, false);
     try std.testing.expectEqual(@as(usize, 1), AcpContextRegistryFixture.gather_calls);
     var contribution = state.context_snapshot.contribution orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("test.acp_context", contribution.provider_id);
     try std.testing.expectEqualStrings("ACP registry context 1", contribution.content);
 
-    try refreshProjectContext(&state, alloc);
+    try refreshProjectContext(&state, alloc, false);
     try std.testing.expectEqual(@as(usize, 2), AcpContextRegistryFixture.gather_calls);
     contribution = state.context_snapshot.contribution orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("ACP registry context 2", contribution.content);
 
     state.context_enabled = false;
-    try refreshProjectContext(&state, alloc);
+    try refreshProjectContext(&state, alloc, false);
     try std.testing.expectEqual(@as(usize, 2), AcpContextRegistryFixture.gather_calls);
     try std.testing.expect(state.context_snapshot.contribution == null);
 
@@ -4265,7 +4337,7 @@ test "ACP refreshes typed registry context and propagates enabled gathering erro
     AcpContextRegistryFixture.gather_error = error.WriteFailed;
     try std.testing.expectError(
         error.WriteFailed,
-        refreshProjectContext(&state, alloc),
+        refreshProjectContext(&state, alloc, false),
     );
     try std.testing.expectEqual(@as(usize, 3), AcpContextRegistryFixture.gather_calls);
     try std.testing.expect(state.context_snapshot.contribution == null);
@@ -4305,7 +4377,7 @@ test "ACP registry callbacks preserve snapshot bytes before transient context" {
 
     var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
     defer state.deinit();
-    try refreshProjectContext(&state, alloc);
+    try refreshProjectContext(&state, alloc, false);
 
     var ctx = AcpContext{
         .alloc = alloc,

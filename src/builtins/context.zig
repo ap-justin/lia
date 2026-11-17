@@ -156,6 +156,7 @@ const SelectionOptions = struct {
     attached_omission_summary: ?context_contract.ContextOmissionSummary = null,
     home: ?[]const u8 = null,
     initial: bool,
+    skip_workspace_root_rules: bool = false,
     instruction_files: context_contract.InstructionFiles = .filesystem,
     context_limits: context_limits.Values = .{},
 };
@@ -247,6 +248,7 @@ fn gatherProjectContextWithHome(
         .targets = &.{},
         .home = home,
         .initial = true,
+        .skip_workspace_root_rules = input.skip_workspace_root_rules,
         .instruction_files = input.instruction_files,
         .context_limits = input.context_limits,
     });
@@ -333,7 +335,9 @@ fn selectProjectContext(alloc: Allocator, options: SelectionOptions) context_con
                 try scratch.addOmission("HOME", .home_unavailable);
             }
 
-            if (std.Io.Dir.path.isAbsolute(options.workspace_root)) {
+            if (options.skip_workspace_root_rules) {
+                // The caller carries this file's text already.
+            } else if (std.Io.Dir.path.isAbsolute(options.workspace_root)) {
                 const project_source = try std.Io.Dir.path.join(arena, &.{ options.workspace_root, "AGENTS.md" });
                 if (global_source_path == null or
                     !std.mem.eql(u8, global_source_path.?, project_source))
@@ -1206,6 +1210,39 @@ test "project instruction file cap keeps a line-safe prefix and reports source f
     try std.testing.expectEqual(@as(usize, 2), context.notices.len);
     try std.testing.expect(std.mem.find(u8, context.notices[0], "effective=12 bytes") != null);
     try std.testing.expect(std.mem.find(u8, context.notices[0], "source=workspace settings") != null);
+}
+
+test "a caller that carries the workspace root rules skips only that file" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestFile(tmp.dir, "home/.lia/AGENTS.md", "RULE_GLOBAL");
+    try writeTestFile(tmp.dir, "home/projects/AGENTS.md", "RULE_PARENT");
+    try writeTestFile(tmp.dir, "home/projects/work/AGENTS.md", "RULE_WORKSPACE");
+    try writeTestFile(tmp.dir, "home/projects/work/sub/AGENTS.md", "RULE_NESTED");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/projects/work");
+    defer alloc.free(workspace);
+    const nested = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/projects/work/sub");
+    defer alloc.free(nested);
+
+    var context = try gatherProjectContextWithHome(alloc, .{ .workspace_root = workspace, .skip_workspace_root_rules = true }, home);
+    defer context.deinit(alloc);
+    const visible = context.modelVisibleBytes();
+    try std.testing.expect(std.mem.find(u8, visible, "RULE_GLOBAL") != null);
+    try std.testing.expect(std.mem.find(u8, visible, "RULE_PARENT") != null);
+    try std.testing.expect(std.mem.find(u8, visible, "RULE_WORKSPACE") == null);
+
+    // Rules below the root still arrive when a tool reaches their folder.
+    var later = try selectApplicableProjectContext(alloc, .{
+        .workspace_root = workspace,
+        .targets = &.{.{ .path = nested, .kind = .directory }},
+        .delivered_sources = context.delivered_sources,
+        .evaluated_endpoints = context.evaluated_endpoints,
+    });
+    defer later.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, later.modelVisibleBytes(), "RULE_NESTED") != null);
 }
 
 test "project instruction file cap bounds retained memory across large candidates" {

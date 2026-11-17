@@ -63,6 +63,7 @@ pub const Config = struct {
     tool_context: tool_runtime.Context,
     provider_set: provider_set.Set,
     system_prompt: []const u8,
+    host_instructions: []const u8 = "",
     model_prompt_overlay: ?[]const u8 = null,
     skill_catalog: skill_invocation.Catalog = .{ .skills = &.{} },
     /// The built-in tools the parent offers through toolbox; the child offers
@@ -317,6 +318,7 @@ pub fn run(
         },
         .{
             .system_prompt = child_system_prompt,
+            .host_instructions = config.host_instructions,
             .model_prompt_overlay = config.model_prompt_overlay,
             .skill_catalog = config.skill_catalog,
             .toolbox_behind = config.toolbox_behind,

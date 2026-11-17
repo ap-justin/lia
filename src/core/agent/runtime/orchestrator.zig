@@ -9658,7 +9658,8 @@ fn processQueuedPromptLoop(
                         if (can_retry) {
                             if (deps.report_usage) |report_fn| {
                                 if (attempt_completion.usage.input_tokens != null or
-                                    attempt_completion.usage.output_tokens != null)
+                                    attempt_completion.usage.output_tokens != null or
+                                    attempt_completion.usage.cost_usd != null)
                                 {
                                     report_fn(deps.ctx, attempt_completion.usage);
                                 }
@@ -10161,7 +10162,9 @@ fn processQueuedPromptLoop(
         preserved_tool_evidence = .none;
 
         if (deps.report_usage) |report_fn| {
-            if (completion.usage.input_tokens != null or completion.usage.output_tokens != null) {
+            if (completion.usage.input_tokens != null or completion.usage.output_tokens != null or
+                completion.usage.cost_usd != null)
+            {
                 report_fn(deps.ctx, completion.usage);
             }
         }

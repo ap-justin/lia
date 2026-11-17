@@ -53,6 +53,8 @@ pub const ErrorCode = struct {
     pub const method_not_found: i64 = -32601;
     pub const invalid_params: i64 = -32602;
     pub const internal_error: i64 = -32603;
+    /// ACP "resource not found": `data.uri` names what is missing.
+    pub const resource_not_found: i64 = -32002;
     /// Answers a request the client withdrew with `$/cancel_request`.
     pub const request_cancelled: i64 = -32800;
 };

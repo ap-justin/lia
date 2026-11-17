@@ -464,9 +464,9 @@ fn handleRestoreSession(
         v2_store.notice = .{ .context = &notice, .emit = ConversionNotice.emit };
         defer v2_store.notice = null;
         v2 = session_adapter.Session.resumeSession(alloc, v2_store, .{ .id = session_id }, workspace_root, .acp) catch |err|
-            return handleLoadFailure(state, alloc, msg, err);
+            return handleLoadFailure(state, alloc, msg, session_id, err);
         v2_resumed = v2.?.durableState(alloc, workspace_root) catch |err|
-            return handleLoadFailure(state, alloc, msg, err);
+            return handleLoadFailure(state, alloc, msg, session_id, err);
     }
     const durable: *const session_codec.DurableSessionState = &v2_resumed.?.state;
 
@@ -800,6 +800,12 @@ fn activateSession(state: *server.ServerState, activation: SessionActivation) !v
         .v2 = activation.v2,
         .client_system_prompt = client_system_prompt,
         .tool_identities = tool_identities,
+        // A loaded session reports totals from its first prompt on, not from
+        // the load, so a client that records differences stays in step.
+        .usage_totals = activation.v2.usageTotals() catch |err| blk: {
+            debug_trace.logf("acp", "event=usage_totals_unreadable session={s} err={s}", .{ activation.session_id, @errorName(err) });
+            break :blk .{};
+        },
         .model = activation.model,
         .provider = activation.provider,
         .mode = start.id,
@@ -870,6 +876,7 @@ fn handleLoadFailure(
     state: *server.ServerState,
     alloc: Allocator,
     msg: *jsonrpc.Message,
+    session_id: []const u8,
     err: anyerror,
 ) !void {
     debug_trace.logf(
@@ -935,9 +942,33 @@ fn handleLoadFailure(
     {
         return server.writeAuthRequired(state, alloc, msg.id);
     }
+    if (err == error.SessionNotFound) return writeSessionNotFound(state, alloc, msg.id, session_id);
     return state.writer.writeError(alloc, msg.id, .{
         .code = ErrorCode.invalid_params,
         .message = "Session not found",
+    });
+}
+
+/// Answers a request for a session lia does not have as ACP "resource not
+/// found" (-32002) with the session id as `data.uri`, the shape clients such
+/// as OpenBot read as "start a new session with the transcript".
+pub fn writeSessionNotFound(
+    state: *server.ServerState,
+    alloc: Allocator,
+    id: ?jsonrpc.RequestId,
+    session_id: []const u8,
+) !void {
+    const message = try alloc.print("Session not found: {s}", .{session_id});
+    defer alloc.free(message);
+    var data: std.Io.Writer.Allocating = .init(alloc);
+    defer data.deinit();
+    try data.writer.writeAll("{\"uri\":");
+    try std.json.Stringify.value(session_id, .{}, &data.writer);
+    try data.writer.writeByte('}');
+    return state.writer.writeError(alloc, id, .{
+        .code = ErrorCode.resource_not_found,
+        .message = message,
+        .data_json = data.written(),
     });
 }
 
@@ -1553,10 +1584,18 @@ pub fn sendActiveSessionInfoUpdate(state: *server.ServerState, alloc: Allocator)
     try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
 }
 
-pub fn sendActiveSessionUsageUpdate(state: *server.ServerState, alloc: Allocator) !void {
-    const active = if (state.active_session) |*session| session else return;
-    const used = active.context_used.load(.acquire);
-    if (used == 0) {
+/// Sends `usage_update` after a model call: `used` is that call's input plus
+/// output tokens, the context the next request starts from, and `cost_usd`
+/// the session's running total. Each part is left out when unknown, and
+/// nothing is sent when none is known.
+pub fn sendSessionUsageUpdate(
+    state: *server.ServerState,
+    alloc: Allocator,
+    active: *server.ActiveSessionState,
+    used: ?u64,
+    cost_usd: ?f64,
+) !void {
+    if (used == null and cost_usd == null) {
         debug_trace.logf("acp", "event=usage_update_skipped reason=no_usage session={s}", .{active.session_id});
         return;
     }
@@ -1565,17 +1604,14 @@ pub fn sendActiveSessionUsageUpdate(state: *server.ServerState, alloc: Allocator
         active.model,
         provider_bundle.fallbackModelCapabilities(active.model),
     );
-    const context_window = capabilities.context_window orelse {
-        debug_trace.logf("acp", "event=usage_update_skipped reason=no_context_window session={s}", .{active.session_id});
-        return;
-    };
+    const context_window: ?u64 = if (capabilities.context_window) |window| window else null;
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try out.writer.writeAll("{\"sessionId\":");
     try writeJsonStr(active.session_id, &out.writer);
     try out.writer.writeAll(",\"update\":");
-    try acp_types.writeUsageUpdate(&out.writer, used, context_window);
+    try acp_types.writeUsageUpdate(&out.writer, used, context_window, cost_usd);
     try out.writer.writeAll("}");
     try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
 }
@@ -2398,6 +2434,7 @@ test "ACP load maps one-off child denial to invalid params" {
             &state,
             arena,
             &msg,
+            "one-off",
             error.OneOffSessionNotResumable,
         );
         try std.testing.expect(state.active_session == null);
@@ -3255,7 +3292,7 @@ test "an unknown session asks for sign-in only while a Gateway default still has
         state.cfg.credential_override = case.credential_override;
         state.auth_pending = true;
         var msg = jsonrpc.Message{ .id = .{ .integer = case.id }, .method = "session/load" };
-        try handleLoadFailure(&state, arena, &msg, error.SessionNotFound);
+        try handleLoadFailure(&state, arena, &msg, "missing-id", error.SessionNotFound);
         try std.testing.expectEqual(case.id != 1, state.auth_pending);
     }
     try capture.sync(io_mod.getIo());
@@ -3277,8 +3314,9 @@ test "an unknown session asks for sign-in only while a Gateway default still has
         if (id.integer == 3) {
             try std.testing.expectEqual(@as(i64, ErrorCode.auth_required), err.get("code").?.integer);
         } else {
-            try std.testing.expectEqual(@as(i64, ErrorCode.invalid_params), err.get("code").?.integer);
-            try std.testing.expectEqualStrings("Session not found", err.get("message").?.string);
+            try std.testing.expectEqual(@as(i64, -32002), err.get("code").?.integer);
+            try std.testing.expectEqualStrings("Session not found: missing-id", err.get("message").?.string);
+            try std.testing.expectEqualStrings("missing-id", err.get("data").?.object.get("uri").?.string);
         }
     }
     try std.testing.expectEqual(@as(usize, 3), answers);

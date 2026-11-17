@@ -229,6 +229,9 @@ pub const InitialContextInput = struct {
     workspace_root: []const u8,
     access_scope: ?workspace_access.AccessScope = null,
     context_limits: context_limits.Values = .{},
+    /// The caller already holds the workspace root's `AGENTS.md`, so it is
+    /// not read again. Rules in other folders are unaffected.
+    skip_workspace_root_rules: bool = false,
     /// Assigned by `Registry` from its composition when routed through it.
     instruction_files: InstructionFiles = .filesystem,
 };

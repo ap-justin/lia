@@ -3204,9 +3204,15 @@ describe("acp: model-independent", () => {
           .map((message: any) => message.params.update.sessionUpdate);
         expect(kinds).toContain("agent_message_chunk");
         expect(client.stderr).toBe("");
-        // Pins the scenario: the gateway sent no usage, and the turn skipped
-        // its usage update because of that.
-        expect(readFileSync(tracePath, "utf8")).toContain("event=usage_update_skipped reason=no_usage");
+        // The gateway sent a cost but no token counts, so the update carries
+        // the cost alone.
+        const usageUpdates = result.messages
+          .filter((message: any) => message.params?.update?.sessionUpdate === "usage_update")
+          .map((message: any) => message.params.update);
+        expect(usageUpdates).toHaveLength(1);
+        expect(usageUpdates[0].cost).toEqual({ amount: 0.0001, currency: "USD" });
+        expect(usageUpdates[0].used).toBeUndefined();
+        expect(readFileSync(tracePath, "utf8")).not.toContain("usage_update_failed");
       } finally {
         titleGate.resolve();
         await client?.close();
@@ -4108,6 +4114,76 @@ describe("acp: model-independent", () => {
             }),
           }),
         }));
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP reports usage and cost as session running totals after every model call",
+    async () => {
+      const root = createIsolatedRoot("lia-acp-usage-totals-");
+      const reply = (text: string, usage: unknown, cost?: string) => fakeGatewaySse([
+        { type: "text-delta", id: "answer_1", delta: text },
+        {
+          type: "finish",
+          finishReason: { unified: "stop", raw: "stop" },
+          usage,
+          ...(cost ? { providerMetadata: { gateway: { cost, generationId: "gen_1" } } } : {}),
+        },
+      ]);
+      const gateway = startFakeGateway(
+        [
+          reply("One.", { inputTokens: { total: 100, cacheRead: 60, cacheWrite: 10 }, outputTokens: { total: 5 } }, "0.25"),
+          reply("Two.", { inputTokens: { total: 120, cacheRead: 100 }, outputTokens: { total: 7 } }, "0.5"),
+          reply("Three.", { inputTokens: { total: 130 }, outputTokens: { total: 3 } }),
+          reply("Four.", { inputTokens: { total: 90 }, outputTokens: { total: 22 } }, "0.25"),
+        ],
+        { models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"], context_window: 128_000 }] },
+      );
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        const sessionId = await startAutoSession(client);
+        const updates = (messages: any[]) => messages
+          .filter((message) => message.params?.update?.sessionUpdate === "usage_update")
+          .map((message) => message.params.update);
+
+        const first = await runPrompt(client, "first", TIMEOUT);
+        expect(updates(first.messages)).toEqual([
+          { sessionUpdate: "usage_update", used: 105, size: 128_000, cost: { amount: 0.25, currency: "USD" } },
+        ]);
+        expect(first.promptResult.result.usage).toEqual({
+          inputTokens: 100, outputTokens: 5, cachedReadTokens: 60, cachedWriteTokens: 10,
+        });
+
+        const second = await runPrompt(client, "second", TIMEOUT);
+        expect(updates(second.messages)).toEqual([
+          { sessionUpdate: "usage_update", used: 127, size: 128_000, cost: { amount: 0.75, currency: "USD" } },
+        ]);
+        expect(second.promptResult.result.usage).toEqual({
+          inputTokens: 220, outputTokens: 12, cachedReadTokens: 160, cachedWriteTokens: 10,
+        });
+
+        // No cost on this call: the update keeps the total so far.
+        const third = await runPrompt(client, "third", TIMEOUT);
+        expect(updates(third.messages)).toEqual([
+          { sessionUpdate: "usage_update", used: 133, size: 128_000, cost: { amount: 0.75, currency: "USD" } },
+        ]);
+        expect(third.promptResult.result.usage.inputTokens).toBe(350);
+
+        // A loaded session continues from the saved totals.
+        await client.close();
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await client.request("initialize", { protocolVersion: 1 }, 10);
+        expect(((await client.request("session/load", { sessionId, cwd: root.workspace, mcpServers: [] }, 11)) as any).error).toBeUndefined();
+        const fourth = await runPrompt(client, "fourth", TIMEOUT);
+        expect(updates(fourth.messages).at(-1)).toMatchObject({ used: 112, cost: { amount: 1, currency: "USD" } });
+        expect(fourth.promptResult.result.usage).toMatchObject({ inputTokens: 440, outputTokens: 37 });
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();
@@ -5748,6 +5824,63 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ACP _session/steering joins the running turn and says when no turn runs",
+    async () => {
+      const root = createIsolatedRoot("lia-acp-ext-steer-");
+      const firstRequest = deferred<void>();
+      const releaseFirst = deferred<void>();
+      const gateway = startFakeGateway([
+        async () => {
+          firstRequest.resolve();
+          await releaseFirst.promise;
+          return finalText("Reading the first tab.");
+        },
+        finalText("Summarized the other tab."),
+      ]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        const init = await client.request("initialize", { protocolVersion: 1 }, 1) as any;
+        expect(init.result._meta.steering).toEqual({ supported: true });
+        expect(init.result.agentCapabilities._meta.lia.steering).toBe(true);
+        const created = await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 2) as any;
+        const sessionId = created.result.sessionId as string;
+        await client.readLine();
+
+        const idle = await client.request("_session/steering", { sessionId, prompt: [{ type: "text", text: "too early" }] }, 3) as any;
+        expect(idle.error).toBeUndefined();
+        expect(idle.result).toEqual({ outcome: "promptRequired" });
+
+        const unknown = await client.request("_session/steering", { sessionId: "nope", prompt: [{ type: "text", text: "x" }] }, 4) as any;
+        expect(unknown.error).toMatchObject({ code: -32002, data: { uri: "nope" } });
+
+        sendPrompt(client, 100, "Summarize the first tab.");
+        await firstRequest.promise;
+        const taken = await client.request("_session/steering", { sessionId, prompt: [{ type: "text", text: "No, the other tab." }] }, 5) as any;
+        expect(taken.error).toBeUndefined();
+        expect(taken.result.outcome).not.toBe("promptRequired");
+        releaseFirst.resolve();
+
+        const { responses } = await readUntilResponses(client, [100]);
+        expect(responses.get(100)!.result.stopReason).toBe("end_turn");
+        expect(gateway.requests).toHaveLength(2);
+        expect(gateway.requests[0]!.body).not.toContain("No, the other tab.");
+        expect(gateway.requests[1]!.body).toContain("No, the other tab.");
+        expect(gateway.requests[0]!.body).not.toContain("too early");
+        expect(client.stderr).toBe("");
+      } finally {
+        releaseFirst.resolve();
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    LIVE_TIMEOUT,
+  );
+
+  test(
     "ACP reports queued steering as cancelled when the turn is cancelled",
     async () => {
       const root = createIsolatedRoot("lia-acp-steer-cancel-");
@@ -5899,6 +6032,141 @@ describe("acp: model-independent", () => {
         expect(prompts).toHaveLength(1);
         expect(JSON.stringify(prompts[0].value)).toContain(marker);
         expect(existsSync(join(root.home, ".lia", "session-files"))).toBe(false);
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    LIVE_TIMEOUT,
+  );
+
+  test(
+    "ACP keeps OpenBot's developer instructions in the system prompt and skips the workspace AGENTS.md",
+    async () => {
+      const root = createIsolatedRoot("lia-acp-developer-instructions-");
+      writeFileSync(join(root.workspace, "AGENTS.md"), "ROOT_RULES_MARKER\n");
+      const gateway = startFakeGateway([
+        finalText("plain"),
+        finalText("first"),
+        finalText("same"),
+        finalText("changed"),
+        finalText("restored"),
+      ]);
+      const block = (text: string) => `<openbot-developer-instructions>\n${text}\n</openbot-developer-instructions>`;
+      const context = "<openbot_context>tab: docs</openbot_context>";
+      const systemText = (body: string) => acpGatewayRequest(body).prompt
+        .filter((message) => message.role === "system")
+        .map((message) => acpContentText(message.content))
+        .join("\n");
+      const userText = (body: string) => acpGatewayRequest(body).prompt
+        .filter((message) => message.role === "user")
+        .map((message) => acpContentText(message.content))
+        .join("\n");
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        // Without the block lia loads the workspace AGENTS.md itself.
+        const plainSession = (await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 2) as any).result.sessionId;
+        await client.readLine();
+        await runPrompt(client, "no block", TIMEOUT);
+        expect(gateway.requests[0]!.body).toContain("ROOT_RULES_MARKER");
+        expect(plainSession).toBeTruthy();
+
+        const created = await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 3) as any;
+        const sessionId = created.result.sessionId as string;
+        await client.readLine();
+        const first = await runPrompt(client, `${block("DEV_RULES_ONE ROOT_COPY")}\n\n${context}\nHello`, TIMEOUT);
+        expect(first.promptResult.result.stopReason).toBe("end_turn");
+        const firstBody = gateway.requests[1]!.body;
+        expect(systemText(firstBody)).toContain(block("DEV_RULES_ONE ROOT_COPY"));
+        expect(userText(firstBody)).not.toContain("DEV_RULES_ONE");
+        expect(userText(firstBody)).toContain(context);
+        expect(userText(firstBody)).toContain("Hello");
+        expect(firstBody).not.toContain("ROOT_RULES_MARKER");
+
+        // The same block again leaves the system prompt as it was, and a later
+        // prompt without one keeps it.
+        await runPrompt(client, `${block("DEV_RULES_ONE ROOT_COPY")}\nAgain`, TIMEOUT);
+        expect(systemText(gateway.requests[2]!.body)).toBe(systemText(firstBody));
+
+        // A new block replaces the old one.
+        await runPrompt(client, `${block("DEV_RULES_TWO")}\nChanged`, TIMEOUT);
+        const changedSystem = systemText(gateway.requests[3]!.body);
+        expect(changedSystem).toContain("DEV_RULES_TWO");
+        expect(changedSystem).not.toContain("DEV_RULES_ONE");
+        expect(gateway.requests[3]!.body).not.toContain("ROOT_RULES_MARKER");
+        await client.close();
+
+        // A loaded session keeps the instructions and still skips AGENTS.md.
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await client.request("initialize", { protocolVersion: 1 }, 10);
+        expect(((await client.request("session/load", { sessionId, cwd: root.workspace, mcpServers: [] }, 11)) as any).error).toBeUndefined();
+        await runPrompt(client, "After load", TIMEOUT);
+        expect(systemText(gateway.requests[4]!.body)).toContain("DEV_RULES_TWO");
+        expect(gateway.requests[4]!.body).not.toContain("ROOT_RULES_MARKER");
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    LIVE_TIMEOUT,
+  );
+
+  test(
+    "ACP keeps a large developer block as instructions and falls back to user text when it cannot be stored",
+    async () => {
+      const root = createIsolatedRoot("lia-acp-large-developer-");
+      const gateway = startFakeGateway([finalText("large"), finalText("nul"), finalText("huge"), finalText("after")]);
+      const block = (text: string) => `<openbot-developer-instructions>\n${text}\n</openbot-developer-instructions>`;
+      const systemText = (body: string) => acpGatewayRequest(body).prompt
+        .filter((message) => message.role === "system")
+        .map((message) => acpContentText(message.content))
+        .join("\n");
+      const userText = (body: string) => acpGatewayRequest(body).prompt
+        .filter((message) => message.role === "user")
+        .map((message) => acpContentText(message.content))
+        .join("\n");
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        const created = await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 2) as any;
+        const sessionId = created.result.sessionId as string;
+        await client.readLine();
+
+        const large = block(`LARGE_START ${"x".repeat(200 * 1024)} LARGE_END`);
+        const first = await runPrompt(client, `${large}\n\nHello`, TIMEOUT);
+        expect(first.promptResult.error).toBeUndefined();
+        expect(first.promptResult.result.stopReason).toBe("end_turn");
+        expect(systemText(gateway.requests[0]!.body)).toContain(large);
+        expect(userText(gateway.requests[0]!.body)).not.toContain("LARGE_START");
+
+        // A block with a NUL byte cannot be stored: it goes as user text.
+        const nul = block("NUL_RULES \u0000 end");
+        const second = await runPrompt(client, `${nul}\n\nWith NUL`, TIMEOUT);
+        expect(second.promptResult.error).toBeUndefined();
+        expect(second.promptResult.result.stopReason).toBe("end_turn");
+        expect(userText(gateway.requests[1]!.body)).toContain("NUL_RULES");
+        expect(userText(gateway.requests[1]!.body)).toContain("With NUL");
+
+        // So does one over the 1 MiB limit, and a block alone is not an empty prompt.
+        const huge = block(`HUGE_START ${"y".repeat(1100 * 1024)}`);
+        const third = await runPrompt(client, huge, TIMEOUT);
+        expect(third.promptResult.error).toBeUndefined();
+        expect(third.promptResult.result.stopReason).toBe("end_turn");
+        expect(userText(gateway.requests[2]!.body)).toContain("HUGE_START");
+        expect(systemText(gateway.requests[2]!.body)).not.toContain("HUGE_START");
+
+        // The large block stays the session's instructions through all of it, and a restart.
+        await client.close();
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await client.request("initialize", { protocolVersion: 1 }, 10);
+        expect(((await client.request("session/load", { sessionId, cwd: root.workspace, mcpServers: [] }, 11)) as any).error).toBeUndefined();
+        await runPrompt(client, "After load", TIMEOUT);
+        expect(systemText(gateway.requests[3]!.body)).toContain("LARGE_END");
+        expect(client.stderr).toBe("");
       } finally {
         await client?.close();
         gateway.stop();
@@ -10765,8 +11033,9 @@ describe("acp: model-independent", () => {
           5,
         ) as any;
         expect(missingLoad.error).toEqual({
-          code: -32602,
-          message: "Session not found",
+          code: -32002,
+          message: "Session not found: missing-session",
+          data: { uri: "missing-session" },
         });
 
         owner.endStdin();
