@@ -3204,9 +3204,15 @@ describe("acp: model-independent", () => {
           .map((message: any) => message.params.update.sessionUpdate);
         expect(kinds).toContain("agent_message_chunk");
         expect(client.stderr).toBe("");
-        // Pins the scenario: the gateway sent no usage, and the turn skipped
-        // its usage update because of that.
-        expect(readFileSync(tracePath, "utf8")).toContain("event=usage_update_skipped reason=no_usage");
+        // The gateway sent a cost but no token counts, so the update carries
+        // the cost alone.
+        const usageUpdates = result.messages
+          .filter((message: any) => message.params?.update?.sessionUpdate === "usage_update")
+          .map((message: any) => message.params.update);
+        expect(usageUpdates).toHaveLength(1);
+        expect(usageUpdates[0].cost).toEqual({ amount: 0.0001, currency: "USD" });
+        expect(usageUpdates[0].used).toBeUndefined();
+        expect(readFileSync(tracePath, "utf8")).not.toContain("usage_update_failed");
       } finally {
         titleGate.resolve();
         await client?.close();
@@ -4108,6 +4114,67 @@ describe("acp: model-independent", () => {
             }),
           }),
         }));
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP reports usage and cost as session running totals after every model call",
+    async () => {
+      const root = createIsolatedRoot("lia-acp-usage-totals-");
+      const reply = (text: string, usage: unknown, cost?: string) => fakeGatewaySse([
+        { type: "text-delta", id: "answer_1", delta: text },
+        {
+          type: "finish",
+          finishReason: { unified: "stop", raw: "stop" },
+          usage,
+          ...(cost ? { providerMetadata: { gateway: { cost, generationId: "gen_1" } } } : {}),
+        },
+      ]);
+      const gateway = startFakeGateway(
+        [
+          reply("One.", { inputTokens: { total: 100, cacheRead: 60, cacheWrite: 10 }, outputTokens: { total: 5 } }, "0.25"),
+          reply("Two.", { inputTokens: { total: 120, cacheRead: 100 }, outputTokens: { total: 7 } }, "0.5"),
+          reply("Three.", { inputTokens: { total: 130 }, outputTokens: { total: 3 } }),
+        ],
+        { models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"], context_window: 128_000 }] },
+      );
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        const sessionId = await startAutoSession(client);
+        const updates = (messages: any[]) => messages
+          .filter((message) => message.params?.update?.sessionUpdate === "usage_update")
+          .map((message) => message.params.update);
+
+        const first = await runPrompt(client, "first", TIMEOUT);
+        expect(updates(first.messages)).toEqual([
+          { sessionUpdate: "usage_update", used: 105, size: 128_000, cost: { amount: 0.25, currency: "USD" } },
+        ]);
+        expect(first.promptResult.result.usage).toEqual({
+          inputTokens: 100, outputTokens: 5, cachedReadTokens: 60, cachedWriteTokens: 10,
+        });
+
+        const second = await runPrompt(client, "second", TIMEOUT);
+        expect(updates(second.messages)).toEqual([
+          { sessionUpdate: "usage_update", used: 127, size: 128_000, cost: { amount: 0.75, currency: "USD" } },
+        ]);
+        expect(second.promptResult.result.usage).toEqual({
+          inputTokens: 220, outputTokens: 12, cachedReadTokens: 160, cachedWriteTokens: 10,
+        });
+
+        // No cost on this call: the update keeps the total so far.
+        const third = await runPrompt(client, "third", TIMEOUT);
+        expect(updates(third.messages)).toEqual([
+          { sessionUpdate: "usage_update", used: 133, size: 128_000, cost: { amount: 0.75, currency: "USD" } },
+        ]);
+        expect(third.promptResult.result.usage.inputTokens).toBe(350);
+        expect(sessionId).toBeTruthy();
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();

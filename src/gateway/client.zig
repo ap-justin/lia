@@ -4509,8 +4509,14 @@ fn parseSseFinishEvent(
     return .{
         .finish_reason = finish_reason,
         .raw = parseSseFinishRaw(root),
-        .usage = parseSseUsage(root),
+        .usage = withCost(parseSseUsage(root), parseSseCost(root)),
     };
+}
+
+fn withCost(usage: types.Usage, cost_usd: ?f64) types.Usage {
+    var result = usage;
+    result.cost_usd = cost_usd;
+    return result;
 }
 
 /// The provider's own reason beside the unified one: the AI SDK folds Gemini
@@ -4548,6 +4554,25 @@ fn parseSseUsage(root: std.json.Value) types.Usage {
         .cache_write_tokens = parseSseTokenDetail(usage_value, "inputTokens", "cacheWrite"),
         .reasoning_tokens = parseSseTokenDetail(usage_value, "outputTokens", "reasoning"),
     };
+}
+
+/// The finish event's `providerMetadata.gateway.cost`: what the Gateway
+/// charged for the request in US dollars, a decimal string such as "0.0001".
+/// Null when absent or not a finite non-negative number.
+fn parseSseCost(root: std.json.Value) ?f64 {
+    if (root != .object) return null;
+    const provider_metadata = root.object.get("providerMetadata") orelse return null;
+    if (provider_metadata != .object) return null;
+    const gateway = provider_metadata.object.get("gateway") orelse return null;
+    if (gateway != .object) return null;
+    const cost = gateway.object.get("cost") orelse return null;
+    const value: f64 = switch (cost) {
+        .string => |text| std.fmt.parseFloat(f64, text) catch return null,
+        .float => |number| number,
+        .integer => |number| @floatFromInt(number),
+        else => return null,
+    };
+    return if (std.math.isFinite(value) and value >= 0) value else null;
 }
 
 fn parseSseTokenDetail(usage_value: std.json.Value, section: []const u8, key: []const u8) ?u64 {
@@ -12201,4 +12226,22 @@ test "a model catalog fetch ends at its deadline during a lookup that hangs" {
         null,
     ));
     try std.testing.expect(elapsedMsSince(started) < 1_000);
+}
+
+test "a Gateway finish event carries the request's cost in dollars" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { json: []const u8, cost: ?f64 }{
+        .{ .json = "{\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"},\"usage\":{\"inputTokens\":{\"total\":10},\"outputTokens\":{\"total\":5}},\"providerMetadata\":{\"gateway\":{\"cost\":\"0.0125\",\"generationId\":\"gen_1\"}}}", .cost = 0.0125 },
+        .{ .json = "{\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"},\"providerMetadata\":{\"gateway\":{\"cost\":0.5}}}", .cost = 0.5 },
+        .{ .json = "{\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"},\"providerMetadata\":{\"gateway\":{\"cost\":\"-1\"}}}", .cost = null },
+        .{ .json = "{\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"},\"providerMetadata\":{\"gateway\":{\"cost\":\"free\"}}}", .cost = null },
+        .{ .json = "{\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"}}", .cost = null },
+    };
+    for (cases) |case| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, case.json, .{});
+        defer parsed.deinit();
+        var detail: ?[]u8 = null;
+        const event = try parseSseFinishEvent(alloc, parsed.value, &detail);
+        try std.testing.expectEqual(case.cost, event.usage.cost_usd);
+    }
 }

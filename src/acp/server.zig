@@ -190,9 +190,10 @@ pub const ActiveSessionState = struct {
     /// The saved session.
     v2: ?*session_adapter.Session = null,
     session_write_mutex: std.Io.Mutex = .init,
-    /// Input plus output tokens of the latest main-model completion, the
-    /// context `usage_update` reports; 0 until a completion reports both.
-    context_used: std.atomic.Value(usize) = .init(0),
+    /// What every model call of this session has used and cost since lia
+    /// opened it, reported to the client as running totals.
+    usage_mutex: std.Io.Mutex = .init,
+    usage_totals: types.Usage = .{},
     model: []u8,
     provider: model_provider.ProviderId = .gateway,
     mode: []const u8,
@@ -229,6 +230,20 @@ pub const ActiveSessionState = struct {
     failure_message_len: usize = 0,
 
     steering: acp_steering.Runtime = .{},
+
+    /// Adds one model call's usage to the session's totals and returns them.
+    pub fn addUsage(self: *ActiveSessionState, usage: types.Usage) types.Usage {
+        self.usage_mutex.lockUncancelable(io_mod.getIo());
+        defer self.usage_mutex.unlock(io_mod.getIo());
+        self.usage_totals.add(usage);
+        return self.usage_totals;
+    }
+
+    pub fn usageTotals(self: *ActiveSessionState) types.Usage {
+        self.usage_mutex.lockUncancelable(io_mod.getIo());
+        defer self.usage_mutex.unlock(io_mod.getIo());
+        return self.usage_totals;
+    }
 
     /// Keeps the whole codepoints of `message` that fit
     /// `failure_message_max_bytes`, invalid bytes as U+FFFD, since the error
@@ -2112,7 +2127,7 @@ fn promptWorkerMain(active: *ActivePrompt) void {
 
 fn publishPromptOutcome(active: *ActivePrompt, outcome: prompt_handler.TerminalOutcome) void {
     const usage = if (active.state.active_session) |*session|
-        session.session_rt.agent.turn_usage
+        session.usageTotals()
     else
         types.Usage{};
     answerPrompt(&active.state.writer, active.alloc, active.msg.id, outcome, usage);

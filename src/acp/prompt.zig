@@ -926,8 +926,6 @@ pub fn handlePrompt(
         },
     };
 
-    // A turn whose completions report no tokens sends no `usage_update`.
-    session.context_used.store(0, .release);
     ctx.resetTurnOutcome(session);
     const deps = agentRuntimeDeps(&ctx);
     var dynamic_tool_arena = std.heap.ArenaAllocator.init(alloc);
@@ -974,7 +972,6 @@ pub fn handlePrompt(
     prompt_input.retainImageSnapshots();
     completeAcpTitleTask(state, session);
     try sessions.sendActiveSessionInfoUpdate(state, alloc);
-    try sessions.sendActiveSessionUsageUpdate(state, alloc);
     debug_trace.logf("acp", "event=prompt_updates_sent session={s}", .{session.session_id});
 
     if (session.cancel_flag.load(.seq_cst)) return .{ .stop_reason = .cancelled };
@@ -1655,13 +1652,21 @@ fn promptSession(ctx: *AcpContext) ?*server.ActiveSessionState {
     return if (std.mem.eql(u8, active.session_id, ctx.session_id)) active else null;
 }
 
+/// Called after every model call. The session's totals take the call's
+/// usage, and a `usage_update` goes out at once, so a client that bills by
+/// report sees each call and not only the turn's end. A cost the provider did
+/// not report leaves `cost` out of the update.
 fn reportUsage(raw_ctx: *anyopaque, usage: types.Usage) void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const active = promptSession(ctx) orelse return;
-    const input = usage.input_tokens orelse return;
-    const output = usage.output_tokens orelse return;
-    const used = std.math.add(u64, input, output) catch return;
-    active.context_used.store(std.math.cast(usize, used) orelse std.math.maxInt(usize), .release);
+    const totals = active.addUsage(usage);
+    const used: ?u64 = if (usage.input_tokens) |input| if (usage.output_tokens) |output|
+        std.math.add(u64, input, output) catch std.math.maxInt(u64)
+    else
+        null else null;
+    sessions.sendSessionUsageUpdate(ctx.state, ctx.alloc, active, used, totals.cost_usd) catch |err| {
+        debug_trace.logf("acp", "event=usage_update_failed session={s} err={s}", .{ active.session_id, @errorName(err) });
+    };
 }
 
 fn modelCatalogFailure(raw_ctx: *anyopaque) ?gateway_model_catalog.FailureCategory {

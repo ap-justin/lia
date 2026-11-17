@@ -1900,13 +1900,19 @@ pub const Usage = struct {
     cache_read_tokens: ?u64 = null,
     cache_write_tokens: ?u64 = null,
     reasoning_tokens: ?u64 = null,
+    /// What the gateway charged for the request, in US dollars, when it says.
+    cost_usd: ?f64 = null,
 
     /// Adds each count `other` reports, saturating at the maximum. A count
     /// neither side reports stays null.
     pub fn add(self: *Usage, other: Usage) void {
         inline for (@typeInfo(Usage).@"struct".field_names) |name| {
             if (@field(other, name)) |amount| {
-                @field(self, name) = std.math.add(u64, @field(self, name) orelse 0, amount) catch std.math.maxInt(u64);
+                if (@TypeOf(amount) == f64) {
+                    @field(self, name) = (@field(self, name) orelse 0) + amount;
+                } else {
+                    @field(self, name) = std.math.add(u64, @field(self, name) orelse 0, amount) catch std.math.maxInt(u64);
+                }
             }
         }
     }
@@ -4456,4 +4462,14 @@ test "provider replay projection preserves matching origin and excludes other ro
             defer freeProviderReplay(a, copy);
         }
     }.check, .{});
+}
+
+test "usage adds token counts and cost" {
+    var total: Usage = .{};
+    total.add(.{ .input_tokens = 4, .cost_usd = 0.25 });
+    total.add(.{ .input_tokens = 3, .output_tokens = 1 });
+    total.add(.{ .cost_usd = 0.5 });
+    try std.testing.expectEqual(@as(?u64, 7), total.input_tokens);
+    try std.testing.expectEqual(@as(?u64, 1), total.output_tokens);
+    try std.testing.expectEqual(@as(?f64, 0.75), total.cost_usd);
 }

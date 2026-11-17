@@ -495,6 +495,9 @@ test "steering replay carries the request id of its prompt" {
     );
 }
 
+/// `usage` holds the session's running totals, not the turn's: OpenBot reads
+/// each report as a total and records the difference from the last one. The
+/// input count includes cache reads.
 pub fn writePromptResponseWithUsage(
     w: *std.Io.Writer,
     reason: StopReason,
@@ -507,8 +510,8 @@ pub fn writePromptResponseWithUsage(
     inline for (.{
         .{ "inputTokens", usage.input_tokens },
         .{ "outputTokens", usage.output_tokens },
-        .{ "cacheReadTokens", usage.cache_read_tokens },
-        .{ "cacheWriteTokens", usage.cache_write_tokens },
+        .{ "cachedReadTokens", usage.cache_read_tokens },
+        .{ "cachedWriteTokens", usage.cache_write_tokens },
         .{ "reasoningTokens", usage.reasoning_tokens },
     }) |field| {
         if (field[1]) |value| {
@@ -541,8 +544,16 @@ pub fn writeSessionInfoUpdate(w: *std.Io.Writer, title: []const u8, updated_at: 
     try w.writeAll("}");
 }
 
-pub fn writeUsageUpdate(w: *std.Io.Writer, used: u64, size: u64) !void {
-    try w.print("{{\"sessionUpdate\":\"usage_update\",\"used\":{d},\"size\":{d}}}", .{ used, size });
+/// A context-usage report after a model call. `used` and `size` are left out
+/// when unknown, and `cost` is the session's running total in US dollars, left
+/// out when the provider reports none: OpenBot records the difference from the
+/// last report, and a cost that is not a total would be counted twice.
+pub fn writeUsageUpdate(w: *std.Io.Writer, used: ?u64, size: ?u64, cost_usd: ?f64) !void {
+    try w.writeAll("{\"sessionUpdate\":\"usage_update\"");
+    if (used) |value| try w.print(",\"used\":{d}", .{value});
+    if (size) |value| try w.print(",\"size\":{d}", .{value});
+    if (cost_usd) |amount| try w.print(",\"cost\":{{\"amount\":{d},\"currency\":\"USD\"}}", .{amount});
+    try w.writeAll("}");
 }
 
 test "writeAgentMessageChunk produces valid json" {
@@ -798,10 +809,22 @@ test "writeUsageUpdate reports context used and size" {
     const alloc = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    try writeUsageUpdate(&out.writer, 8, 128_000);
+    try writeUsageUpdate(&out.writer, 8, 128_000, null);
     try std.testing.expectEqualStrings(
         "{\"sessionUpdate\":\"usage_update\",\"used\":8,\"size\":128000}",
         out.writer.buffered(),
+    );
+    out.clearRetainingCapacity();
+    try writeUsageUpdate(&out.writer, 8, null, 0.125);
+    try std.testing.expectEqualStrings(
+        "{\"sessionUpdate\":\"usage_update\",\"used\":8,\"cost\":{\"amount\":0.125,\"currency\":\"USD\"}}",
+        out.written(),
+    );
+    out.clearRetainingCapacity();
+    try writePromptResponseWithUsage(&out.writer, .end_turn, .{ .input_tokens = 9, .output_tokens = 2, .cache_read_tokens = 4, .cache_write_tokens = 1 });
+    try std.testing.expectEqualStrings(
+        "{\"stopReason\":\"end_turn\",\"usage\":{\"inputTokens\":9,\"outputTokens\":2,\"cachedReadTokens\":4,\"cachedWriteTokens\":1}}",
+        out.written(),
     );
 }
 

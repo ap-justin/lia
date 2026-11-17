@@ -1578,10 +1578,18 @@ pub fn sendActiveSessionInfoUpdate(state: *server.ServerState, alloc: Allocator)
     try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
 }
 
-pub fn sendActiveSessionUsageUpdate(state: *server.ServerState, alloc: Allocator) !void {
-    const active = if (state.active_session) |*session| session else return;
-    const used = active.context_used.load(.acquire);
-    if (used == 0) {
+/// Sends `usage_update` after a model call: `used` is that call's input plus
+/// output tokens, the context the next request starts from, and `cost_usd`
+/// the session's running total. Each part is left out when unknown, and
+/// nothing is sent when none is known.
+pub fn sendSessionUsageUpdate(
+    state: *server.ServerState,
+    alloc: Allocator,
+    active: *server.ActiveSessionState,
+    used: ?u64,
+    cost_usd: ?f64,
+) !void {
+    if (used == null and cost_usd == null) {
         debug_trace.logf("acp", "event=usage_update_skipped reason=no_usage session={s}", .{active.session_id});
         return;
     }
@@ -1590,17 +1598,14 @@ pub fn sendActiveSessionUsageUpdate(state: *server.ServerState, alloc: Allocator
         active.model,
         provider_bundle.fallbackModelCapabilities(active.model),
     );
-    const context_window = capabilities.context_window orelse {
-        debug_trace.logf("acp", "event=usage_update_skipped reason=no_context_window session={s}", .{active.session_id});
-        return;
-    };
+    const context_window: ?u64 = if (capabilities.context_window) |window| window else null;
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try out.writer.writeAll("{\"sessionId\":");
     try writeJsonStr(active.session_id, &out.writer);
     try out.writer.writeAll(",\"update\":");
-    try acp_types.writeUsageUpdate(&out.writer, used, context_window);
+    try acp_types.writeUsageUpdate(&out.writer, used, context_window, cost_usd);
     try out.writer.writeAll("}");
     try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
 }
