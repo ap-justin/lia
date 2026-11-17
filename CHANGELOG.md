@@ -13,9 +13,13 @@ Merges fx 0.0.17.
 - `lia doctor` tests the saved credential and connects to each approved MCP server, adds a fix line to every check, and exits 1 when a check fails. `lia doctor --fix` removes old terminal and side folders whose session is gone.
 - `lia sessions --live` lists the sessions a lia process has open, with their subagents. `lia session <id>/<agent>` reads a subagent's conversation and `--tail <n>` shows only the last turns.
 - Mistyped commands, flags and settings suggest the closest match, and every command accepts `--flag=value`.
+- ACP: `initialize` answers `_meta.steering.supported: true`, and `_session/steering` with `{sessionId, prompt}` adds text to the running turn like `_meta.lia.steer`. It answers `{"outcome": "promptRequired"}` when no turn is running.
+- ACP: `usage_update` goes out after every model call, with `cost: {amount, currency: "USD"}` as the session's running total when the Gateway reports a cost. `PromptResponse.usage` holds the session's running totals, and its cache fields are now `cachedReadTokens` and `cachedWriteTokens`.
+- ACP: a prompt that starts with an `<openbot-developer-instructions>` block sends it as system instructions, a new block replaces the old one, and the workspace-root `AGENTS.md` is not read for that session.
 
 ### Fixes
 
+- ACP: `session/load` and `session/resume` of an unknown session answer `-32002` with the session id in `data.uri`, not `-32602`, so clients can start a new session.
 - Requests keep retrying through network drops, gateway errors (including 520, 524 and 529) and rate limits until they succeed or are cancelled. A compaction the provider refuses as too long is sent again as a smaller request.
 - Several lia processes that get a 401 together refresh a shared Vercel login once, a login another process just refreshed is used instead of asking to sign in again, and a new sign-in starts on the team used before.
 - Claude Fable 5.1 and later no longer reject a continued session with "Invalid signature in thinking block".
