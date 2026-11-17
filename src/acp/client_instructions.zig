@@ -127,6 +127,43 @@ pub fn load(
     return text;
 }
 
+/// The block OpenBot puts at the front of a prompt with the developer
+/// instructions it wants the model to follow.
+pub const developer_open = "<openbot-developer-instructions>";
+pub const developer_close = "</openbot-developer-instructions>";
+
+pub const DeveloperSplit = struct {
+    /// The whole block, tags included.
+    block: []const u8,
+    /// The prompt after the block, without the blank lines that follow it.
+    rest: []const u8,
+};
+
+/// Splits a leading developer-instructions block off a prompt, or returns
+/// null when the prompt does not start with a complete one. Both parts point
+/// into `text`.
+pub fn splitDeveloperInstructions(text: []const u8) ?DeveloperSplit {
+    const start = std.mem.trimStart(u8, text, " \t\r\n");
+    if (!std.mem.startsWith(u8, start, developer_open)) return null;
+    const close_at = std.mem.find(u8, start, developer_close) orelse return null;
+    const end = close_at + developer_close.len;
+    return .{
+        .block = start[0..end],
+        .rest = std.mem.trimStart(u8, start[end..], " \t\r\n"),
+    };
+}
+
+/// Whether a session's client prompt is OpenBot's developer-instructions
+/// block, which already holds the workspace `AGENTS.md`.
+pub fn isDeveloperInstructions(client_prompt: []const u8) bool {
+    return std.mem.startsWith(u8, client_prompt, developer_open);
+}
+
+/// Whether `text` can be kept as a session's client prompt.
+pub fn storable(text: []const u8) bool {
+    return text.len <= max_bytes and validText(text);
+}
+
 /// Joins host instructions with the client prompt for the system slot, after
 /// lia's built-in instructions. Caller owns the result.
 pub fn compose(alloc: Allocator, host_instructions: []const u8, client_prompt: []const u8) ![]u8 {
@@ -217,4 +254,17 @@ test "client system prompt of exactly the size limit survives a restore" {
     const restored = (try load(alloc, &capability)).?;
     defer alloc.free(restored);
     try std.testing.expectEqual(max_bytes, restored.len);
+}
+
+test "a leading developer-instructions block splits off the prompt" {
+    const split = splitDeveloperInstructions("\n<openbot-developer-instructions>\nBe brief.\n</openbot-developer-instructions>\n\n<openbot_context>x</openbot_context>\nHi").?;
+    try std.testing.expectEqualStrings("<openbot-developer-instructions>\nBe brief.\n</openbot-developer-instructions>", split.block);
+    try std.testing.expectEqualStrings("<openbot_context>x</openbot_context>\nHi", split.rest);
+    try std.testing.expect(isDeveloperInstructions(split.block));
+
+    try std.testing.expect(splitDeveloperInstructions("Hi <openbot-developer-instructions>x</openbot-developer-instructions>") == null);
+    try std.testing.expect(splitDeveloperInstructions("<openbot-developer-instructions>never closed") == null);
+    try std.testing.expect(splitDeveloperInstructions("<openbot_context>x</openbot_context>") == null);
+    const only = splitDeveloperInstructions("<openbot-developer-instructions></openbot-developer-instructions>").?;
+    try std.testing.expectEqualStrings("", only.rest);
 }

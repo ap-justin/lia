@@ -6033,6 +6033,80 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ACP keeps OpenBot's developer instructions in the system prompt and skips the workspace AGENTS.md",
+    async () => {
+      const root = createIsolatedRoot("lia-acp-developer-instructions-");
+      writeFileSync(join(root.workspace, "AGENTS.md"), "ROOT_RULES_MARKER\n");
+      const gateway = startFakeGateway([
+        finalText("plain"),
+        finalText("first"),
+        finalText("same"),
+        finalText("changed"),
+        finalText("restored"),
+      ]);
+      const block = (text: string) => `<openbot-developer-instructions>\n${text}\n</openbot-developer-instructions>`;
+      const context = "<openbot_context>tab: docs</openbot_context>";
+      const systemText = (body: string) => acpGatewayRequest(body).prompt
+        .filter((message) => message.role === "system")
+        .map((message) => acpContentText(message.content))
+        .join("\n");
+      const userText = (body: string) => acpGatewayRequest(body).prompt
+        .filter((message) => message.role === "user")
+        .map((message) => acpContentText(message.content))
+        .join("\n");
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        // Without the block lia loads the workspace AGENTS.md itself.
+        const plainSession = (await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 2) as any).result.sessionId;
+        await client.readLine();
+        await runPrompt(client, "no block", TIMEOUT);
+        expect(gateway.requests[0]!.body).toContain("ROOT_RULES_MARKER");
+        expect(plainSession).toBeTruthy();
+
+        const created = await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 3) as any;
+        const sessionId = created.result.sessionId as string;
+        await client.readLine();
+        const first = await runPrompt(client, `${block("DEV_RULES_ONE ROOT_COPY")}\n\n${context}\nHello`, TIMEOUT);
+        expect(first.promptResult.result.stopReason).toBe("end_turn");
+        const firstBody = gateway.requests[1]!.body;
+        expect(systemText(firstBody)).toContain(block("DEV_RULES_ONE ROOT_COPY"));
+        expect(userText(firstBody)).not.toContain("DEV_RULES_ONE");
+        expect(userText(firstBody)).toContain(context);
+        expect(userText(firstBody)).toContain("Hello");
+        expect(firstBody).not.toContain("ROOT_RULES_MARKER");
+
+        // The same block again leaves the system prompt as it was, and a later
+        // prompt without one keeps it.
+        await runPrompt(client, `${block("DEV_RULES_ONE ROOT_COPY")}\nAgain`, TIMEOUT);
+        expect(systemText(gateway.requests[2]!.body)).toBe(systemText(firstBody));
+
+        // A new block replaces the old one.
+        await runPrompt(client, `${block("DEV_RULES_TWO")}\nChanged`, TIMEOUT);
+        const changedSystem = systemText(gateway.requests[3]!.body);
+        expect(changedSystem).toContain("DEV_RULES_TWO");
+        expect(changedSystem).not.toContain("DEV_RULES_ONE");
+        expect(gateway.requests[3]!.body).not.toContain("ROOT_RULES_MARKER");
+        await client.close();
+
+        // A loaded session keeps the instructions and still skips AGENTS.md.
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await client.request("initialize", { protocolVersion: 1 }, 10);
+        expect(((await client.request("session/load", { sessionId, cwd: root.workspace, mcpServers: [] }, 11)) as any).error).toBeUndefined();
+        await runPrompt(client, "After load", TIMEOUT);
+        expect(systemText(gateway.requests[4]!.body)).toContain("DEV_RULES_TWO");
+        expect(gateway.requests[4]!.body).not.toContain("ROOT_RULES_MARKER");
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    LIVE_TIMEOUT,
+  );
+
+  test(
     `ACP session/new cwd selects the session workspace`,
     async () => {
       const root = createIsolatedRoot("lia-acp-session-cwd-");

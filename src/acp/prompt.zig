@@ -804,7 +804,10 @@ pub fn handlePrompt(
         image_attachments.inlineCapturedSnapshots(alloc, prompt_input.images) catch |err|
             return promptInputFailure(err);
     }
-    const prompt_text = prompt_input.text;
+    // OpenBot's developer instructions lead the prompt as a tagged block. They
+    // go to the system slot, not the user's message.
+    const developer_split = client_instructions.splitDeveloperInstructions(prompt_input.text);
+    const prompt_text = if (developer_split) |split| split.rest else prompt_input.text;
 
     if (prompt_input.continue_recovery and prompt_text.len != 0) {
         return .{
@@ -825,7 +828,15 @@ pub fn handlePrompt(
 
     // The prompt's attached files stay out of the instructions: the runtime
     // delivers their folders' rules as a note on the turn's own message.
-    try refreshProjectContext(state, alloc);
+    if (developer_split) |split| {
+        if (!client_instructions.storable(split.block)) return .{ .rpc_error = .{
+            .code = ErrorCode.invalid_params,
+            .message = "Developer instructions exceed 64 KiB or are not valid text",
+        } };
+        try keepDeveloperInstructions(state, session, split.block);
+    }
+    // The block carries the workspace `AGENTS.md`, so lia does not load it too.
+    try refreshProjectContext(state, alloc, client_instructions.isDeveloperInstructions(session.client_system_prompt));
 
     session.pending_prompt_id = msg.id;
     defer session.pending_prompt_id = null;
@@ -1121,9 +1132,28 @@ pub fn runSubagentChild(
     }, turn, message, admission, cancel);
 }
 
+/// Makes `block` the session's client prompt, replacing the one before, and
+/// saves it so a loaded session keeps it. The same block again changes nothing.
+fn keepDeveloperInstructions(
+    state: *server.ServerState,
+    session: *server.ActiveSessionState,
+    block: []const u8,
+) !void {
+    if (std.mem.eql(u8, session.client_system_prompt, block)) return;
+    if (session.v2) |v2| {
+        session.session_write_mutex.lockUncancelable(io_mod.getIo());
+        defer session.session_write_mutex.unlock(io_mod.getIo());
+        try v2.setClientPrompt(block);
+    }
+    const copy = try state.alloc.dupe(u8, block);
+    if (session.client_system_prompt.len > 0) state.alloc.free(session.client_system_prompt);
+    session.client_system_prompt = copy;
+}
+
 fn refreshProjectContext(
     state: *server.ServerState,
     alloc: Allocator,
+    skip_workspace_root_rules: bool,
 ) context_contract.ProviderError!void {
     state.context_snapshot.deinit(alloc);
     if (!state.context_enabled) return;
@@ -1132,6 +1162,7 @@ fn refreshProjectContext(
         .workspace_root = state.workspace_root,
         .access_scope = state.workspace_access.scope(state.workspace_root),
         .context_limits = state.context_limits,
+        .skip_workspace_root_rules = skip_workspace_root_rules,
     }) catch |err| {
         debug_trace.logf("context", "acp gather failed err={s}", .{@errorName(err)});
         return err;
@@ -4250,19 +4281,19 @@ test "ACP refreshes typed registry context and propagates enabled gathering erro
     var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
     defer state.deinit();
 
-    try refreshProjectContext(&state, alloc);
+    try refreshProjectContext(&state, alloc, false);
     try std.testing.expectEqual(@as(usize, 1), AcpContextRegistryFixture.gather_calls);
     var contribution = state.context_snapshot.contribution orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("test.acp_context", contribution.provider_id);
     try std.testing.expectEqualStrings("ACP registry context 1", contribution.content);
 
-    try refreshProjectContext(&state, alloc);
+    try refreshProjectContext(&state, alloc, false);
     try std.testing.expectEqual(@as(usize, 2), AcpContextRegistryFixture.gather_calls);
     contribution = state.context_snapshot.contribution orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("ACP registry context 2", contribution.content);
 
     state.context_enabled = false;
-    try refreshProjectContext(&state, alloc);
+    try refreshProjectContext(&state, alloc, false);
     try std.testing.expectEqual(@as(usize, 2), AcpContextRegistryFixture.gather_calls);
     try std.testing.expect(state.context_snapshot.contribution == null);
 
@@ -4270,7 +4301,7 @@ test "ACP refreshes typed registry context and propagates enabled gathering erro
     AcpContextRegistryFixture.gather_error = error.WriteFailed;
     try std.testing.expectError(
         error.WriteFailed,
-        refreshProjectContext(&state, alloc),
+        refreshProjectContext(&state, alloc, false),
     );
     try std.testing.expectEqual(@as(usize, 3), AcpContextRegistryFixture.gather_calls);
     try std.testing.expect(state.context_snapshot.contribution == null);
@@ -4310,7 +4341,7 @@ test "ACP registry callbacks preserve snapshot bytes before transient context" {
 
     var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
     defer state.deinit();
-    try refreshProjectContext(&state, alloc);
+    try refreshProjectContext(&state, alloc, false);
 
     var ctx = AcpContext{
         .alloc = alloc,
