@@ -464,9 +464,9 @@ fn handleRestoreSession(
         v2_store.notice = .{ .context = &notice, .emit = ConversionNotice.emit };
         defer v2_store.notice = null;
         v2 = session_adapter.Session.resumeSession(alloc, v2_store, .{ .id = session_id }, workspace_root, .acp) catch |err|
-            return handleLoadFailure(state, alloc, msg, err);
+            return handleLoadFailure(state, alloc, msg, session_id, err);
         v2_resumed = v2.?.durableState(alloc, workspace_root) catch |err|
-            return handleLoadFailure(state, alloc, msg, err);
+            return handleLoadFailure(state, alloc, msg, session_id, err);
     }
     const durable: *const session_codec.DurableSessionState = &v2_resumed.?.state;
 
@@ -870,6 +870,7 @@ fn handleLoadFailure(
     state: *server.ServerState,
     alloc: Allocator,
     msg: *jsonrpc.Message,
+    session_id: []const u8,
     err: anyerror,
 ) !void {
     debug_trace.logf(
@@ -935,9 +936,33 @@ fn handleLoadFailure(
     {
         return server.writeAuthRequired(state, alloc, msg.id);
     }
+    if (err == error.SessionNotFound) return writeSessionNotFound(state, alloc, msg.id, session_id);
     return state.writer.writeError(alloc, msg.id, .{
         .code = ErrorCode.invalid_params,
         .message = "Session not found",
+    });
+}
+
+/// Answers a request for a session lia does not have as ACP "resource not
+/// found" (-32002) with the session id as `data.uri`, the shape clients such
+/// as OpenBot read as "start a new session with the transcript".
+pub fn writeSessionNotFound(
+    state: *server.ServerState,
+    alloc: Allocator,
+    id: ?jsonrpc.RequestId,
+    session_id: []const u8,
+) !void {
+    const message = try alloc.print("Session not found: {s}", .{session_id});
+    defer alloc.free(message);
+    var data: std.Io.Writer.Allocating = .init(alloc);
+    defer data.deinit();
+    try data.writer.writeAll("{\"uri\":");
+    try std.json.Stringify.value(session_id, .{}, &data.writer);
+    try data.writer.writeByte('}');
+    return state.writer.writeError(alloc, id, .{
+        .code = ErrorCode.resource_not_found,
+        .message = message,
+        .data_json = data.written(),
     });
 }
 
@@ -2398,6 +2423,7 @@ test "ACP load maps one-off child denial to invalid params" {
             &state,
             arena,
             &msg,
+            "one-off",
             error.OneOffSessionNotResumable,
         );
         try std.testing.expect(state.active_session == null);
@@ -3255,7 +3281,7 @@ test "an unknown session asks for sign-in only while a Gateway default still has
         state.cfg.credential_override = case.credential_override;
         state.auth_pending = true;
         var msg = jsonrpc.Message{ .id = .{ .integer = case.id }, .method = "session/load" };
-        try handleLoadFailure(&state, arena, &msg, error.SessionNotFound);
+        try handleLoadFailure(&state, arena, &msg, "missing-id", error.SessionNotFound);
         try std.testing.expectEqual(case.id != 1, state.auth_pending);
     }
     try capture.sync(io_mod.getIo());
@@ -3277,8 +3303,9 @@ test "an unknown session asks for sign-in only while a Gateway default still has
         if (id.integer == 3) {
             try std.testing.expectEqual(@as(i64, ErrorCode.auth_required), err.get("code").?.integer);
         } else {
-            try std.testing.expectEqual(@as(i64, ErrorCode.invalid_params), err.get("code").?.integer);
-            try std.testing.expectEqualStrings("Session not found", err.get("message").?.string);
+            try std.testing.expectEqual(@as(i64, -32002), err.get("code").?.integer);
+            try std.testing.expectEqualStrings("Session not found: missing-id", err.get("message").?.string);
+            try std.testing.expectEqualStrings("missing-id", err.get("data").?.object.get("uri").?.string);
         }
     }
     try std.testing.expectEqual(@as(usize, 3), answers);
