@@ -11,6 +11,11 @@ const session_child_store = @import("../core/session/session_child_store.zig");
 const Allocator = std.mem.Allocator;
 
 pub const max_bytes: usize = 64 * 1024;
+/// The most a developer-instructions block may hold to be kept as the
+/// session's client prompt: a session's log holds a line of 4 MiB at most,
+/// and escaping can double a block's size there. A larger block goes to the
+/// model as user text.
+pub const developer_max_bytes: usize = 1024 * 1024;
 /// The side file a v1 session keeps the prompt in.
 pub const file_name = "system-prompt.txt";
 const block_separator = "\n\n";
@@ -159,9 +164,10 @@ pub fn isDeveloperInstructions(client_prompt: []const u8) bool {
     return std.mem.startsWith(u8, client_prompt, developer_open);
 }
 
-/// Whether `text` can be kept as a session's client prompt.
+/// Whether a developer-instructions block can be kept as a session's client
+/// prompt.
 pub fn storable(text: []const u8) bool {
-    return text.len <= max_bytes and validText(text);
+    return text.len <= developer_max_bytes and validText(text);
 }
 
 /// Joins host instructions with the client prompt for the system slot, after
@@ -267,4 +273,17 @@ test "a leading developer-instructions block splits off the prompt" {
     try std.testing.expect(splitDeveloperInstructions("<openbot_context>x</openbot_context>") == null);
     const only = splitDeveloperInstructions("<openbot-developer-instructions></openbot-developer-instructions>").?;
     try std.testing.expectEqualStrings("", only.rest);
+}
+
+test "a developer block is storable up to its own limit and only as valid text" {
+    const alloc = std.testing.allocator;
+    const big = try alloc.alloc(u8, developer_max_bytes);
+    defer alloc.free(big);
+    @memset(big, 'a');
+    try std.testing.expect(storable(big));
+    const over = try std.mem.concat(alloc, u8, &.{ big, "a" });
+    defer alloc.free(over);
+    try std.testing.expect(!storable(over));
+    try std.testing.expect(!storable("a\x00b"));
+    try std.testing.expect(!storable("\xff"));
 }

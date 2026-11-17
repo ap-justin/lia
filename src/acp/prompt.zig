@@ -805,9 +805,15 @@ pub fn handlePrompt(
             return promptInputFailure(err);
     }
     // OpenBot's developer instructions lead the prompt as a tagged block. They
-    // go to the system slot, not the user's message.
-    const developer_split = client_instructions.splitDeveloperInstructions(prompt_input.text);
-    const prompt_text = if (developer_split) |split| split.rest else prompt_input.text;
+    // go to the system slot, not the user's message. A block that cannot be
+    // kept as session instructions stays in the user text, so it never fails
+    // the prompt.
+    var developer_split = client_instructions.splitDeveloperInstructions(prompt_input.text);
+    if (developer_split) |split| if (!client_instructions.storable(split.block)) {
+        debug_trace.logf("acp", "event=developer_instructions_as_user_text reason=not_storable bytes={d}", .{split.block.len});
+        developer_split = null;
+    };
+    var prompt_text = if (developer_split) |split| split.rest else prompt_input.text;
 
     if (prompt_input.continue_recovery and prompt_text.len != 0) {
         return .{
@@ -829,11 +835,11 @@ pub fn handlePrompt(
     // The prompt's attached files stay out of the instructions: the runtime
     // delivers their folders' rules as a note on the turn's own message.
     if (developer_split) |split| {
-        if (!client_instructions.storable(split.block)) return .{ .rpc_error = .{
-            .code = ErrorCode.invalid_params,
-            .message = "Developer instructions exceed 64 KiB or are not valid text",
-        } };
-        try keepDeveloperInstructions(state, session, split.block);
+        keepDeveloperInstructions(state, session, split.block) catch |err| {
+            debug_trace.logf("acp", "event=developer_instructions_as_user_text reason=save_failed err={s}", .{@errorName(err)});
+            developer_split = null;
+            prompt_text = prompt_input.text;
+        };
     }
     // The block carries the workspace `AGENTS.md`, so lia does not load it too.
     try refreshProjectContext(state, alloc, client_instructions.isDeveloperInstructions(session.client_system_prompt));

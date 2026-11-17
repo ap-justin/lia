@@ -6116,6 +6116,67 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ACP keeps a large developer block as instructions and falls back to user text when it cannot be stored",
+    async () => {
+      const root = createIsolatedRoot("lia-acp-large-developer-");
+      const gateway = startFakeGateway([finalText("large"), finalText("nul"), finalText("huge"), finalText("after")]);
+      const block = (text: string) => `<openbot-developer-instructions>\n${text}\n</openbot-developer-instructions>`;
+      const systemText = (body: string) => acpGatewayRequest(body).prompt
+        .filter((message) => message.role === "system")
+        .map((message) => acpContentText(message.content))
+        .join("\n");
+      const userText = (body: string) => acpGatewayRequest(body).prompt
+        .filter((message) => message.role === "user")
+        .map((message) => acpContentText(message.content))
+        .join("\n");
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        const created = await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 2) as any;
+        const sessionId = created.result.sessionId as string;
+        await client.readLine();
+
+        const large = block(`LARGE_START ${"x".repeat(200 * 1024)} LARGE_END`);
+        const first = await runPrompt(client, `${large}\n\nHello`, TIMEOUT);
+        expect(first.promptResult.error).toBeUndefined();
+        expect(first.promptResult.result.stopReason).toBe("end_turn");
+        expect(systemText(gateway.requests[0]!.body)).toContain(large);
+        expect(userText(gateway.requests[0]!.body)).not.toContain("LARGE_START");
+
+        // A block with a NUL byte cannot be stored: it goes as user text.
+        const nul = block("NUL_RULES \u0000 end");
+        const second = await runPrompt(client, `${nul}\n\nWith NUL`, TIMEOUT);
+        expect(second.promptResult.error).toBeUndefined();
+        expect(second.promptResult.result.stopReason).toBe("end_turn");
+        expect(userText(gateway.requests[1]!.body)).toContain("NUL_RULES");
+        expect(userText(gateway.requests[1]!.body)).toContain("With NUL");
+
+        // So does one over the 1 MiB limit, and a block alone is not an empty prompt.
+        const huge = block(`HUGE_START ${"y".repeat(1100 * 1024)}`);
+        const third = await runPrompt(client, huge, TIMEOUT);
+        expect(third.promptResult.error).toBeUndefined();
+        expect(third.promptResult.result.stopReason).toBe("end_turn");
+        expect(userText(gateway.requests[2]!.body)).toContain("HUGE_START");
+        expect(systemText(gateway.requests[2]!.body)).not.toContain("HUGE_START");
+
+        // The large block stays the session's instructions through all of it, and a restart.
+        await client.close();
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await client.request("initialize", { protocolVersion: 1 }, 10);
+        expect(((await client.request("session/load", { sessionId, cwd: root.workspace, mcpServers: [] }, 11)) as any).error).toBeUndefined();
+        await runPrompt(client, "After load", TIMEOUT);
+        expect(systemText(gateway.requests[3]!.body)).toContain("LARGE_END");
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    LIVE_TIMEOUT,
+  );
+
+  test(
     `ACP session/new cwd selects the session workspace`,
     async () => {
       const root = createIsolatedRoot("lia-acp-session-cwd-");
