@@ -4561,7 +4561,7 @@ fn parseSseUsage(root: std.json.Value) types.Usage {
 /// (BYOK) charges the provider account, not Gateway credits, so its `cost` is
 /// 0 and the spend shows only in `marketCost`, the list price. When `cost` is
 /// missing or 0 and `marketCost` is positive, that is the answer. Null when
-/// neither is a finite non-negative number.
+/// `cost` is not a finite non-negative number and `marketCost` is not positive.
 fn parseSseCost(root: std.json.Value) ?f64 {
     if (root != .object) return null;
     const provider_metadata = root.object.get("providerMetadata") orelse return null;

@@ -1900,7 +1900,9 @@ pub const Usage = struct {
     cache_read_tokens: ?u64 = null,
     cache_write_tokens: ?u64 = null,
     reasoning_tokens: ?u64 = null,
-    /// What the gateway charged for the request, in US dollars, when it says.
+    /// What the gateway charged for the request, in US dollars, when it says;
+    /// the market price instead when it charged 0 (a request on the team's own
+    /// provider key).
     cost_usd: ?f64 = null,
 
     /// Adds each count `other` reports, saturating at the maximum. A count
