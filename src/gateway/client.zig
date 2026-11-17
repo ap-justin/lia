@@ -4556,23 +4556,32 @@ fn parseSseUsage(root: std.json.Value) types.Usage {
     };
 }
 
-/// The finish event's `providerMetadata.gateway.cost`: what the Gateway
-/// charged for the request in US dollars, a decimal string such as "0.0001".
-/// Null when absent or not a finite non-negative number.
+/// The finish event's cost in US dollars: `providerMetadata.gateway.cost`, a
+/// decimal string such as "0.0001". A request on the team's own provider key
+/// (BYOK) charges the provider account, not Gateway credits, so its `cost` is
+/// 0 and the spend shows only in `marketCost`, the list price. When `cost` is
+/// missing or 0 and `marketCost` is positive, that is the answer. Null when
+/// neither is a finite non-negative number.
 fn parseSseCost(root: std.json.Value) ?f64 {
     if (root != .object) return null;
     const provider_metadata = root.object.get("providerMetadata") orelse return null;
     if (provider_metadata != .object) return null;
     const gateway = provider_metadata.object.get("gateway") orelse return null;
     if (gateway != .object) return null;
-    const cost = gateway.object.get("cost") orelse return null;
-    const value: f64 = switch (cost) {
+    const charged = parseDollars(gateway.object.get("cost"));
+    if (charged) |amount| if (amount > 0) return amount;
+    if (parseDollars(gateway.object.get("marketCost"))) |market| if (market > 0) return market;
+    return charged;
+}
+
+fn parseDollars(value: ?std.json.Value) ?f64 {
+    const amount: f64 = switch (value orelse return null) {
         .string => |text| std.fmt.parseFloat(f64, text) catch return null,
         .float => |number| number,
         .integer => |number| @floatFromInt(number),
         else => return null,
     };
-    return if (std.math.isFinite(value) and value >= 0) value else null;
+    return if (std.math.isFinite(amount) and amount >= 0) amount else null;
 }
 
 fn parseSseTokenDetail(usage_value: std.json.Value, section: []const u8, key: []const u8) ?u64 {
@@ -12236,6 +12245,10 @@ test "a Gateway finish event carries the request's cost in dollars" {
         .{ .json = "{\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"},\"providerMetadata\":{\"gateway\":{\"cost\":\"-1\"}}}", .cost = null },
         .{ .json = "{\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"},\"providerMetadata\":{\"gateway\":{\"cost\":\"free\"}}}", .cost = null },
         .{ .json = "{\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"}}", .cost = null },
+        .{ .json = "{\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"},\"providerMetadata\":{\"gateway\":{\"cost\":\"0\",\"marketCost\":\"0.000064\"}}}", .cost = 0.000064 },
+        .{ .json = "{\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"},\"providerMetadata\":{\"gateway\":{\"cost\":\"0.0125\",\"marketCost\":\"0.02\"}}}", .cost = 0.0125 },
+        .{ .json = "{\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"},\"providerMetadata\":{\"gateway\":{\"cost\":\"0\"}}}", .cost = 0 },
+        .{ .json = "{\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"},\"providerMetadata\":{\"gateway\":{\"marketCost\":0.5}}}", .cost = 0.5 },
     };
     for (cases) |case| {
         const parsed = try std.json.parseFromSlice(std.json.Value, alloc, case.json, .{});

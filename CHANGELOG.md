@@ -14,7 +14,7 @@ Merges fx 0.0.17.
 - `lia sessions --live` lists the sessions a lia process has open, with their subagents. `lia session <id>/<agent>` reads a subagent's conversation and `--tail <n>` shows only the last turns.
 - Mistyped commands, flags and settings suggest the closest match, and every command accepts `--flag=value`.
 - ACP: `initialize` answers `_meta.steering.supported: true`, and `_session/steering` with `{sessionId, prompt}` adds text to the running turn like `_meta.lia.steer`. It answers `{"outcome": "promptRequired"}` when no turn is running.
-- ACP: `usage_update` goes out after every model call, with `cost: {amount, currency: "USD"}` as the session's running total when the Gateway reports a cost. `PromptResponse.usage` holds the session's running totals, and its cache fields are now `cachedReadTokens` and `cachedWriteTokens`.
+- ACP: `usage_update` goes out after every model call, with `cost: {amount, currency: "USD"}` as the session's running total when the Gateway reports a cost: its charge, or the market price for a request on your own provider key (BYOK), which the Gateway charges 0. `PromptResponse.usage` holds the session's running totals, and its cache fields are now `cachedReadTokens` and `cachedWriteTokens`.
 - ACP: a prompt that starts with an `<openbot-developer-instructions>` block sends it as system instructions, a new block replaces the old one, and the workspace-root `AGENTS.md` is not read for that session.
 
 ### Fixes
