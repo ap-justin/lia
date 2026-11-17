@@ -810,7 +810,8 @@ pub fn handlePrompt(
     // the prompt.
     var developer_split = client_instructions.splitDeveloperInstructions(prompt_input.text);
     if (developer_split) |split| if (!client_instructions.storable(split.block)) {
-        debug_trace.logf("acp", "event=developer_instructions_as_user_text reason=not_storable bytes={d}", .{split.block.len});
+        const reason = if (split.block.len > client_instructions.developer_max_bytes) "too_large" else "invalid_text";
+        debug_trace.logf("acp", "event=developer_instructions_as_user_text reason={s} bytes={d}", .{ reason, split.block.len });
         developer_split = null;
     };
     var prompt_text = if (developer_split) |split| split.rest else prompt_input.text;
@@ -837,7 +838,6 @@ pub fn handlePrompt(
     if (developer_split) |split| {
         keepDeveloperInstructions(state, session, split.block) catch |err| {
             debug_trace.logf("acp", "event=developer_instructions_as_user_text reason=save_failed err={s}", .{@errorName(err)});
-            developer_split = null;
             prompt_text = prompt_input.text;
         };
     }

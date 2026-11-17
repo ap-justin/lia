@@ -12,9 +12,10 @@ const Allocator = std.mem.Allocator;
 
 pub const max_bytes: usize = 64 * 1024;
 /// The most a developer-instructions block may hold to be kept as the
-/// session's client prompt: a session's log holds a line of 4 MiB at most,
-/// and escaping can double a block's size there. A larger block goes to the
-/// model as user text.
+/// session's client prompt; a larger block goes to the model as user text.
+/// The session log takes a value of `max_value_bytes` at most
+/// (`core/session_manager/api.zig`) and JSON escapes a control byte as six,
+/// so a block under this limit can still fail to save and go as user text.
 pub const developer_max_bytes: usize = 1024 * 1024;
 /// The side file a v1 session keeps the prompt in.
 pub const file_name = "system-prompt.txt";
