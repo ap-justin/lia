@@ -1,0 +1,131 @@
+<template>
+  <style>
+    #root {
+      position: absolute;
+      inset: 0;
+      font-family: "JetBrains Mono", monospace;
+    }
+    #acp-svg {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+    }
+    .acp-pkt {
+      opacity: 0;
+    }
+  </style>
+  <div id="root" data-composition-id="acp" data-width="1920" data-height="1080">
+    <svg id="acp-svg" viewBox="0 0 1920 1080">
+      <g id="acp-scene" fill="none" stroke-linecap="round" stroke-linejoin="round">
+        <!-- wires -->
+        <path class="acp-wire" d="M380 270 H700" stroke="#2a3340" stroke-width="4" pathLength="1" />
+        <path class="acp-wire" d="M380 540 H700" stroke="#2a3340" stroke-width="4" pathLength="1" />
+        <path class="acp-wire" d="M380 810 H700" stroke="#2a3340" stroke-width="4" pathLength="1" />
+        <path class="acp-wire" id="acp-bus" d="M700 270 V810" stroke="#7ee2b8" stroke-width="7" pathLength="1" />
+        <path class="acp-wire" d="M700 540 H1000" stroke="#7ee2b8" stroke-width="7" pathLength="1" />
+        <path class="acp-wire" d="M1240 540 H1510" stroke="#2a3340" stroke-width="4" pathLength="1" />
+
+        <!-- editor window -->
+        <g id="acp-c1" stroke="#e6edf3" stroke-width="4">
+          <rect x="220" y="210" width="160" height="120" rx="12" fill="#0d1117" />
+          <path d="M220 240 H380" />
+          <circle cx="238" cy="225" r="3" fill="#e6edf3" />
+          <circle cx="252" cy="225" r="3" fill="#e6edf3" />
+          <path d="M240 266 H300 M256 286 H336 M240 306 H284" stroke="#7d8a94" />
+        </g>
+        <!-- chat -->
+        <g id="acp-c2" stroke="#e6edf3" stroke-width="4">
+          <path d="M244 485 H356 Q380 485 380 509 V571 Q380 595 356 595 H290 L252 625 V595 H244 Q220 595 220 571 V509 Q220 485 244 485 Z" fill="#0d1117" />
+          <circle cx="270" cy="540" r="6" fill="#e6edf3" />
+          <circle cx="300" cy="540" r="6" fill="#e6edf3" />
+          <circle cx="330" cy="540" r="6" fill="#e6edf3" />
+        </g>
+        <!-- pipeline -->
+        <g id="acp-c3" stroke="#e6edf3" stroke-width="4">
+          <rect x="220" y="750" width="160" height="120" rx="12" fill="#0d1117" />
+          <path d="M262 810 H298 M302 810 H338" stroke="#7d8a94" />
+          <circle cx="252" cy="810" r="14" fill="#0d1117" />
+          <circle cx="300" cy="810" r="14" fill="#0d1117" />
+          <circle cx="348" cy="810" r="14" fill="#7ee2b8" stroke="#7ee2b8" />
+        </g>
+
+        <!-- lia -->
+        <g id="acp-lia">
+          <rect x="1000" y="450" width="240" height="180" rx="18" fill="#7ee2b8" stroke="none" />
+          <text x="1120" y="567" text-anchor="middle" font-size="96" font-weight="700" letter-spacing="-5" fill="#0d1117" stroke="none">lia</text>
+        </g>
+
+        <!-- model -->
+        <g id="acp-model" stroke="#e6edf3" stroke-width="4">
+          <circle cx="1600" cy="540" r="90" fill="#0d1117" />
+          <path d="M1600 540 L1655 540 M1600 540 L1617 592 M1600 540 L1556 572 M1600 540 L1556 508 M1600 540 L1617 488" stroke="#7d8a94" />
+          <circle cx="1600" cy="540" r="16" fill="#e6edf3" />
+          <circle cx="1655" cy="540" r="8" fill="#e6edf3" />
+          <circle cx="1617" cy="592" r="8" fill="#e6edf3" />
+          <circle cx="1556" cy="572" r="8" fill="#e6edf3" />
+          <circle cx="1556" cy="508" r="8" fill="#e6edf3" />
+          <circle cx="1617" cy="488" r="8" fill="#e6edf3" />
+        </g>
+
+        <text id="acp-label" x="700" y="205" text-anchor="middle" font-size="52" font-weight="700" fill="#7ee2b8" stroke="none">ACP</text>
+        <g id="acp-packets" stroke="none"></g>
+      </g>
+    </svg>
+  </div>
+  <script>
+    const tl = gsap.timeline({ paused: true });
+    const SPEED = 1200;
+    const ys = [270, 540, 810];
+    const toModel = (y) => [[380, y], [700, y], [700, 540], [1000, 540], [1240, 540], [1500, 540]];
+
+    const packets = document.querySelector("#acp-packets");
+    const makePacket = (id, r, fill) => {
+      const c = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+      c.setAttribute("id", id);
+      c.setAttribute("class", "acp-pkt");
+      c.setAttribute("r", r);
+      c.setAttribute("cx", 380);
+      c.setAttribute("cy", 540);
+      c.setAttribute("fill", fill);
+      packets.appendChild(c);
+      return c;
+    };
+    const travel = (el, pts, t0) => {
+      let t = t0;
+      tl.set(el, { opacity: 1 }, t0);
+      for (let i = 0; i < pts.length - 1; i++) {
+        const [x0, y0] = pts[i];
+        const [x1, y1] = pts[i + 1];
+        const d = Math.hypot(x1 - x0, y1 - y0) / SPEED;
+        if (d > 0) {
+          tl.fromTo(el, { attr: { cx: x0, cy: y0 } }, { attr: { cx: x1, cy: y1 }, duration: d, ease: "none", immediateRender: false }, t);
+        }
+        t += d;
+      }
+      tl.set(el, { opacity: 0 }, t);
+      return t;
+    };
+
+    tl.fromTo("#acp-c1, #acp-c2, #acp-c3", { opacity: 0, x: -30 }, { opacity: 1, x: 0, duration: 0.6, ease: "power3.out", stagger: 0.12 }, 0.1);
+    tl.fromTo(".acp-wire", { strokeDasharray: 1, strokeDashoffset: 1 }, { strokeDashoffset: 0, duration: 0.5, ease: "power2.out", stagger: 0.07 }, 0.3);
+    tl.fromTo("#acp-lia", { opacity: 0, scale: 0.9, svgOrigin: "1120 540" }, { opacity: 1, scale: 1, svgOrigin: "1120 540", duration: 0.5, ease: "power3.out" }, 0.3);
+    tl.fromTo("#acp-model", { opacity: 0 }, { opacity: 1, duration: 0.5 }, 0.5);
+    tl.fromTo("#acp-label", { opacity: 0 }, { opacity: 1, duration: 0.5 }, 0.7);
+
+    ys.forEach((y, i) => {
+      const start = 0.9 + i * 0.7;
+      const out = makePacket("acp-p" + i, 17, "#7ee2b8");
+      const arrive = travel(out, toModel(y), start);
+      const atLia = start + (320 + Math.abs(y - 540) + 300) / SPEED;
+      tl.fromTo("#acp-lia", { scale: 1, svgOrigin: "1120 540" }, { scale: 1.06, svgOrigin: "1120 540", duration: 0.12, yoyo: true, repeat: 1, ease: "power1.out", immediateRender: false }, atLia);
+      for (let j = 0; j < 3; j++) {
+        const back = makePacket("acp-r" + i + "-" + j, 11, "#e6edf3");
+        travel(back, toModel(y).slice().reverse(), arrive + 0.05 + j * 0.12);
+      }
+    });
+
+    tl.to("#acp-scene", { opacity: 0, duration: 0.4, ease: "power2.in" }, 5.6);
+    window.__timelines["acp"] = tl;
+  </script>
+</template>

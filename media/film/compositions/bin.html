@@ -1,0 +1,71 @@
+<template>
+  <style>
+    #root {
+      position: absolute;
+      inset: 0;
+      font-family: "JetBrains Mono", monospace;
+    }
+    #bin-svg {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+    }
+  </style>
+  <div id="root" data-composition-id="bin" data-width="1920" data-height="1080">
+    <svg id="bin-svg" viewBox="0 0 1920 1080">
+      <g id="bin-scene">
+        <g id="bin-tiles"></g>
+        <rect id="bin-block" x="720" y="340" width="480" height="240" rx="18" fill="#7ee2b8" opacity="0" />
+        <text
+          id="bin-word"
+          x="960"
+          y="505"
+          text-anchor="middle"
+          font-size="170"
+          font-weight="700"
+          letter-spacing="-8"
+          fill="#0d1117"
+          opacity="0"
+        >lia</text>
+        <text id="bin-label" x="960" y="720" text-anchor="middle" font-size="44" fill="#e6edf3" opacity="0">one binary</text>
+      </g>
+    </svg>
+  </div>
+  <script>
+    const tl = gsap.timeline({ paused: true });
+    const tiles = document.querySelector("#bin-tiles");
+    for (let i = 0; i < 18; i++) {
+      const col = i % 6;
+      const row = Math.floor(i / 6);
+      const r = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+      r.setAttribute("class", "bin-tile");
+      r.setAttribute("x", 720 + col * 80 + 2);
+      r.setAttribute("y", 340 + row * 80 + 2);
+      r.setAttribute("width", 76);
+      r.setAttribute("height", 76);
+      r.setAttribute("rx", 8);
+      r.setAttribute("fill", "#7ee2b8");
+      tiles.appendChild(r);
+    }
+    const tileOffsets = [];
+    for (let i = 0; i < 18; i++) {
+      tileOffsets.push({ x: (((i * 7) % 11) - 5) * 150, y: (((i * 5) % 9) - 4) * 110 });
+    }
+    gsap.utils.toArray(".bin-tile").forEach((el, i) => {
+      tl.fromTo(
+        el,
+        { x: tileOffsets[i].x, y: tileOffsets[i].y, opacity: 0.55, rotation: (i % 5) * 18 - 36, svgOrigin: "960 460" },
+        { x: 0, y: 0, opacity: 1, rotation: 0, duration: 1.1, ease: "power3.out", immediateRender: true },
+        0.15 + i * 0.05,
+      );
+    });
+    tl.fromTo("#bin-block", { opacity: 0 }, { opacity: 1, duration: 0.3 }, 2.0);
+    tl.to(".bin-tile", { opacity: 0, duration: 0.01 }, 2.35);
+    tl.fromTo("#bin-block", { scale: 1.04, svgOrigin: "960 460" }, { scale: 1, svgOrigin: "960 460", duration: 0.5, ease: "power2.out" }, 2.0);
+    tl.fromTo("#bin-word", { opacity: 0, y: 12 }, { opacity: 1, y: 0, duration: 0.5, ease: "power3.out" }, 2.3);
+    tl.fromTo("#bin-label", { opacity: 0, y: 12 }, { opacity: 1, y: 0, duration: 0.5, ease: "power3.out" }, 2.7);
+    tl.to("#bin-scene", { opacity: 0, duration: 0.4, ease: "power2.in" }, 3.6);
+    window.__timelines["bin"] = tl;
+  </script>
+</template>

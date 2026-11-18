@@ -15,42 +15,43 @@
       justify-content: center;
     }
     #close-mark {
-      font-size: 120px;
+      display: flex;
+      align-items: flex-end;
+      font-size: 240px;
       font-weight: 700;
       line-height: 1;
       letter-spacing: -0.04em;
     }
-    #close-facts {
-      margin-top: 56px;
-      font-size: 44px;
-      color: #e6edf3;
+    #close-cursor {
+      width: 0.5em;
+      height: 0.12em;
+      margin: 0 0 0.06em 0.12em;
+      background: #7ee2b8;
     }
     #close-url {
-      margin-top: 28px;
-      font-size: 56px;
+      margin-top: 64px;
+      font-size: 60px;
       font-weight: 700;
       color: #7ee2b8;
     }
     #close-credit {
-      margin-top: 120px;
-      font-size: 28px;
+      margin-top: 110px;
+      font-size: 30px;
       color: #7d8a94;
     }
   </style>
   <div id="root" data-composition-id="close" data-width="1920" data-height="1080">
     <div id="close-wrap">
-      <p id="close-mark">lia</p>
-      <p id="close-facts">Linux · x86_64 + arm64 · Apache-2.0</p>
+      <div id="close-mark">lia<span id="close-cursor"></span></div>
       <p id="close-url">github.com/ap-justin/lia</p>
       <p id="close-credit">Based on fx by Vercel Labs.</p>
     </div>
   </div>
   <script>
     const tl = gsap.timeline({ paused: true });
-    tl.fromTo("#close-mark", { opacity: 0, y: 20 }, { opacity: 1, y: 0, duration: 0.6, ease: "power3.out" }, 0.2);
-    tl.fromTo("#close-facts", { opacity: 0, y: 20 }, { opacity: 1, y: 0, duration: 0.6, ease: "power3.out" }, 0.7);
-    tl.fromTo("#close-url", { opacity: 0, y: 20 }, { opacity: 1, y: 0, duration: 0.6, ease: "power3.out" }, 1.2);
-    tl.fromTo("#close-credit", { opacity: 0 }, { opacity: 1, duration: 0.6, ease: "power2.out" }, 1.4);
+    tl.fromTo("#close-mark", { opacity: 0, y: 20 }, { opacity: 1, y: 0, duration: 0.6, ease: "power3.out" }, 0.1);
+    tl.fromTo("#close-url", { opacity: 0, y: 20 }, { opacity: 1, y: 0, duration: 0.6, ease: "power3.out" }, 0.6);
+    tl.fromTo("#close-credit", { opacity: 0 }, { opacity: 1, duration: 0.6, ease: "power2.out" }, 1.1);
     window.__timelines["close"] = tl;
   </script>
 </template>
