@@ -1,0 +1,51 @@
+<template>
+  <style>
+    #root {
+      position: absolute;
+      inset: 0;
+      font-family: "JetBrains Mono", monospace;
+      color: #e6edf3;
+    }
+    #open-wrap {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+    }
+    #open-mark {
+      display: flex;
+      align-items: flex-end;
+      font-size: 260px;
+      font-weight: 700;
+      line-height: 1;
+      letter-spacing: -0.04em;
+    }
+    #open-cursor {
+      width: 0.5em;
+      height: 0.12em;
+      margin: 0 0 0.06em 0.12em;
+      background: #7ee2b8;
+    }
+    #open-tag {
+      margin-top: 56px;
+      font-size: 48px;
+      color: #e6edf3;
+    }
+  </style>
+  <div id="root" data-composition-id="open" data-width="1920" data-height="1080">
+    <div id="open-wrap">
+      <div id="open-mark">lia<span id="open-cursor"></span></div>
+      <p id="open-tag">A native coding agent, headless behind ACP clients.</p>
+    </div>
+  </div>
+  <script>
+    const tl = gsap.timeline({ paused: true });
+    tl.fromTo("#open-cursor", { opacity: 0 }, { opacity: 1, duration: 0.01 }, 0.9);
+    tl.to("#open-cursor", { opacity: 0, duration: 0.01, repeat: 5, repeatDelay: 0.5, yoyo: true }, 1.6);
+    tl.fromTo("#open-tag", { opacity: 0, y: 20 }, { opacity: 1, y: 0, duration: 0.7, ease: "power3.out" }, 1.8);
+    tl.to("#open-wrap", { opacity: 0, duration: 0.4, ease: "power2.in" }, 4.5);
+    window.__timelines["open"] = tl;
+  </script>
+</template>
