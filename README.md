@@ -1,4 +1,10 @@
-# lia
+<h1 align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/brand/lia-lockup-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="docs/brand/lia-lockup-light.svg">
+    <img src="docs/brand/lia-lockup-light.svg" alt="lia" width="280">
+  </picture>
+</h1>
 
 lia is a native coding agent that runs headless behind an [Agent Client Protocol](https://agentclientprotocol.com) (ACP) client. It's one binary written in Zig, with no runtime to install.
 
