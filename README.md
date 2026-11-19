@@ -2,6 +2,12 @@
 
 lia is a native coding agent that runs headless behind an [Agent Client Protocol](https://agentclientprotocol.com) (ACP) client. It's one binary written in Zig, with no runtime to install.
 
+<p align="center">
+  <a href="https://marketing-justin.fly.storage.tigris.dev/lia/film/lia-30s.mp4"><img src="https://marketing-justin.fly.storage.tigris.dev/lia/film/lia-30s-poster.png" alt="lia, built for bots: watch the 30-second film" width="720"></a>
+  <br>
+  <sub><a href="https://marketing-justin.fly.storage.tigris.dev/lia/film/lia-30s.mp4">Watch the 30-second film</a></sub>
+</p>
+
 ## Install
 
 lia ships Linux builds for x86_64 and arm64 on [GitHub Releases](https://github.com/ap-justin/lia/releases), each with a SHA-256 checksum file. Until the first release is out, build it from source (see [Contributing](#contributing)).
