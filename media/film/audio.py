@@ -1,9 +1,10 @@
 """Synthesized score and effects for the 30 s film: 120 BPM, 48 kHz stereo, music + sfx buses, reverb send.
 
 usage: python audio.py [WORK_DIR]   -> WORK_DIR/score.wav and score.mp3 (MP3 is what the player embeds)
+needs WORK_DIR/events.json from export_events.py, so message pulses and arrivals sit on the scenes' own times
 Every effect sits on a visual time from scenes.js; the cause is named beside it.
 """
-import pathlib, subprocess, sys
+import json, pathlib, subprocess, sys
 import numpy as np
 from scipy.io import wavfile
 from scipy.signal import butter, sosfilt, fftconvolve
@@ -136,119 +137,121 @@ def scribble(d, amp=1.0):
 def beats(a, b): return np.arange(a, b, BEAT)
 
 
-LAND = [4.35 + 0.5 * k for k in range(6)]          # crate k thuds into the pile (scenes.js land_t)
-CHIP = [21.0 + 0.5 * k for k in range(6)]          # crate k shrinks into a chip (scenes.js chip_t)
-DROP = 19.5                                         # the lia block clicks into the socket
+ev = json.loads((WORK / 'events.json').read_text())
+strain = np.interp(np.arange(N) / SR, np.arange(601) / 20, ev['strain'])
+cover = np.interp(np.arange(N) / SR, np.arange(601) / 20, ev['coverage'])
+COLLAPSE = ev['collapse']                  # [agent0, hero, agent2, agent3, agent4]
+HERO_T = COLLAPSE[1]                       # 17.5: the hero halo becomes a thin ring
+DROP = 21.0                                # the cascade starts on the beat; drums enter
+PENTA = [69, 72, 74, 76, 79, 81, 84, 86, 88]
 
-AM = [45, 52, 57, 60]; F = [41, 48, 53, 57]; DM = [38, 45, 50, 53]; C = [48, 52, 55, 60]; G = [43, 50, 55, 59]; CM9 = [48, 55, 59, 62, 64, 71]
-# pads: light and open at the start, closed and low while the server fills, bright after the click
+
+def pan_of(x): return float(np.clip((x - 960) / 960 * 0.7, -0.7, 0.7))
+
+
+AM = [45, 52, 57, 60]; DM = [38, 45, 50, 53]; C = [48, 52, 55, 60]; G = [43, 50, 55, 59]; F = [41, 48, 53, 57]; CM9 = [48, 55, 59, 62, 64, 71]
+# pads: light at the start, low and closed while the field fills, resolved and bright after the release
 for a, b, notes, amp, cut in [
-    (0, 4, AM, 0.50, 1200), (4, 8, AM, 0.30, 500), (8, 11, DM, 0.55, 600), (11, 12, [38, 45, 50, 53, 56], 0.30, 600),
-    (12, 16, [45, 52, 57, 60, 64], 0.2, 900), (16, DROP, [45, 52, 57, 60], 0.2, 1200),
-    (DROP, 21, C, 0.17, 4200), (21, 22.5, G, 0.17, 4200), (22.5, 24, [45, 52, 57, 60, 64], 0.17, 4200), (24, 25.5, F, 0.17, 4200), (25.5, 26.5, C, 0.16, 4200),
+    (0, 4, AM, 0.50, 1200), (4, 11, DM, 0.38, 600), (11, HERO_T, [45, 52, 57, 60, 64], 0.30, 900),
+    (HERO_T, DROP, C, 0.30, 2200), (DROP, 22.5, C, 0.17, 4200), (22.5, 24, G, 0.17, 4200), (24, 25.5, [45, 52, 57, 60, 64], 0.17, 4200), (25.5, 26.5, F, 0.16, 4200),
 ]:
     put(music, a, pad([m2f(n) for n in notes], b - a, 1.0, cut), 0, amp, rev=0.25)
 put(music, 26.5, pad([m2f(n) for n in CM9], 3.0, 1.0, 5200, attack=0.3, release=0.8), 0, 0.2, rev=0.45)   # held final chord
-# low drag under the problem: a long sub note every two beats, rumble that swells with the gauge
-for t0 in beats(4.0, DROP)[::2]:
-    put(music, t0, bass(m2f(33 if t0 < 11 else 31), 1.4, 1.0), 0, 0.26 if t0 < 12 else 0.2)
-rum = filt(rng.standard_normal(int(7.0 * SR)), 'low', 160) * np.linspace(0.05, 0.5, int(7.0 * SR)) ** 1.5
-put(music, 4.0, rum, 0, 0.22)
 
-# outset: soft plucks on the beat (the bots at work)
+# a low drone swells with how full the field is; a strained, flickering tone rides the red outline
+t_all = np.arange(N) / SR
+drone = sum(2 * ((f * t_all) % 1) - 1 for f in (55.0, 55.4, 82.4, 110.3))
+drone = filt(drone, 'low', 420) / 4 * (0.04 + 0.9 * np.clip(cover, 0, 1.3) ** 1.5) * (t_all > 3.9)
+drone *= np.clip((21.5 - t_all) / 1.0, 0, 1)
+music += np.stack([drone, drone], 1) * 0.45
+flick = 0.55 + 0.45 * (np.sin(2 * np.pi * 4 * t_all) > 0)
+strained = sum(2 * ((f * t_all) % 1) - 1 for f in (466.2, 440.0, 659.3, 698.5)) / 4
+strained = filt(strained, 'low', 2600) * strain ** 1.6 * flick * 0.16
+music += np.stack([strained, strained * 0.9], 1)
+
+# outset: soft plucks on the beat while the agents settle and talk
 for i, t0 in enumerate(beats(0.5, 4.0)):
-    put(music, t0, pluck(m2f([69, 76, 72, 76][i % 4]), 1.0, 0.5), (-0.3, 0.3)[i % 2], 0.17, rev=0.2)
-# problem: a heartbeat kick that tightens, ticking hats from the red zone
-for t0 in beats(4.0, 12.0):
-    put(sfx, t0, kick(1.0), 0, 0.25 + 0.35 * prog_s(t0, 4, 10))
-for t0 in beats(8.0, 12.0):
-    put(music, t0 + BEAT / 2, hat(1.0), 0.3, 0.10)
-# inside the crate: sparse bell notes as each unused part appears
-for k, t0 in enumerate((12.5, 13.0, 13.5, 14.0, 14.5)):
-    put(music, t0, chime(m2f((69, 72, 76, 74, 71)[k]), 1.0, 1.6), (-0.4, -0.2, 0, 0.2, 0.4)[k], 0.09, rev=0.5)
-# build into the click: hats on 16ths from the parts falling away
-for t0 in np.arange(16.0, DROP, BEAT / 4):
-    put(music, t0, hat(1.0), 0.2, 0.04 + 0.12 * prog_s(t0, 16, DROP))
+    put(music, t0, pluck(m2f([69, 76, 72, 76][i % 4]), 1.0, 0.5), (-0.3, 0.3)[i % 2], 0.15, rev=0.2)
+# problem: a heartbeat kick that tightens as the field fills (on the sfx bus, so the duck does not eat it)
+for t0 in beats(4.0, 11.0):
+    put(sfx, t0, kick(1.0), 0, 0.18 + 0.30 * prog_s(t0, 4, 10))
+# inside the halo: bell tones as each layer lights up
+for k in range(5):
+    put(music, 12.5 + 0.5 * k, chime(m2f(PENTA[k] - 12), 1.0, 1.6), (-0.4, -0.2, 0, 0.2, 0.4)[k], 0.10, rev=0.5)
+# the release at 17.5 and a build into the cascade
+for t0 in np.arange(18.5, DROP, BEAT / 4):
+    put(music, t0, hat(1.0), 0.2, 0.04 + 0.12 * prog_s(t0, 18.5, DROP))
 
-# the release: kick on every beat, offbeat hat, clap on 2 and 4, bass, bright arpeggio
-BASS = [(19.5, 36), (21.0, 43), (22.5, 33), (24.0, 41), (25.5, 36)]
-ends = [21.0, 22.5, 24.0, 25.5, 26.5]
+# cascade onward: kick on every beat, offbeat hat, clap on 2 and 4, bass, bright arpeggio
+BASS = [(21.0, 36), (22.5, 43), (24.0, 33), (25.5, 41)]
+ends = [22.5, 24.0, 25.5, 26.5]
 for (a, root), b in zip(BASS, ends):
     for t0 in beats(a, b):
         put(music, t0, bass(m2f(root + (0, 12, 7, 12)[int((t0 - a) / BEAT) % 4]), 0.45, 1.0), 0, 0.30)
 kick_times = list(beats(DROP, 26.0))
 for t0 in kick_times:
     put(sfx, t0, kick(1.0), 0, 0.55); put(music, t0 + BEAT / 2, hat(1.0), 0.25, 0.12)
-for t0 in beats(20.0, 26.0)[::2]:
+for t0 in beats(22.0, 26.0)[::2]:
     put(music, t0, clap(1.0), 0, 0.28, rev=0.25)
-ARP = [(19.5, 21.0, C), (21.0, 22.5, G), (22.5, 24.0, [57, 60, 64, 67]), (24.0, 25.5, F), (25.5, 26.5, C)]
+ARP = [(21.0, 22.5, C), (22.5, 24.0, G), (24.0, 25.5, [57, 60, 64, 67]), (25.5, 26.5, F)]
 for a, b, notes in ARP:
     for k, t0 in enumerate(np.arange(a, b, BEAT / 2)):
         n = notes[[1, 2, 3, 2, 1, 3, 2, 0][k % 8] % len(notes)] + 12
-        put(music, t0, pluck(m2f(n), 1.0, 0.35), (-0.4, 0.4)[k % 2], 0.10, rev=0.25)
+        put(music, t0, pluck(m2f(n), 1.0, 0.35), (-0.4, 0.4)[k % 2], 0.09, rev=0.25)
 for t0, n in ((26.5, 72), (27.5, 76), (28.0, 79), (28.5, 83)):                       # drums stop; shimmer on the brand beats
     put(music, t0, chime(m2f(n), 1.0, 2.2), 0, 0.10, rev=0.6)
 
 # ---- effects, each at the exact visual time ----
-# outset: bots arrive through the door (hop-walk) at 1.0, 2.0, 3.0
-for t0 in (1.0, 2.0, 3.0):
-    for k in range(4):
-        put(sfx, t0 + 0.12 + 0.28 * k, tick(1100, 1.0), -0.7 + 0.1 * k, 0.35)
-    put(sfx, t0 + 1.2, blip(m2f(81), 1.0, 0.2), -0.2, 0.10, rev=0.3)
-# problem: each crate thuds into the pile and the gauge steps up
-for k, t0 in enumerate(LAND):
-    put(sfx, t0 - 0.35, sweep(0.35, 2400, 500, 0.12, q=0.5, rising=False), -0.2, 1.0)    # the crate drops in
-    put(sfx, t0, impact(1.0), -0.5 + 0.2 * k * 0.5, 0.42)
-    put(sfx, t0, filt(rng.standard_normal(int(0.4 * SR)), 'low', 1200) * np.exp(-tt(0.4) * 9), -0.3, 0.5)   # dust
-    put(sfx, t0 + 0.1, glide(m2f(52 + 2 * k), m2f(50 + 2 * k), 0.4, 1.0), 0.8, 0.10 + 0.01 * k)             # gauge steps up
-    put(sfx, t0 + 0.05, tick(500, 1.0), 0.4, 0.5)                                                           # rope pulls tight
-# quake and the red zone: rumble, then an alarm on each beat
-put(sfx, 7.5, filt(rng.standard_normal(int(1.0 * SR)), 'low', 220) * np.sin(np.pi * tt(1.0)), 0, 1.0)
-for t0 in beats(8.0, 11.0):
-    put(sfx, t0, blip(m2f(81), 1.0, 0.14), 0.7, 0.26); put(sfx, t0, blip(m2f(74), 1.0, 0.14), 0.7, 0.2)
-# a new bot walks up, hits the pile at 10.0 and the "no entry" sign lights
-for k in range(3):
-    put(sfx, 9.2 + 0.28 * k, tick(1000, 1.0), -0.8, 0.35)
-put(sfx, 10.0, impact(0.9), -0.7, 0.6); put(sfx, 10.0, crack(0.7), -0.5, 0.3)
-put(sfx, 10.0, glide(220, 180, 0.35, 1.0), 0, 0.14)                                    # buzzer on the sign
-put(sfx, 10.1, glide(220, 180, 0.35, 1.0), 0, 0.14)
-put(sfx, 10.7, glide(m2f(64), m2f(52), 0.7, 1.0), -0.6, 0.12, rev=0.3)                 # the bot sags
-# camera dives into one heavy crate; the doors open at 12.0
-put(sfx, 11.0, sweep(1.0, 200, 5000, 0.35, q=0.5), 0, 1.0)
-put(sfx, 11.95, impact(0.9), 0, 0.55); put(sfx, 11.95, sweep(0.5, 3000, 400, 0.22, q=0.5, rising=False), 0, 1.0)
-put(sfx, 12.0, chime(m2f(88), 1.0, 2.0), 0, 0.14, rev=0.6)
-# parts pop at 12.5-14.5 and are crossed out half a second later
+# every message: a soft pulse as it leaves (pitched by who sends it); the heavy ones land with a low tock that grows with the load
+for m in ev['msgs']:
+    t0, d, ph = m['t0'], m['d'], m['phase']
+    note = PENTA[(m['a'] * 2 + m['b']) % len(PENTA)]
+    if ph == 'a':
+        put(sfx, t0, blip(m2f(note), 1.0, 0.12), pan_of(m['ax']), 0.07, rev=0.3)
+        put(sfx, t0 + d, blip(m2f(note + 7), 1.0, 0.10), pan_of(m['bx']), 0.05, rev=0.3)
+    elif ph == 'b':
+        load = float(np.clip(cover[int((t0 + d) * SR)], 0, 1.3))
+        put(sfx, t0, blip(m2f(note - 12), 1.0, 0.14), pan_of(m['ax']), 0.07)
+        put(sfx, t0 + d, glide(m2f(48 - 5 * load), m2f(41 - 5 * load), 0.35, 1.0), pan_of(m['bx']), 0.10 + 0.08 * load)   # the target wakes and swells
+        put(sfx, t0 + d, filt(rng.standard_normal(int(0.3 * SR)), 'low', 500 + 900 * load) * np.exp(-tt(0.3) * 12), pan_of(m['bx']), 0.18)
+    else:
+        put(sfx, t0, pluck(m2f(note), 1.0, 0.3), pan_of(m['ax']), 0.10, rev=0.35)
+        put(sfx, t0 + d, blip(m2f(note + 12), 1.0, 0.1), pan_of(m['bx']), 0.06, rev=0.35)
+# the newcomer slides in at 8.8, hits the strained outline at 9.5 and bounces off
+put(sfx, 8.8, sweep(0.7, 300, 1600, 0.14), -0.8, 1.0)
+put(sfx, 9.5, impact(0.8), -0.8, 0.5); put(sfx, 9.5, crack(0.7), -0.7, 0.3)
+put(sfx, 9.55, glide(m2f(64), m2f(55), 0.5, 1.0), -0.8, 0.12, rev=0.3)
+# the camera dives into one halo (11-12)
+put(sfx, 11.0, sweep(1.0, 200, 5000, 0.30, q=0.5), 0, 1.0)
+put(sfx, 11.95, impact(0.7), 0, 0.45); put(sfx, 12.0, chime(m2f(88), 1.0, 2.0), 0, 0.12, rev=0.6)
+# five layers light up in turn (12.5-14.5)
 for k in range(5):
-    put(sfx, 12.5 + 0.5 * k, blip(m2f(72 + 3 * k), 1.0, 0.2), (-0.5 + 0.25 * k), 0.15, rev=0.3)
-    put(sfx, 13.0 + 0.5 * k, sweep(0.3, 1500, 4500, 0.12, q=0.5), (-0.5 + 0.25 * k), 1.0)
-    put(sfx, 13.3 + 0.5 * k, tick(3500, 1.0), (-0.5 + 0.25 * k), 0.5)
-put(sfx, 15.4, sweep(0.6, 200, 2500, 0.3, q=0.5), 0, 1.0)                              # the shaking before they fall
-# the unused parts fall away one after another
+    t0 = 12.5 + 0.5 * k
+    put(sfx, t0, blip(m2f(PENTA[k] + 12), 1.0, 0.2), -0.4 + 0.2 * k, 0.14, rev=0.4)
+    put(sfx, t0, tick(2600, 1.0), -0.4 + 0.2 * k, 0.4)
+# the layers peel off and fall: a clean run of ticks per layer (16.0 + 0.25k, one per segment)
 for k in range(5):
-    put(sfx, 16.0 + 0.25 * k, glide(m2f(84 - 3 * k), m2f(60 - 3 * k), 0.7, 1.0), -0.5 + 0.25 * k, 0.13, rev=0.3)
-    put(sfx, 16.0 + 0.25 * k, sweep(0.5, 2500, 500, 0.12, q=0.5, rising=False), -0.5 + 0.25 * k, 1.0)
-# what is left becomes lia
-put(sfx, 17.0, chime(m2f(79), 1.0, 2.0), 0, 0.18, rev=0.6)
-put(sfx, 17.4, scribble(0.4, 1.0), 0, 0.3)
-put(sfx, 17.5, chime(m2f(91), 1.0, 2.0), 0, 0.10, rev=0.6)
-put(sfx, 18.0, sweep(1.0, 5000, 200, 0.3, q=0.5, rising=False), 0, 1.0)                # the camera pulls back out
-for k, n in enumerate((60, 64, 67, 72, 76)):                                           # the block flies to the socket (18.4-19.5)
-    put(sfx, 18.45 + 0.2 * k, pluck(m2f(n + 12), 1.0, 0.4), -0.3 + 0.15 * k, 0.12, rev=0.3)
-put(sfx, 19.2, sweep(0.3, 400, 6000, 0.3, q=0.5), 0, 1.0)
-# the click into the socket at 19.5, then the rack lights up
-put(sfx, DROP, tick(2200, 1.0), 0, 1.0); put(sfx, DROP, impact(1.0), 0, 0.8)
-put(sfx, DROP, chime(m2f(84), 1.0, 2.5), 0, 0.22, rev=0.6); put(sfx, DROP, chime(m2f(96), 1.0, 2.5), 0, 0.09, rev=0.6)
-put(sfx, DROP + 0.05, scribble(1.0, 1.0), 0, 0.35)                                     # LED strip sweeps along the rail
-# result: each crate shrinks into a chip on its bot's back on the beat
-for k, t0 in enumerate(CHIP):
-    put(sfx, t0, sweep(0.5, 3000, 600, 0.14, q=0.5, rising=False), -0.8 + 0.3 * k, 1.0)
-    put(sfx, t0 + 0.5, tick(3000 + 300 * k, 1.0), -0.8 + 0.3 * k, 0.7)
-    put(sfx, t0 + 0.5, chime(m2f((72, 74, 76, 79, 81, 84)[k]), 1.0, 1.4), -0.8 + 0.3 * k, 0.17, rev=0.5)
-put(sfx, 23.2, sweep(1.0, 400, 3500, 0.2), 0, 1.0)                                      # bots spread out
-put(sfx, 24.4, chime(m2f(91), 1.0, 2.0), 0.4, 0.12, rev=0.6)                           # free slots appear
-for t0, pan in ((24.5, -0.8), (25.0, -0.8)):                                            # new bots slide in
-    put(sfx, t0, sweep(0.6, 500, 2500, 0.16), pan, 1.0); put(sfx, t0 + 0.6, tick(1800, 1.0), pan + 0.3, 0.8)
-put(sfx, 26.0, sweep(0.5, 300, 6000, 0.35, q=0.5), 0, 1.0)                             # zoom to the mark
+    for s in range(10):
+        put(sfx, 16.0 + 0.25 * k + 0.03 * s, tick(1800 + 260 * k + 90 * s, 1.0), -0.5 + 0.25 * k, 0.32)
+    put(sfx, 16.0 + 0.25 * k, glide(m2f(86 - 3 * k), m2f(62 - 3 * k), 0.8, 1.0), -0.5 + 0.25 * k, 0.09, rev=0.3)
+put(sfx, 15.4, sweep(0.6, 200, 2500, 0.28, q=0.5), 0, 1.0)
+# the hero halo collapses to a thin ring (17.5): the release
+put(sfx, HERO_T, impact(1.0), 0, 0.6); put(sfx, HERO_T, sweep(0.6, 5000, 300, 0.25, q=0.5, rising=False), 0, 1.0)
+for k, n in enumerate((60, 64, 67, 72, 76)):
+    put(sfx, HERO_T + 0.05 * k, chime(m2f(n + 12), 1.0, 2.5), -0.3 + 0.15 * k, 0.12, rev=0.6)
+put(sfx, 18.3, chime(m2f(91), 1.0, 2.5), 0, 0.18, rev=0.6); put(sfx, 18.35, scribble(0.5, 1.0), 0, 0.25)   # the mark flashes on the ring
+put(sfx, 19.0, sweep(1.2, 5000, 200, 0.30, q=0.5, rising=False), 0, 1.0)                                    # the camera pulls back out
+# every other halo becomes a ring on the beat (21.0, 21.5, 22.0, 22.5)
+for k, t0 in enumerate([COLLAPSE[0], COLLAPSE[2], COLLAPSE[3], COLLAPSE[4]]):
+    put(sfx, t0, impact(0.8), 0, 0.5); put(sfx, t0, glide(m2f(76 - 2 * k), m2f(55 - 2 * k), 0.7, 1.0), -0.5 + 0.3 * k, 0.14, rev=0.4)
+    put(sfx, t0 + 0.2, chime(m2f(PENTA[3 + k]), 1.0, 1.8), -0.5 + 0.3 * k, 0.17, rev=0.5)
+# new agents stream in from the edges (23.0 onward), each with a bright pluck up the scale
+for a in ev['arrivals']:
+    if a['wave'] >= 0:
+        w = a['wave']; t0 = a['arrive']
+        put(sfx, t0, sweep(0.4, 600, 3000, 0.10, q=0.5), pan_of(a['x']), 1.0)
+        put(sfx, t0 + 0.45, pluck(m2f(PENTA[w % len(PENTA)] + 12 * (w // 9)), 1.0, 0.5), pan_of(a['x']), 0.14, rev=0.45)
+put(sfx, 26.0, sweep(0.5, 300, 6000, 0.35, q=0.5), 0, 1.0)                              # the field contracts into the tile
 # brand: the mark resolves, the wordmark, the line and the address land
 put(sfx, 26.5, impact(0.9), 0, 0.45)
 put(sfx, 26.6, scribble(0.8, 1.0), 0, 0.30)
@@ -261,13 +264,13 @@ put(sfx, 28.9, tick(3400, 1.0), 0, 0.4)
 # ---- mix ----
 # sidechain duck on each kick from the drop onward, softer before
 duck = np.ones(N)
-for t0 in list(beats(4.0, 12.0)) + kick_times:
-    i = int(t0 * SR); d = int(0.28 * SR); depth = 0.5 if t0 >= DROP else 0.88
+for t0 in kick_times:
+    i = int(t0 * SR); d = int(0.28 * SR); depth = 0.5
     env = 1 - (1 - depth) * np.exp(-np.arange(min(d, N - i)) / (0.07 * SR))
     duck[i:i + len(env)] = np.minimum(duck[i:i + len(env)], env)
 # music reads closed (low-passed) through the heavy beats and opens on the click
 closed = filt(music, 'low', 900, 2)
-w = np.clip((np.arange(N) / SR - 18.5) / 1.0, 0, 1)[:, None]
+w = np.clip((np.arange(N) / SR - 17.0) / 1.5, 0, 1)[:, None]
 music = (closed * (1 - w) + music * w) * duck[:, None]
 
 ir_n = int(2.0 * SR); ir_t = np.arange(ir_n) / SR

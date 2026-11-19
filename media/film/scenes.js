@@ -1,304 +1,245 @@
-// World geometry (1920x1080 canvas coordinates). The server box holds the bots; the gauge and RAM stick sit beside it.
-const FLOOR = 880;
-const BOXR = { x: 140, y: 340, w: 1360, h: 560 };
-const CRATE = { w: 150, h: 130 };
-const CELLS = [[0, 0], [0, 1], [1, 0], [0, 2], [1, 1], [2, 0]];   // where each crate lands in the pile
-const SOCKET = [840, 290];
-const MARK_W = 150, MARK_H = 98;
-const WARN = '#ff6b6b', AMBER = '#f2c879';
-const TINTS = [COL.acc, '#8ab4f8', AMBER, '#e58fb0', '#e6edf3', '#b79cf5', '#b79cf5', '#8ab4f8', AMBER, '#e58fb0'];
+// The whole frame is the server's memory: one rounded field. Agents are flat single-color shapes with two eyes; a session is the soft gray halo around one.
+const FIELD = { x: 110, y: 80, w: 1700, h: 880, r: 80 };
+const RED = '#ff4433', DIM_LINE = '#3b4655', EYE = '#12161c', HALO = [170, 178, 190];
+const KINDS = [
+  { shape: 'tri', col: '#ff7eb6' }, { shape: 'hex', col: '#ffd24d' }, { shape: 'circle', col: '#a58bff' },
+  { shape: 'sq', col: '#ff9a4a' }, { shape: 'hex', col: '#62d26f' }, { shape: 'pill', col: '#ff6070' },
+];
+const R_AGENT = 68, R_HALO = 1.9, RING_K = 1.3;
+const ORIG = [{ kind: 0, x: 520, y: 360 }, { kind: 1, x: 960, y: 520 }, { kind: 2, x: 1400, y: 360 }, { kind: 3, x: 720, y: 760 }, { kind: 4, x: 1240, y: 760 }];
+const COLLAPSE_T = [21.0, 17.5, 21.5, 22.0, 22.5];            // when each original halo becomes a ring
+const WAVE_N = 17, WAVE_T0 = 23.0, WAVE_DT = 0.15;
+const HERO = 1;                                                // the agent the camera dives into
+const ZOOM = 3.0;
 
-const cell_pos = k => [190 + 75 + CELLS[k][0] * 150, FLOOR - 65 - CELLS[k][1] * 130];
-const land_t = k => 4.35 + 0.5 * k;
-const chip_t = k => 21.0 + 0.5 * k;
-const spread_x = i => 560 + i * 168;
-const pack_x = i => 840 + i * 110;
-const final_x = j => 250 + j * 128;
-const WAVE_T = [24.5, 25.0];                       // bots 6 and 7 slide in from the door
-const NEW_FINAL = [1, 0];                       // their floor slots, nearest the door last
+// ---------- agents that stream in at the end ----------
+const AGENTS = ORIG.map((a, i) => ({ ...a, r: R_AGENT, arrive: -1, orig: i }));
+(function make_wave() {
+  const placed = ORIG.map(a => [a.x, a.y]);
+  for (let k = 0; k < WAVE_N; k++) {
+    let p = null;
+    for (let tries = 0; tries < 400 && !p; tries++) {
+      const x = FIELD.x + 110 + hash(k * 7.3 + tries * 1.7) * (FIELD.w - 220), y = FIELD.y + 100 + hash(k * 13.1 + tries * 2.9) * (FIELD.h - 200);
+      const min = tries < 300 ? 175 : 140;
+      if (placed.every(q => Math.hypot(q[0] - x, q[1] - y) >= min)) p = [x, y];
+    }
+    placed.push(p);
+    const kind = k === 0 ? 5 : (k + 2) % 6, side = k === 0 ? 3 : Math.floor(hash(k * 5.1) * 4);
+    const from = side === 0 ? [p[0], FIELD.y - 160] : side === 1 ? [FIELD.x + FIELD.w + 160, p[1]] : side === 2 ? [p[0], FIELD.y + FIELD.h + 160] : [-120, p[1]];
+    AGENTS.push({ kind, x: p[0], y: p[1], r: 48, arrive: WAVE_T0 + WAVE_DT * k, from: k === 0 ? [-10, 520] : from, wave: k });
+  }
+})();
 
-function col_mix(a, b, p) {
-  const pa = [1, 3, 5].map(i => parseInt(a.slice(i, i + 2), 16)), pb = [1, 3, 5].map(i => parseInt(b.slice(i, i + 2), 16));
-  return 'rgb(' + pa.map((v, i) => Math.round(lerp(v, pb[i], clamp01(p)))).join(',') + ')';
+// ---------- messages between agents ----------
+const MSGS = [];
+(function make_msgs() {
+  const pairs = [[0, 1], [1, 2], [1, 3], [3, 4], [2, 4], [0, 3], [1, 4], [0, 2]];
+  const add = (t0, a, b, d, phase) => MSGS.push({ t0, a, b, d, phase });
+  let k = 0;
+  for (let t = 0.3; t < 3.95; t += 0.3, k++) { const p = pairs[k % pairs.length]; k % 2 ? add(t, p[1], p[0], 0.5, 'a') : add(t, p[0], p[1], 0.5, 'a'); }
+  for (let t = 4.0; t < 10.6; t += 0.25, k++) { const p = pairs[Math.floor(hash(k * 3.3) * pairs.length)]; hash(k) > 0.5 ? add(t, p[0], p[1], 0.45, 'b') : add(t, p[1], p[0], 0.45, 'b'); }
+  for (let t = 20.6; t < 26.0; t += (t < 22.4 ? 0.2 : 0.11), k++) {
+    const live = AGENTS.map((a, i) => i).filter(i => AGENTS[i].arrive + 0.7 <= t);
+    const a = live[Math.floor(hash(k * 5.7) * live.length)];
+    const near = live.filter(j => j !== a && Math.hypot(AGENTS[j].x - AGENTS[a].x, AGENTS[j].y - AGENTS[a].y) < 460);
+    if (near.length) add(t, a, near[Math.floor(hash(k * 9.1) * near.length)], t < 22.4 ? 0.4 : 0.3, 'd');
+  }
+})();
+
+// ---------- state as pure functions of t ----------
+const swell = (i, t) => {
+  let g = 1;
+  for (const m of MSGS) if (m.phase === 'b' && m.b === i) g += 0.32 * ease.out_cubic(prog(t, m.t0 + m.d - 0.05, m.t0 + m.d + 0.4));
+  return g;
+};
+const collapse = (i, t) => (i < 5 ? ease.in_out_cubic(prog(t, COLLAPSE_T[i], COLLAPSE_T[i] + 0.55)) : 1);
+const halo_r = (i, t) => lerp(R_AGENT * R_HALO * swell(i, t), AGENTS[i].r * RING_K, collapse(i, t));
+const here = (i, t) => t >= AGENTS[i].arrive;
+function agent_pos(i, t) {
+  const a = AGENTS[i];
+  if (!a.from) return [a.x, a.y];
+  const p = ease.out_back(prog(t, a.arrive, a.arrive + 0.7));
+  return [lerp(a.from[0], a.x, p), lerp(a.from[1], a.y, p)];
+}
+function coverage(t) {
+  let A = 0;
+  for (let i = 0; i < 5; i++) A += Math.PI * halo_r(i, t) ** 2 * (1 - collapse(i, t) * 0.9);
+  return A / (FIELD.w * FIELD.h * 0.85);
+}
+const strain_at = t => ease.in_out_cubic(prog(coverage(t), 0.55, 1.0));
+function pop_at(i, t) {   // a message landing wakes the agent
+  let s = 0;
+  for (const m of MSGS) if (m.b === i) { const dt = t - (m.t0 + m.d); if (dt > 0 && dt < 0.7) s += Math.exp(-dt * 9) * Math.cos(dt * 22); }
+  return s;
 }
 
-// ---------- memory: how full the server is ----------
-function level(t) {
-  let v = 0.12;
-  for (let k = 0; k < 6; k++) v += 0.13 * ease.out_cubic(prog(t, land_t(k) - 0.35, land_t(k) + 0.1));
-  for (let k = 0; k < 6; k++) v -= 0.125 * ease.in_out_cubic(prog(t, chip_t(k) + 0.1, chip_t(k) + 0.5));
-  for (let j = 0; j < 2; j++) v += 0.015 * prog(t, WAVE_T[j], WAVE_T[j] + 0.6);
-  return v;
-}
-const level_col = v => (v < 0.5 ? col_mix(COL.acc, AMBER, v / 0.5) : col_mix(AMBER, WARN, (v - 0.5) / 0.35));
-
-// ---------- parts ----------
-function bot(x, y, s, o = {}) {
-  const mood = o.mood || 'ok', t = o.t || 0, sag = o.sag || 0, tint = o.tint || COL.acc;
-  const hL = o.handL || [-96, -30], hR = o.handR || [96, -30];
-  ctx.save(); ctx.translate(x, y); ctx.scale(s, s * (1 - 0.1 * sag));
-  ctx.translate(0, mood === 'relax' ? 0 : Math.sin(t * Math.PI * 2) * 2);
-  [-30, 30].forEach(fx => { rr(fx - 18, -22, 36, 22, 9); fill_stroke(COL.panel, COL.ink, 5); });
-  [[-46, hL], [46, hR]].forEach(([sx, h]) => {
-    let dx = h[0] - sx, dy = h[1] + 80; const L = Math.hypot(dx, dy), m = 92;
-    if (L > m) { dx *= m / L; dy *= m / L; }
-    line(sx, -80, sx + dx, -80 + dy, COL.ink, 7); circle(sx + dx, -80 + dy, 9, COL.panel, COL.ink, 5);
-  });
-  rr(-50, -102, 100, 82, 18); fill_stroke(COL.panel, COL.ink, 5);
-  rr(-34, -42, 68, 12, 6); fill_stroke(tint, null);
-  circle(0, -66, 9, tint);
-  line(0, -212, 0, -242, COL.ink, 5);
-  ctx.save(); ctx.shadowColor = tint; ctx.shadowBlur = 14; circle(0, -248, 9, tint); ctx.restore();
-  rr(-62, -214, 124, 100, 28); fill_stroke(COL.panel, COL.ink, 5);
-  [-1, 1].forEach(sd => { rr(sd * 62 - (sd > 0 ? 0 : 10), -178, 10, 34, 5); fill_stroke(tint, null); });
-  const bl = (t % 3.2) > 3.08 ? 0.15 : 1;
-  [-24, 24].forEach(ex => {
-    ctx.save(); ctx.translate(ex, -166);
-    if (mood === 'relax' || mood === 'happy') { ctx.beginPath(); ctx.arc(0, 4, 10, 1.15 * Math.PI, 1.85 * Math.PI); ctx.strokeStyle = COL.ink; ctx.lineWidth = 5; ctx.lineCap = 'round'; ctx.stroke(); }
-    else { ctx.scale(1, bl); circle(0, 0, mood === 'surprised' ? 12 : 9, COL.ink); }
-    ctx.restore();
-  });
-  if (mood === 'sad' || mood === 'worried') { line(-36, -182, -14, -192, COL.ink, 4); line(36, -182, 14, -192, COL.ink, 4); }
+// ---------- drawing ----------
+function agent_path(shape, r) {
   ctx.beginPath();
-  if (mood === 'happy' || mood === 'relax') ctx.arc(0, -138, 24, 0.15 * Math.PI, 0.85 * Math.PI);
-  else if (mood === 'sad') ctx.arc(0, -112, 18, 1.2 * Math.PI, 1.8 * Math.PI);
-  else if (mood === 'surprised') ctx.ellipse(0, -128, 9, 12, 0, 0, Math.PI * 2);
-  else if (mood === 'worried') { ctx.moveTo(-18, -128); for (let i = 1; i <= 6; i++) ctx.lineTo(-18 + i * 6, -128 + (i % 2 ? -5 : 5)); }
-  else ctx.arc(0, -142, 16, 0.2 * Math.PI, 0.8 * Math.PI);
-  ctx.strokeStyle = COL.ink; ctx.lineWidth = 5; ctx.lineCap = 'round'; ctx.stroke();
-  ctx.restore();
+  if (shape === 'tri') { for (let k = 0; k < 3; k++) { const a = -Math.PI / 2 + k * 2 * Math.PI / 3; ctx.lineTo(Math.cos(a) * r * 1.12, Math.sin(a) * r * 1.12 + r * 0.14); } ctx.closePath(); }
+  else if (shape === 'hex') { for (let k = 0; k < 6; k++) { const a = Math.PI / 6 + k * Math.PI / 3; ctx.lineTo(Math.cos(a) * r, Math.sin(a) * r); } ctx.closePath(); }
+  else if (shape === 'circle') ctx.arc(0, 0, r * 0.95, 0, Math.PI * 2);
+  else if (shape === 'sq') { const h = r * 0.82; ctx.moveTo(-h, -h); ctx.lineTo(h, -h); ctx.lineTo(h, h); ctx.lineTo(-h, h); ctx.closePath(); }
+  else { rr(-r * 1.15, -r * 0.68, r * 2.3, r * 1.36, r * 0.68); }
 }
-
-function crate(x, y, s, o = {}) {
-  const w = CRATE.w * s, h = CRATE.h * s, open = o.open || 0, a = o.a ?? 1;
-  ctx.save(); ctx.translate(x, y); if (o.rot) ctx.rotate(o.rot); ctx.globalAlpha *= a;
-  if (open > 0.001) { rr(-w / 2, -h / 2, w, h, 10 * s); fill_stroke('#05080c', COL.ink, 5 * s); }
-  for (const side of [-1, 1]) {
-    ctx.save(); ctx.translate(side * open * w * 0.85, 0);
-    const x0 = side < 0 ? -w / 2 : 0;
-    ctx.beginPath(); ctx.rect(x0, -h / 2, w / 2, h); fill_stroke('#1a2029', COL.ink, Math.max(2, 5 * s));
-    for (let i = 1; i < 4; i++) line(x0, -h / 2 + i * h / 4, x0 + w / 2, -h / 2 + i * h / 4, '#2f3a47', Math.max(1.5, 3 * s));
-    line(x0 + (side < 0 ? 14 : w / 2 - 14) * s, -h / 2, x0 + (side < 0 ? 14 : w / 2 - 14) * s, h / 2, COL.dim, Math.max(2, 7 * s));
-    line(x0 + 4 * s, side < 0 ? -h / 2 + 4 * s : h / 2 - 4 * s, x0 + w / 2 - 4 * s, side < 0 ? h / 2 - 4 * s : -h / 2 + 4 * s, '#2f3a47', Math.max(1.5, 4 * s));
+// mood: squint 0..1 (strained), pleased 0..1 (curved eyes), curious (eyes wide and glancing up)
+function eyes(r, shape, mood, t, seed) {
+  const ey = shape === 'tri' ? r * 0.16 : 0, ex = shape === 'pill' ? r * 0.42 : r * 0.28;
+  const blink = ((t + seed * 1.7) % 3.6) > 3.47 ? 0.12 : 1;
+  const sq = mood.squint || 0, pl = mood.pleased || 0, cu = mood.curious || 0;
+  const lx = (mood.look ? mood.look[0] : 0) * r * 0.07, ly = (mood.look ? mood.look[1] : 0) * r * 0.07 - cu * r * 0.05;
+  for (const s of [-1, 1]) {
+    ctx.save(); ctx.translate(s * ex + lx, ey + ly);
+    const rx = r * 0.12 * (1 + 0.25 * cu), ry = r * 0.19 * (1 + 0.3 * cu) * (1 - 0.82 * sq) * blink;
+    if (pl > 0.5) { ctx.beginPath(); ctx.arc(0, r * 0.06, r * 0.13, 1.12 * Math.PI, 1.88 * Math.PI); ctx.strokeStyle = EYE; ctx.lineWidth = r * 0.075; ctx.lineCap = 'round'; ctx.stroke(); }
+    else { ctx.rotate(sq * s * -0.28); ctx.beginPath(); ctx.ellipse(0, 0, rx, Math.max(r * 0.03, ry), 0, 0, Math.PI * 2); ctx.fillStyle = EYE; ctx.fill(); }
     ctx.restore();
   }
+}
+function agent_draw(i, t, mood, extra = {}) {
+  const [x, y] = extra.pos || agent_pos(i, t), a = AGENTS[i], k = KINDS[a.kind];
+  const breathe = 1 + 0.03 * Math.sin(t * 2.2 + i) + 0.09 * pop_at(i, t);
+  ctx.save(); ctx.translate(x, y); ctx.rotate((mood.tilt || 0) + 0.02 * Math.sin(t * 1.3 + i)); ctx.scale(breathe, breathe * (extra.squash || 1));
+  agent_path(k.shape, a.r); ctx.fillStyle = k.col; ctx.fill();
+  ctx.strokeStyle = k.col; ctx.lineWidth = a.r * 0.28; ctx.lineJoin = 'round'; ctx.stroke();
+  eyes(a.r, k.shape, mood, t, i);
   ctx.restore();
 }
 
-function chip(x, y, s, a = 1, t = 0) {
-  ctx.save(); ctx.translate(x, y); ctx.scale(s, s); ctx.globalAlpha *= a;
-  ctx.shadowColor = COL.acc; ctx.shadowBlur = 14;
-  rr(-26, -18, 52, 36, 8); fill_stroke(COL.acc, null); ctx.shadowBlur = 0;
-  draw_mark(0, 0, 24, COL.bg); ctx.restore();
+function halo_draw(i, t) {
+  const [x, y] = agent_pos(i, t), R = halo_r(i, t), c = collapse(i, t);
+  if (c < 0.98) {
+    const g = ctx.createRadialGradient(x, y, R * 0.1, x, y, R);
+    g.addColorStop(0, `rgba(${HALO},0.10)`); g.addColorStop(0.75, `rgba(${HALO},0.20)`); g.addColorStop(1, `rgba(${HALO},0)`);
+    ctx.save(); ctx.globalAlpha *= 1 - c; ctx.fillStyle = g; ctx.beginPath(); ctx.arc(x, y, R, 0, Math.PI * 2); ctx.fill(); ctx.restore();
+  }
+  if (c > 0.02) {
+    ctx.save(); ctx.globalAlpha *= c; ctx.shadowColor = COL.acc; ctx.shadowBlur = 16;
+    circle(x, y, R, null, COL.acc, AGENTS[i].r * 0.07 + 1.5); ctx.restore();
+  }
 }
 
-function ram_stick(x, y, hot) {
-  ctx.save(); ctx.translate(x, y);
-  if (hot > 0.05) { ctx.shadowColor = WARN; ctx.shadowBlur = 30 * hot; }
-  rr(-62, -24, 124, 48, 6); fill_stroke(COL.panel, hot > 0.5 ? WARN : COL.ink, 5); ctx.shadowBlur = 0;
-  [-34, 0, 34].forEach(cx => { rr(cx - 14, -12, 28, 24, 4); fill_stroke(COL.line, null); });
-  for (let i = -5; i <= 5; i++) line(i * 10, 24, i * 10, 36, hot > 0.5 ? WARN : AMBER, 4);
+function field_path(inset, r) { rr(FIELD.x + inset, FIELD.y + inset, FIELD.w - 2 * inset, FIELD.h - 2 * inset, r); }
+function field_draw(t, strain) {
+  ctx.save(); field_path(0, FIELD.r); ctx.fillStyle = '#0e141b'; ctx.fill(); ctx.restore();
+  const flick = strain > 0.05 ? (0.55 + 0.45 * (Math.sin(t * 2 * Math.PI * 4) > 0 ? 1 : 0.35)) : 1;
+  const inset = 16 * strain, lw = 3 + 6 * strain;
+  const calm = t >= 21 ? ease.out_cubic(prog(t, 21, 24)) : 0;
+  const base = col_mix_rgb(DIM_LINE, '#3f7c68', calm);
+  ctx.save(); ctx.globalAlpha *= strain > 0.05 ? flick : 1;
+  field_path(inset, FIELD.r - inset * 0.5); ctx.strokeStyle = strain > 0.05 ? col_mix_rgb(base, RED, strain) : base; ctx.lineWidth = lw; ctx.stroke();
   ctx.restore();
 }
-
-function gauge(t) {
-  const v = level(t), x = 1680, y0 = 350, h = 520, w = 64, col = level_col(v);
-  rr(x - w / 2, y0, w, h, 32); fill_stroke(COL.panel, COL.ink, 5);
-  ctx.save(); rr(x - w / 2 + 6, y0 + 6, w - 12, h - 12, 26); ctx.clip();
-  const fh = (h - 12) * clamp01(v), blink = v > 0.88 ? 0.6 + 0.4 * Math.sin(t * 2 * Math.PI * 2) : 1;
-  ctx.fillStyle = col; ctx.globalAlpha *= blink; ctx.fillRect(x - w / 2, y0 + h - 6 - fh, w, fh); ctx.restore();
-  [0.33, 0.66].forEach(f => line(x + w / 2 + 4, y0 + h - h * f, x + w / 2 + 20, y0 + h - h * f, COL.dim, 4));
-  ram_stick(x, 290, v > 0.88 ? 0.6 + 0.4 * Math.sin(t * 2 * Math.PI * 2) : 0);
+function col_mix_rgb(a, b, p) {
+  const pa = [1, 3, 5].map(i => parseInt(a.slice(i, i + 2), 16)), pb = [1, 3, 5].map(i => parseInt(b.slice(i, i + 2), 16));
+  return '#' + pa.map((v, i) => Math.round(lerp(v, pb[i], clamp01(p))).toString(16).padStart(2, '0')).join('');
 }
 
-function server_box(t, led) {
-  const b = BOXR;
-  rr(b.x, b.y, b.w, b.h, 18); fill_stroke('#0e141b', null);
-  ctx.beginPath(); ctx.moveTo(b.x, 640); ctx.lineTo(b.x, b.y + 18); ctx.arcTo(b.x, b.y, b.x + 18, b.y, 18); ctx.lineTo(b.x + b.w - 18, b.y);
-  ctx.arcTo(b.x + b.w, b.y, b.x + b.w, b.y + 18, 18); ctx.lineTo(b.x + b.w, b.y + b.h - 18); ctx.arcTo(b.x + b.w, b.y + b.h, b.x + b.w - 18, b.y + b.h, 18);
-  ctx.lineTo(b.x + 18, b.y + b.h);
-  fill_stroke(null, led > 0.5 ? col_mix(COL.ink, COL.acc, led) : COL.ink, 6);
-  for (let i = 0; i < 7; i++) line(1000 + i * 60, b.y + 25, 1030 + i * 60, b.y + 25, COL.line, 5);
-  const v = level(t);
-  for (let i = 0; i < 4; i++) circle(1440, b.y + 70 + i * 40, 9, v > 0.88 && t < 21 ? (Math.sin(t * 12 + i) > 0 ? WARN : COL.line) : (led > 0.5 ? COL.acc : (v < 0.5 ? COL.acc : COL.line)));
-  // socket in the top rail
-  rr(SOCKET[0] - 80, b.y - 12, 160, 24, 6); fill_stroke(COL.panel, COL.dim, 4);
-  line(SOCKET[0] - 30, b.y + 12, SOCKET[0] - 30, b.y + 26, COL.dim, 4); line(SOCKET[0] + 30, b.y + 12, SOCKET[0] + 30, b.y + 26, COL.dim, 4);
-  if (led > 0) {
-    const L = 600 * led;
-    line(SOCKET[0] - L, b.y + 12, SOCKET[0] + L, b.y + 12, COL.acc, 5);
+function messages_draw(t) {
+  for (const m of MSGS) {
+    if (t < m.t0 || t > m.t0 + m.d + 0.25) continue;
+    if (!here(m.a, t) || !here(m.b, t)) continue;
+    const A = agent_pos(m.a, t), B = agent_pos(m.b, t), p = clamp01((t - m.t0) / m.d), fade = 1 - prog(t, m.t0 + m.d, m.t0 + m.d + 0.25);
+    const green = m.phase === 'd', col = green ? COL.acc : COL.ink;
+    ctx.save(); ctx.globalAlpha *= 0.28 * fade; line(A[0], A[1], B[0], B[1], col, 3); ctx.restore();
+    const e = ease.in_out_cubic(p);
+    if (p < 1) { ctx.save(); ctx.shadowColor = col; ctx.shadowBlur = 12; circle(lerp(A[0], B[0], e), lerp(A[1], B[1], e), green ? 7 : 8, col); ctx.restore(); }
   }
 }
 
-// ---------- the bots ----------
-function bot_x(i, t) {
-  if (i < 6) {
-    if (i >= 3) { const a = 1.0 + (i - 3); const arr = ease.in_out_cubic(prog(t, a, a + 1.2)); if (t < a + 1.2) return lerp(150, spread_x(i), arr); }
-    const sq = ease.in_out_cubic(prog(t, 4.0, 8.0)), un = ease.in_out_cubic(prog(t, 23.2, 24.4));
-    const x = lerp(spread_x(i), pack_x(i), sq);
-    return lerp(x, final_x(2 + i), un);
-  }
-  if (i === 6) {
-    if (t < 9.0) return -80;
-    if (t < 10.0) return lerp(-80, 130, ease.out_cubic(prog(t, 9.0, 10.0)));
-    if (t < 10.7) return lerp(130, 70, ease.out_cubic(prog(t, 10.0, 10.7)));
-    if (t < WAVE_T[0]) return 70;
-    return lerp(70, final_x(NEW_FINAL[0]), ease.in_out_cubic(prog(t, WAVE_T[0], WAVE_T[0] + 0.6)));
-  }
-  const j = i - 6; return t < WAVE_T[j] ? -120 : lerp(-120, final_x(NEW_FINAL[j]), ease.in_out_cubic(prog(t, WAVE_T[j], WAVE_T[j] + 0.6)));
-}
-function bot_here(i, t) { return i < 3 || (i < 6 && t >= 1.0 + (i - 3)) || (i === 6 && t >= 9.0) || (i > 6 && t >= WAVE_T[i - 6]); }
-function bot_mood(i, t) {
-  if (i === 6) return t < 10.0 ? 'ok' : t < 19.5 ? (t < 10.7 ? 'surprised' : 'sad') : t < 24.4 ? 'ok' : 'happy';
-  if (i > 6) return 'happy';
-  if (t >= chip_t(i) + 0.5) return 'happy';
-  if (t < 4.2) return 'ok';
-  if (t < 6.6 && t >= land_t(i) - 0.1 && t < land_t(i) + 0.5) return 'surprised';
-  return t < 9.5 ? 'worried' : 'sad';
-}
-function bot_draw(i, t) {
-  if (!bot_here(i, t)) return;
-  const x = bot_x(i, t), walking = (i >= 3 && i < 6 && t < 1.0 + (i - 3) + 1.2) || (i === 6 && t > 9 && t < 10.7) || (i > 6 && t < WAVE_T[i - 6] + 0.6) || (i === 6 && t >= WAVE_T[0] && t < WAVE_T[0] + 0.6);
-  const hop = walking ? Math.abs(Math.sin(t * 9 + i)) * 14 : 0;
-  const heavy = i < 6 ? 1 - ease.in_out_cubic(prog(t, 21.0 + 0.5 * i, 21.6 + 0.5 * i)) : 0;
-  const crate_on = i < 6 ? (t >= land_t(i) ? 1 : 0) : 0;
-  let sag = (i < 6 ? 0.35 * pulse(t, land_t(i), 0.5) * (t < 6.6 ? 1 : 0) + 0.3 * ease.out_cubic(prog(t, 4.5, 8.0)) * heavy * crate_on : 0);
-  if (i === 6 && t > 10.0 && t < 10.5) sag = 0.5 * pulse(t, 10.0, 0.5);
-  const work = i < 6 && t < 21.0 ? 1 - 0.8 * ease.out_cubic(prog(t, 4.0, 8.5)) : 1;
-  const speed = i < 6 && t < 21.0 ? lerp(2.0, 0.7, prog(t, 4.0, 8.0)) : 2.0;
-  const ph = Math.sin(t * Math.PI * speed + i * 1.3) * work;
-  const happy = bot_mood(i, t) === 'happy';
-  let hL = [-70, -42 - 16 * ph], hR = [70, -42 + 16 * ph];
-  if (happy) { const w = Math.sin(t * 7 + i); hL = [-92, -100 + 20 * w]; hR = [92, -100 - 20 * w]; }
-  if (i === 6 && t >= 10.7 && t < 11.0) hR = [120, -120];
-  bot(x, FLOOR - hop, 1.1, { mood: bot_mood(i, t), t: t + i * 0.37, tint: TINTS[i], sag, handL: hL, handR: hR });
+function mood_of(i, t, strain) {
+  const a = AGENTS[i];
+  if (a.wave !== undefined) return { pleased: 1, look: [Math.sin(t * 2 + i), 0] };
+  const c = collapse(i, t), look = [Math.sin(t * 0.9 + i * 2), Math.cos(t * 0.7 + i)];
+  let m = { look };
+  if (t >= 4 && t < COLLAPSE_T[i] + 0.3) m = { squint: strain, look };
+  if (i === HERO && t >= 12.2 && t < 17.5) m = { curious: 1, look: [Math.sin(t * 1.5), -0.4], tilt: 0.08 * Math.sin(t * 2) };
+  return { ...m, pleased: c > 0.5 ? 1 : 0, squint: c > 0.5 ? 0 : m.squint || 0 };
 }
 
-// ---------- world ----------
-function dust(x, y, p) {
-  if (p <= 0 || p >= 1) return;
-  for (let k = 0; k < 6; k++) { const d = (k - 2.5) * 26 * ease.out_cubic(p); ctx.save(); ctx.globalAlpha *= 0.5 * (1 - p); circle(x + d, y - 6 * p * (k % 2 + 1), 10 + 12 * p, COL.dim); ctx.restore(); }
+// the newcomer that finds no room: slides in from the left edge, bounces off the strained outline
+function newcomer_state(t) {
+  const x = t < 8.8 ? -130 : t < 9.5 ? lerp(-130, 44, ease.in_cubic(prog(t, 8.8, 9.5))) : t < 10.3 ? lerp(44, -10, ease.out_cubic(prog(t, 9.5, 10.3))) : -10;
+  const squash = t > 9.45 && t < 9.9 ? 1 - 0.22 * Math.sin(Math.PI * prog(t, 9.45, 9.9)) : 1;
+  return { x, y: 520, squash, bump: t >= 9.5 && t < 10.1 };
 }
 
+// ---------- the world ----------
 function world(t) {
-  const lv = level(t);
-  const quake = t >= 7.5 && t < 11 ? 3 * prog(t, 7.5, 8.2) : 0;
-  let sy = 0, sx = 0;
-  for (let k = 0; k < 6; k++) sy += 7 * pulse(t, land_t(k), 0.2);
-  sx = quake * Math.sin(t * 55); sy += quake * Math.cos(t * 47) * 0.6;
-  if (t >= 10.0 && t < 10.4) sx += 5 * Math.sin(t * 90);
-  ctx.save(); ctx.translate(sx, sy);
-  const led = t >= 19.5 ? ease.out_cubic(prog(t, 19.5, 20.6)) : 0;
-  server_box(t, led);
-  // crates and ropes
-  for (let k = 0; k < 6; k++) {
-    const cp = cell_pos(k);
-    const bx = bot_x(k, t) - 62, by = FLOOR - 112;
-    const fall = prog(t, land_t(k) - 0.35, land_t(k));
-    const chp = ease.in_out_cubic(prog(t, chip_t(k), chip_t(k) + 0.5));
-    if (fall <= 0) continue;
-    let cx = cp[0], cy = lerp(cp[1] - 700, cp[1], ease.in_cubic(fall)), s = 1, op = k === 1 ? ease.out_cubic(prog(t, 11.95, 12.35)) : 0;
-    const landed = fall >= 1;
-    if (landed) cy += 4 * Math.exp(-(t - land_t(k)) * 10) * Math.cos(30 * (t - land_t(k)));
-    if (t >= 10.0 && t < 10.5 && CELLS[k][0] === 0) cx += 5 * Math.sin(t * 90);
-    if (chp > 0) { cx = lerp(cp[0], bx, chp); cy = lerp(cy, by, chp); s = lerp(1, 0.3, chp); }
-    if (landed && chp < 1) { ctx.save(); ctx.globalAlpha *= 1 - chp; ctx.setLineDash([8, 10]); line(bx, by, cx, cy, COL.dim, 3); ctx.restore(); }
-    crate(cx, cy, s, { open: op, a: 1 - prog(chp, 0.2, 0.8) });
-    if (chp > 0.2 && chp < 1) chip(cx, cy, 1, prog(chp, 0.3, 0.8));
-    if (landed) dust(cp[0], FLOOR, prog(t, land_t(k), land_t(k) + 0.5));
-  }
-  for (let i = 0; i < 8; i++) bot_draw(i, t);
-  // chips ride on the bots' backs
-  for (let k = 0; k < 6; k++) if (t >= chip_t(k) + 0.5) chip(bot_x(k, t) - 62, FLOOR - 112, 1.0, 1);
-  for (let j = 0; j < 2; j++) if (bot_here(6 + j, t)) chip(bot_x(6 + j, t) - 62, FLOOR - 112, 1.0, 1);
-  // free slots on the floor: room for more bots
-  if (t >= 24.4) { const a = ease.out_cubic(prog(t, 24.4, 25.0)); [8, 9].forEach(j => { ctx.save(); ctx.globalAlpha *= 0.7 * a; ctx.setLineDash([12, 12]); rr(final_x(j) - 55, FLOOR - 250, 110, 250, 26); ctx.strokeStyle = COL.dim; ctx.lineWidth = 4; ctx.stroke(); ctx.setLineDash([]); line(final_x(j) - 16, FLOOR - 125, final_x(j) + 16, FLOOR - 125, COL.dim, 5); line(final_x(j), FLOOR - 141, final_x(j), FLOOR - 109, COL.dim, 5); ctx.restore(); }); }
-  // no entry sign at the door
-  if (t >= 10.0 && t < 11.0) { const a = ease.out_cubic(prog(t, 10.0, 10.3)) * (1 - prog(t, 10.8, 11.0)); ctx.save(); ctx.globalAlpha *= a; ctx.translate(230, 560); circle(0, 0, 36, COL.panel, WARN, 8); line(-24, 24, 24, -24, WARN, 8); ctx.restore(); }
-  ctx.restore();
-  gauge(t);
-}
-
-function lia_block_world(t) {
-  const fly = ease.in_out_cubic(prog(t, 18.4, 19.5));
-  const start = cell_pos(1), end = SOCKET;
-  const p = [lerp(start[0], end[0], fly), lerp(start[1], end[1], fly) - 140 * Math.sin(Math.PI * fly)];
-  const size = lerp(22 / MARK_W, 1, ease.in_out_cubic(prog(t, 18.0, 19.3)));
-  if (t < 18.0) return;
-  const land = t >= 19.5 ? 1 - 0.1 * Math.exp(-(t - 19.5) * 9) * Math.cos(26 * (t - 19.5)) : 1;
-  ctx.save(); ctx.translate(p[0], p[1] + (t >= 19.5 ? 0 : 0)); ctx.scale(size * land, size * land);
-  ctx.shadowColor = COL.acc; ctx.shadowBlur = 24; rr(-MARK_W / 2, -MARK_H / 2, MARK_W, MARK_H, 14); fill_stroke(COL.acc, null); ctx.shadowBlur = 0;
-  draw_mark(0, 0, 66, COL.bg); ctx.restore();
-  if (t >= 19.5 && t < 20.2) { const r = prog(t, 19.5, 20.2); ctx.save(); ctx.globalAlpha *= 1 - r; circle(SOCKET[0], SOCKET[1] + 40, 60 + 160 * r, null, COL.acc, 6); ctx.restore(); }
-}
-
-function camera(t) {
-  if (t < 4) return track(t, [[0, 1.12, 900, 620], [4, 1.0, 900, 600]], ease.out_cubic);
-  if (t < 11) return [1.0, 900, 600];
-  if (t < 12) { const p = ease.in_expo(prog(t, 11, 12)), c = cell_pos(1); return [Math.exp(lerp(0, Math.log(9), p)), lerp(900, c[0], p), lerp(600, c[1], p)]; }
-  if (t < 18) return [9, ...cell_pos(1)];
-  if (t < 19) { const p = ease.out_expo(prog(t, 18, 19)), c = cell_pos(1); return [Math.exp(lerp(Math.log(9), 0, p)), lerp(c[0], 900, p), lerp(c[1], 600, p)]; }
-  if (t < 26) return [1.0 + 0.04 * prog(t, 19, 26), 900, 600];
-  const p = ease.in_out_cubic(prog(t, 26, 26.5)); return [lerp(1.04, 700 / MARK_W, p), lerp(900, SOCKET[0], p), lerp(600, SOCKET[1], p)];
-}
-
-// ---------- scenes ----------
-function s_stage(t) {
-  const [z, cx, cy] = camera(t);
-  ctx.save(); ctx.translate(W / 2, H / 2); ctx.scale(z, z); ctx.translate(-cx, -cy);
-  world(t); lia_block_world(t);
-  ctx.restore();
-}
-
-function part_icon(kind, x, y, s) {
-  ctx.save(); ctx.translate(x, y); ctx.scale(s, s); ctx.lineJoin = 'round'; ctx.lineCap = 'round';
-  if (kind === 0) {            // terminal UI: a window with a title bar
-    rr(-90, -66, 180, 132, 14); fill_stroke(COL.panel, COL.ink, 7);
-    line(-90, -30, 90, -30, COL.ink, 6); [-70, -52, -34].forEach(dx => circle(dx, -48, 5, COL.ink));
-    line(-62, 4, 20, 4, COL.dim, 8); line(-62, 34, 60, 34, COL.dim, 8);
-  } else if (kind === 1) {     // slash commands: a square holding a slash
-    rr(-70, -70, 140, 140, 22); fill_stroke(COL.panel, COL.ink, 7); line(-22, 42, 22, -42, COL.ink, 12);
-  } else if (kind === 2) {     // SDKs: a package cube
-    ctx.beginPath(); ctx.moveTo(0, -80); ctx.lineTo(70, -40); ctx.lineTo(70, 40); ctx.lineTo(0, 80); ctx.lineTo(-70, 40); ctx.lineTo(-70, -40); ctx.closePath(); fill_stroke(COL.panel, COL.ink, 7);
-    line(-70, -40, 0, 0, COL.ink, 6); line(70, -40, 0, 0, COL.ink, 6); line(0, 0, 0, 80, COL.ink, 6);
-  } else if (kind === 3) {     // upgrades: an up arrow in a ring
-    circle(0, 0, 72, COL.panel, COL.ink, 7); ctx.beginPath(); ctx.moveTo(0, -42); ctx.lineTo(34, -4); ctx.lineTo(12, -4); ctx.lineTo(12, 40); ctx.lineTo(-12, 40); ctx.lineTo(-12, -4); ctx.lineTo(-34, -4); ctx.closePath(); fill_stroke(COL.ink, null);
-  } else {                     // sign-ins: a key
-    circle(-34, 0, 38, COL.panel, COL.ink, 7); circle(-34, 0, 10, COL.ink); line(4, 0, 84, 0, COL.ink, 9); line(58, 0, 58, 30, COL.ink, 9); line(78, 0, 78, 24, COL.ink, 9);
+  const strain = strain_at(t);
+  field_draw(t, strain);
+  ctx.save(); field_path(0, FIELD.r); ctx.clip();
+  for (let i = 0; i < AGENTS.length; i++) if (here(i, t)) halo_draw(i, t);
+  messages_draw(t);
+  for (let i = 0; i < AGENTS.length; i++) {
+    if (!here(i, t)) continue;
+    agent_draw(i, t, mood_of(i, t, strain));
   }
   ctx.restore();
+  if (t >= 8.8 && t < 23.0) {
+    const n = newcomer_state(t);
+    ctx.save(); ctx.translate(n.x, n.y); ctx.scale(1, n.squash);
+    agent_path('pill', R_AGENT); ctx.fillStyle = KINDS[5].col; ctx.fill(); ctx.strokeStyle = KINDS[5].col; ctx.lineWidth = R_AGENT * 0.28; ctx.lineJoin = 'round'; ctx.stroke();
+    eyes(R_AGENT, 'pill', n.bump ? { squint: 0.8 } : { curious: 1, look: [1, -0.3] }, t, 9);
+    ctx.restore();
+    if (n.bump) { const p = prog(t, 9.5, 10.1); ctx.save(); ctx.globalAlpha *= 1 - p; circle(FIELD.x, 520, 30 + 90 * p, null, RED, 6); ctx.restore(); }
+  }
 }
-const PARTS = [['terminal UI', 0], ['slash commands', 1], ['SDKs', 2], ['upgrades', 3], ['sign-ins', 4]];
-const PART_X = [470, 715, 960, 1205, 1450];
+
+// ---------- the dive into one halo: five layers made for people ----------
+const LAYERS = [['terminal UI', 300, 540], ['slash commands', 385, 400], ['SDKs', 470, 680], ['upgrades', 555, 260], ['sign-ins', 640, 820]];
+const SEGS = 10;
+function layer_pt(R, y) { return 960 + Math.sqrt(Math.max(0, R * R - (y - 540) ** 2)); }
 
 function s_why(t) {
-  // overlay on the zoomed crate: parts a bot never uses pop in, get crossed out, then drop away
-  const shake = t >= 15.4 && t < 16.0 ? 4 * (t - 15.4) / 0.6 : 0;
-  PARTS.forEach(([tag, kind], k) => {
-    const born = 12.5 + 0.5 * k, p = ease.out_back(prog(t, born, born + 0.4)), fall = Math.max(0, t - (16.0 + 0.25 * k));
-    if (p <= 0) return;
-    const x = PART_X[k] + (fall ? (k - 2) * 60 * fall : 0) + shake * Math.sin(t * 70 + k), y = 470 + 12 * Math.sin(t * 2 + k) + 0.5 * 3800 * fall * fall;
-    if (y > 1400) return;
-    ctx.save(); ctx.translate(x, y); ctx.rotate(fall ? fall * (k % 2 ? 2.2 : -2.6) : 0); ctx.scale(p, p);
-    part_icon(kind, 0, 0, 1.25);
-    text(tag, 0, 195, 30, COL.ink, 700, "center");
-    const xp = prog(t, born + 0.5, born + 0.85);
-    if (xp > 0) { ctx.globalAlpha = 0.95; line(-100, -100, -100 + 200 * xp, -100 + 200 * xp, WARN, 12); if (xp > 0.5) line(100, -100, 100 - 200 * (xp - 0.5) * 2, -100 + 200 * (xp - 0.5) * 2, WARN, 12); }
-    ctx.restore();
+  const cx = 960, cy = 540;
+  LAYERS.forEach(([tag, R, ty], k) => {
+    const lit = prog(t, 12.5 + 0.5 * k, 12.85 + 0.5 * k), born = ease.out_cubic(prog(t, 12.2 + 0.08 * k, 12.6 + 0.08 * k));
+    const peel0 = 16.0 + 0.25 * k;
+    for (let s = 0; s < SEGS; s++) {
+      const a0 = s * 2 * Math.PI / SEGS + 0.05, a1 = (s + 1) * 2 * Math.PI / SEGS - 0.05, dt = Math.max(0, t - (peel0 + 0.03 * s));
+      const off = dt * 260 + 0.5 * 2600 * dt * dt, rot = dt * ((s + k) % 2 ? 1.6 : -1.9), mid = (a0 + a1) / 2;
+      if (off > 1500) continue;
+      ctx.save(); ctx.translate(cx + Math.cos(mid) * dt * 160, cy + off * 0.8 + Math.sin(mid) * dt * 160); ctx.rotate(rot);
+      ctx.globalAlpha *= born * (1 - prog(dt, 0.7, 1.1)); ctx.shadowColor = '#e6edf3'; ctx.shadowBlur = 18 * lit * (dt ? 0 : 1);
+      ctx.beginPath(); ctx.arc(0, 0, R, a0, a1); ctx.strokeStyle = col_mix_rgb('#6b7482', '#e6edf3', lit); ctx.lineWidth = 34; ctx.lineCap = 'butt'; ctx.stroke(); ctx.restore();
+    }
+    if (t >= 12.5 + 0.5 * k && t < peel0 + 0.3) {
+      const a = lit * (1 - prog(t, peel0, peel0 + 0.3)), px = layer_pt(R, ty);
+      ctx.save(); ctx.globalAlpha *= a; line(px, ty, 1620, ty, '#e6edf3', 3); circle(px, ty, 8, '#e6edf3'); text(tag, 1640, ty + 10, 30, COL.ink, 700, 'left'); ctx.restore();
+    }
   });
-  // the bot that wanted in watches
-  const bm = t < 13.5 ? 'surprised' : t < 16.2 ? 'sad' : 'happy';
-  if (t >= 12.3) {
-    const a = ease.out_cubic(prog(t, 12.3, 12.8)), w = Math.sin(t * 7);
-    ctx.save(); ctx.globalAlpha *= a;
-    bot(210, 1075, 1.1, { mood: bm, t, tint: TINTS[6], handL: [-92, -100 + (bm === 'happy' ? 20 * w : 0)], handR: [92, -100 - (bm === 'happy' ? 20 * w : 0)] });
-    ctx.restore();
+  // collapse into the tight green ring, and the mark flashes once on it
+  if (t >= 18.2 && t < 19.2) {
+    const p = prog(t, 18.2, 19.2), s = spring_t(t - 18.2, 8, 2) ;
+    ctx.save(); ctx.globalAlpha *= (1 - p) * 0.9 + 0.1 * (t < 18.9 ? 1 : 0); ctx.translate(960, 540 - AGENTS[HERO].r * RING_K * ZOOM - 90);
+    ctx.scale(Math.min(1.2, s), Math.min(1.2, s)); ctx.shadowColor = COL.acc; ctx.shadowBlur = 30; draw_mark(0, 0, 170, COL.acc); ctx.restore();
   }
-  // the core that is left becomes lia
-  if (t >= 17.0 && t < 18.0) {
-    const g = Math.min(1.08, spring_t(t - 17.0, 8, 2.2)), cw = 200 * g, ch = 130 * g;
-    ctx.save(); ctx.shadowColor = COL.acc; ctx.shadowBlur = 40; rr(960 - cw / 2, 540 - ch / 2, cw, ch, 22); fill_stroke(COL.acc, null); ctx.shadowBlur = 0;
-    draw_mark(960, 540, 88 * g, COL.bg, prog(t, 17.4, 17.8)); ctx.restore();
+}
+
+// ---------- camera ----------
+function camera(t) {
+  const [hx, hy] = [AGENTS[HERO].x, AGENTS[HERO].y];
+  if (t < 11) return [1, 960, 540];
+  if (t < 12) { const p = ease.in_expo(prog(t, 11, 12)); return [Math.exp(lerp(0, Math.log(ZOOM), p)), lerp(960, hx, p), lerp(540, hy, p)]; }
+  if (t < 19) return [ZOOM, hx, hy];
+  if (t < 20.2) { const p = ease.out_expo(prog(t, 19, 20.2)); return [Math.exp(lerp(Math.log(ZOOM), 0, p)), lerp(hx, 960, p), lerp(hy, 540, p)]; }
+  return [1, 960, 540];
+}
+
+function s_stage(t) {
+  const [z, cx, cy] = camera(t);
+  ctx.save();
+  if (t >= 26.0) ctx.globalAlpha *= 1 - ease.in_out_cubic(prog(t, 26.0, 26.4));
+  ctx.translate(W / 2, H / 2); ctx.scale(z, z); ctx.translate(-cx, -cy);
+  world(t);
+  ctx.restore();
+  if (t >= 12.0 && t < 19.2) s_why(t);
+  if (t >= 12.0 && t < 19.2) { const g = ctx.createLinearGradient(0, 900, 0, 1080); g.addColorStop(0, 'rgba(13,17,23,0)'); g.addColorStop(0.45, 'rgba(13,17,23,0.92)'); g.addColorStop(1, 'rgba(13,17,23,1)'); ctx.fillStyle = g; ctx.fillRect(0, 900, W, 180); }
+  if (t >= 26.0) {   // the memory field contracts into the lia tile
+    const p = ease.in_out_cubic(prog(t, 26.0, 26.5)), x = lerp(FIELD.x, 610, p), y = lerp(FIELD.y, 311.5, p), w = lerp(FIELD.w, 700, p), h = lerp(FIELD.h, 457, p), r = lerp(FIELD.r, 60, p);
+    ctx.save(); ctx.globalAlpha *= p; rr(x, y, w, h, r); fill_stroke(COL.acc, null); ctx.restore();
+    draw_mark(960, 540, 215, COL.bg, p);
   }
 }
 
@@ -306,11 +247,11 @@ function s_brand(t) {
   backdrop();
   const rect = 1 - ease.in_out_cubic(prog(t, 26.6, 27.4));
   const move = ease.in_out_cubic(prog(t, 26.8, 27.6));
-  const size = lerp(232, 300, move), mx = lerp(960, 742, move);
+  const size = lerp(215, 300, move), mx = lerp(960, 742, move), my = lerp(540, 440, move);
   if (rect > 0.001) { ctx.save(); ctx.globalAlpha *= rect; rr(960 - 350, 540 - 228, 700, 457, 60); fill_stroke(COL.acc, null); ctx.restore(); }
   const k = prog(t, 26.6, 27.2);
   ctx.save(); ctx.shadowColor = COL.acc; ctx.shadowBlur = 30 * pulse(t, 27.4, 0.8);
-  draw_mark(mx, 440, size, k < 0.5 ? COL.bg : COL.acc); ctx.restore();
+  draw_mark(mx, my, size, k < 0.5 ? COL.bg : COL.acc); ctx.restore();
   kinetic('lia', 1135, 510, t, 27.5, 99, 220, COL.ink);
   kinetic('built for bots', 960, 640, t, 27.9, 99, 52, COL.ink, 400);
   const ua = ease.out_cubic(prog(t, 28.4, 28.9)); text('github.com/ap-justin/lia', 960, 790, 60, COL.acc, 700, 'center', ua);
@@ -322,19 +263,14 @@ function draw(t) {
   t = Math.max(0, Math.min(DUR - 1e-4, t));
   ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.shadowBlur = 0;
   backdrop();
-  if (t < 26.5) { s_stage(t); if (t >= 12.0 && t < 18.0) s_why(t); }
-  else s_brand(t);
-  // the zoom into the heavy crate lands on a dark interior; flash as the doors open
-  if (t >= 11.9 && t < 12.3) { ctx.save(); ctx.globalAlpha = 0.5 * (1 - prog(t, 11.95, 12.3)); ctx.fillStyle = COL.ink; ctx.fillRect(0, 0, W, H); ctx.restore(); }
+  if (t < 26.5) s_stage(t); else s_brand(t);
   overlay_labels(t);
   finish(t);
 }
 
 function overlay_labels(t) {
-  const y = 1030;
-  kinetic('your bots', 960, y, t, 0.8, 3.4, 60);
-  kinetic('heavy', 960, y, t, 4.2, 8.4, 64);
-  kinetic('no room', 960, y, t, 9.9, 11.0, 60, WARN);
+  const y = 1035;
+  kinetic('heavy', 960, y, t, 4.2, 10.8, 64);
   kinetic('built for people', 960, y, t, 12.4, 15.9, 60);
   kinetic('built for bots', 960, y, t, 17.2, 20.9, 64, COL.acc);
   kinetic('light', 960, y, t, 21.3, 23.9, 64);
