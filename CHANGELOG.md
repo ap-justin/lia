@@ -19,7 +19,7 @@ Merges fx 0.0.18.
 - An MCP tool error gives the model the details the server sent, up to 8 KiB. `$${VAR}` in an MCP config reaches the server as `${VAR}`. lia says when it refuses an MCP server's tool list or login.
 - `read_file` reads a line field of 0 as unset, and a read skipped because of new folder rules tells the model to send it again.
 - Max effort goes to AI Gateway unchanged, and lia says when the Gateway leaves out an effort.
-- The `statusLine` and `notifications` settings are no longer read; `sound` replaces `notifications`.
+- The `statusLine` setting is no longer read. lia still reads `notifications` as the older name for `sound` until lia 0.2.0.
 - `"*": "deny"`, `"web_fetch": "deny"` and `"web_fetch": "ask"` in permission rules now apply to every `web_fetch` call.
 
 ### Fixes

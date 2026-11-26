@@ -99,7 +99,8 @@ pub fn parseArgs(
         return options;
     }
 
-    const key = words[1];
+    // An older name, such as `notifications.max`, means its current one.
+    const key = settings_keys.currentPath(words[1]);
     if (key.len == 0) return wordsProblem(problem, "the key is empty");
     if (settings_keys.unknownPart(key)) |part| {
         unknown_key.* = part;
@@ -301,7 +302,7 @@ pub const OverrideProblem = union(enum) {
 /// from `text`.
 pub fn parseOverride(text: []const u8, problem: *OverrideProblem) error{InvalidConfigOverride}!config_runtime.SettingOverride {
     const at = std.mem.findScalar(u8, text, '=') orelse return overrideProblem(problem, .malformed);
-    const key = text[0..at];
+    const key = settings_keys.currentPath(text[0..at]);
     const value = text[at + 1 ..];
     if (key.len == 0) return overrideProblem(problem, .malformed);
     if (settings_keys.unknownPart(key)) |part| return overrideProblem(problem, .{ .unknown = part });
@@ -675,8 +676,8 @@ test "config args default to list and take scope, origin, and json flags" {
     try std.testing.expect(listed.show_origin);
     try std.testing.expectEqual(output_contracts.OutputFormat.json, listed.format);
 
-    // Keys are the current names.
-    const got = try parseForTest(&.{ "get", "sound.max", "--global" });
+    // An older name means its current one.
+    const got = try parseForTest(&.{ "get", "notifications.max", "--global" });
     try std.testing.expectEqualStrings("sound.max", got.key.?);
     try std.testing.expectEqual(settings_entries.Scope.global, got.scope);
 }
@@ -699,7 +700,7 @@ test "config set and unset take a key, and set takes a value" {
     try std.testing.expectEqualStrings("fast_mode", set.key.?);
     try std.testing.expectEqualStrings("on", set.value.?);
 
-    const unset = try parseForTest(&.{ "unset", "sound.max", "--json" });
+    const unset = try parseForTest(&.{ "unset", "notifications.max", "--json" });
     try std.testing.expectEqual(Action.unset, unset.action);
     try std.testing.expect(unset.value == null);
 
@@ -720,7 +721,7 @@ test "config set turns each value into the patch the save path writes" {
     try std.testing.expectEqual(false, fast.patch.fast_mode.?);
     try std.testing.expect(!fast.value.?.bool);
 
-    const sound = try changeForTest(&.{ "set", "sound.max", "true" }, &problem);
+    const sound = try changeForTest(&.{ "set", "notifications.max", "true" }, &problem);
     try std.testing.expect(sound.patch.notification_max.?);
 
     const steps = try changeForTest(&.{ "set", "max_agent_steps", "0" }, &problem);
@@ -729,7 +730,7 @@ test "config set turns each value into the patch the save path writes" {
     const pinned = try changeForTest(&.{ "set", "theme", "LIGHT" }, &problem);
     try std.testing.expectEqualStrings("light", pinned.patch.theme.?);
 
-    const removed = try changeForTest(&.{ "unset", "sound.max" }, &problem);
+    const removed = try changeForTest(&.{ "unset", "notifications.max" }, &problem);
     try std.testing.expectEqualStrings("sound.max", removed.patch.remove.?);
     try std.testing.expect(removed.value == null);
 }
@@ -762,7 +763,7 @@ test "--config takes key=value with the keys and checks of config set" {
     const fast = try parseOverride("fast_mode=on", &problem);
     try std.testing.expectEqualStrings("fast_mode", fast.key);
     try std.testing.expect(fast.value.bool);
-    const sound = try parseOverride("sound.max=false", &problem);
+    const sound = try parseOverride("notifications.max=false", &problem);
     try std.testing.expectEqualStrings("sound.max", sound.key);
 
     const cases = [_]struct { text: []const u8, message: []const u8 }{
@@ -786,14 +787,14 @@ test "every key config set writes is a plain setting in the list" {
         try std.testing.expect(settings_keys.unknownPart(name) == null);
         const dot = comptime std.mem.findScalar(u8, name, '.');
         const key = settings_keys.find(name[0 .. dot orelse name.len]).?;
-        try std.testing.expect(!key.map and key.where != .retired);
+        try std.testing.expect(!key.map and key.where != .retired and key.renamed_to == null);
     }
 }
 
 test "config get names the part of a key that isn't a setting" {
     var unknown: ?settings_keys.UnknownPart = null;
     var problem: ?[]const u8 = null;
-    try std.testing.expectError(error.UnknownConfigSetting, parseArgs(&.{ "get", "sound.mx" }, &unknown, &problem));
+    try std.testing.expectError(error.UnknownConfigSetting, parseArgs(&.{ "get", "notifications.mx" }, &unknown, &problem));
     try std.testing.expectEqualStrings("mx", unknown.?.name);
     try std.testing.expectEqualStrings("sound", unknown.?.parent.?);
 }
@@ -984,7 +985,7 @@ test "every plain setting is resolved or deliberately shown from the files" {
             .retired => continue,
             else => {},
         }
-        if (key.kind == .refused) continue;
+        if (key.kind == .refused or key.renamed_to != null) continue;
         if (key.kind == .switches) {
             for (key.children) |child| {
                 var buf: [96]u8 = undefined;

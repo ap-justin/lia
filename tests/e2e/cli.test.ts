@@ -1040,18 +1040,17 @@ describe("cli: status", () => {
         const warnings = JSON.parse(doctor.stdout)
           .checks.filter((check: { name: string; status: string }) => check.name === "config" && check.status === "warn")
           .map((check: { detail: string }) => check.detail);
-        // The renamed `statusLine` and `notifications` groups warn with their
-        // current names until lia 0.2.0. Their children are not checked, since
-        // lia ignores the groups.
+        // lia still reads `notifications` as the older name for `sound`, and
+        // doctor names the release that drops it.
         expect(warnings).toEqual([
           "unknown setting fast_mdoe in ~/.lia/settings.json (did you mean fast_mode?)",
           `unknown setting efort in ~/.lia/settings.json for workspace ${cwd} (did you mean effort?)`,
-          "statusLine in ~/.lia/settings.json is an older name for status_line, which lia no longer reads; rename it to status_line",
-          `notifications in ~/.lia/settings.json for workspace ${cwd} is an older name for sound, which lia no longer reads; rename it to sound`,
+          `notifications in ~/.lia/settings.json for workspace ${cwd} is deprecated and stops working in lia 0.2.0; rename it to sound`,
           "unknown setting max_agent_step in .lia.json (did you mean max_agent_steps?)",
         ]);
-        // status_line itself is retired: loaded and ignored, never diagnosed.
-        expect(doctor.stdout).not.toContain("status_line.");
+        // statusLine and status_line are retired: loaded and ignored, never diagnosed.
+        expect(doctor.stdout).not.toContain("statusLine");
+        expect(doctor.stdout).not.toContain("status_line");
 
         const status = await runLia(["status"], { cwd, env });
         expect(status.code).toBe(0);

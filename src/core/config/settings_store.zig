@@ -1002,7 +1002,14 @@ fn removePath(object: *std.json.ObjectMap, path: []const u8) bool {
         if (removed and std.mem.eql(u8, path, "fast_mode")) _ = object.orderedRemove("fast_mode_model_bound");
         return removed;
     };
-    return removeChild(object, path[0..dot], path[dot + 1 ..]);
+    var removed = removeChild(object, path[0..dot], path[dot + 1 ..]);
+    // A renamed group, such as `sound`, may still hold the value under
+    // its older name, which would otherwise keep applying.
+    for (settings_keys.keys) |key| {
+        const current = key.renamed_to orelse continue;
+        if (std.mem.eql(u8, current, path[0..dot])) removed = removeChild(object, key.name, path[dot + 1 ..]) or removed;
+    }
+    return removed;
 }
 
 fn removeChild(object: *std.json.ObjectMap, parent_key: []const u8, child: []const u8) bool {
@@ -1055,7 +1062,7 @@ test "removing a plain preference clears it and an emptied parent" {
     var root = try std.json.parseFromSliceLeaky(
         std.json.Value,
         arena.allocator(),
-        "{\"fast_mode\":true,\"fast_mode_model_bound\":true,\"prompt_history\":{\"enabled\":true},\"sound\":{\"max\":true,\"turn_end\":true}}",
+        "{\"fast_mode\":true,\"fast_mode_model_bound\":true,\"prompt_history\":{\"enabled\":true},\"notifications\":{\"max\":true,\"turn_end\":true}}",
         .{},
     );
     try std.testing.expect((try applyUserPatchToRoot(arena.allocator(), &root, .{ .remove = "fast_mode" })).changed);
@@ -1064,8 +1071,8 @@ test "removing a plain preference clears it and an emptied parent" {
     try std.testing.expect((try applyUserPatchToRoot(arena.allocator(), &root, .{ .remove = "prompt_history.enabled" })).changed);
     try std.testing.expect(!root.object.contains("prompt_history"));
 
-    try std.testing.expect((try applyUserPatchToRoot(arena.allocator(), &root, .{ .remove = "sound.max" })).changed);
-    try std.testing.expect(root.object.get("sound").?.object.contains("turn_end"));
+    try std.testing.expect((try applyUserPatchToRoot(arena.allocator(), &root, .{ .remove = "notifications.max" })).changed);
+    try std.testing.expect(root.object.get("notifications").?.object.contains("turn_end"));
 
     try std.testing.expect(!(try applyUserPatchToRoot(arena.allocator(), &root, .{ .remove = "theme" })).changed);
 }
@@ -1073,7 +1080,7 @@ test "removing a plain preference clears it and an emptied parent" {
 test "plain preference patches reject values the parser would refuse" {
     try validateUserPatch(.{ .theme = "light" });
     try validateUserPatch(.{ .theme = "my-theme.v2" });
-    try validateUserPatch(.{ .remove = "sound.max" });
+    try validateUserPatch(.{ .remove = "notifications.max" });
     const bad = [_]UserSettingsPatch{
         .{ .theme = "" },
         .{ .theme = "../escape" },
@@ -1082,7 +1089,6 @@ test "plain preference patches reject values the parser would refuse" {
         .{ .remove = "models" },
         .{ .remove = "models.gateway" },
         .{ .remove = "sound.mx" },
-        .{ .remove = "notifications.max" },
         .{ .remove = "fast_mdoe" },
         .{ .remove = "status_line.context" },
         .{ .remove = "startup_scrollback" },
@@ -1233,7 +1239,7 @@ fn applyUserPatchToRoot(
         patch.notification_attention_required != null or
         patch.notification_max != null)
     {
-        const notifications = try ensureGroup(arena, &root.object, "sound", &application.changed);
+        const notifications = try renamedGroup(arena, &root.object, "notifications", "sound", &application.changed);
         if (patch.notification_turn_end) |enabled| {
             application.changed = try putBool(arena, notifications, "turn_end", enabled) or application.changed;
         }
@@ -1774,6 +1780,43 @@ fn ensureGroup(arena: Allocator, root: *std.json.ObjectMap, name: []const u8, ch
         try root.put(arena, name, .{ .object = .empty });
     }
     return &root.getPtr(name).?.object;
+}
+
+/// The object a renamed settings group is saved under, such as `sound` for
+/// the older `notifications`. Values that only the older key sets move into
+/// the current one, and the older key is removed, so the file keeps one
+/// spelling. A value both keys set keeps the current one, which startup
+/// already used, and the older value is dropped with a log line. Sets
+/// `changed` when the older key was there. The current name was an unknown
+/// key before the rename, so a value under it that isn't an object is one lia
+/// never used, and saving replaces it.
+fn renamedGroup(
+    arena: Allocator,
+    root: *std.json.ObjectMap,
+    older: []const u8,
+    current: []const u8,
+    changed: *bool,
+) !*std.json.ObjectMap {
+    _ = try ensureGroup(arena, root, current, changed);
+    if (root.get(older)) |value| {
+        if (value != .object) return error.InvalidSettingsFormat;
+        const group = &root.getPtr(current).?.object;
+        var iterator = value.object.iterator();
+        while (iterator.next()) |entry| {
+            if (group.contains(entry.key_ptr.*)) {
+                debug_trace.logf(
+                    "config",
+                    "dropping {s}.{s} while renaming {s} to {s}: {s}.{s} is also set and wins",
+                    .{ older, entry.key_ptr.*, older, current, current, entry.key_ptr.* },
+                );
+                continue;
+            }
+            try group.put(arena, entry.key_ptr.*, entry.value_ptr.*);
+        }
+        _ = root.orderedRemove(older);
+        changed.* = true;
+    }
+    return &root.getPtr(current).?.object;
 }
 
 fn putModelPreference(
@@ -2404,7 +2447,47 @@ test "user patch retires presentation settings without rejecting their values" {
     try std.testing.expect(std.mem.find(u8, bytes, "\"future\":{\"workspace\":2}") != null);
 }
 
-test "saving replaces a stray sound value and leaves an old notifications group alone" {
+test "saving moves a renamed group, and remove clears either spelling" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.lia");
+    try writeStoreFixture(
+        tmp.dir,
+        "home/.lia/settings.json",
+        "{\"notifications\":{\"max\":false,\"turn_end\":true},\"sound\":{\"max\":true}}\n",
+    );
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    var store = try Store.initFromHome(alloc, home, .writable);
+    defer store.deinit(alloc);
+
+    var moved = try store.applyUserPatch(alloc, .{ .notification_attention_required = true });
+    defer moved.deinit(alloc);
+    try std.testing.expect(moved == .committed);
+    {
+        const bytes = try store.readPrimaryForTest(alloc);
+        defer alloc.free(bytes);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.object.get("notifications") == null);
+        const sound = parsed.value.object.get("sound").?.object;
+        // The current key keeps its own value; the older one only fills gaps.
+        try std.testing.expect(sound.get("max").?.bool);
+        try std.testing.expect(sound.get("turn_end").?.bool);
+        try std.testing.expect(sound.get("attention_required").?.bool);
+    }
+
+    var removed = try store.applyUserPatch(alloc, .{ .remove = "sound.max" });
+    defer removed.deinit(alloc);
+    try std.testing.expect(removed == .committed);
+    const bytes = try store.readPrimaryForTest(alloc);
+    defer alloc.free(bytes);
+    try std.testing.expect(std.mem.find(u8, bytes, "notifications") == null);
+    try std.testing.expect(std.mem.find(u8, bytes, "\"max\"") == null);
+}
+
+test "saving a renamed group replaces a stray value lia ignored under its current name" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2423,10 +2506,10 @@ test "saving replaces a stray sound value and leaves an old notifications group 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
     defer parsed.deinit();
     const sound = parsed.value.object.get("sound").?.object;
-    try std.testing.expect(sound.get("max") == null);
+    try std.testing.expect(sound.get("max").?.bool);
     try std.testing.expect(!sound.get("turn_end").?.bool);
     try std.testing.expect(parsed.value.object.get("status_line") == null);
-    try std.testing.expect(parsed.value.object.get("notifications") != null);
+    try std.testing.expect(parsed.value.object.get("notifications") == null);
 }
 
 test "durable validation rejects malformed prompt history" {
@@ -2459,8 +2542,8 @@ test "notification user patch preserves sibling fields and valid workspace overr
     try writeStoreFixture(
         tmp.dir,
         "home/.lia/settings.json",
-        "{\"sound\":{\"attention_required\":true,\"future\":7}," ++
-            "\"workspaces\":{\"/workspace\":{\"sound\":{\"turn_end\":false," ++
+        "{\"notifications\":{\"attention_required\":true,\"future\":7}," ++
+            "\"workspaces\":{\"/workspace\":{\"notifications\":{\"turn_end\":false," ++
             "\"attention_required\":false,\"future\":8}}}}\n",
     );
 
@@ -2479,19 +2562,21 @@ test "notification user patch preserves sibling fields and valid workspace overr
     defer alloc.free(bytes);
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
     defer parsed.deinit();
-    const sound = parsed.value.object.get("sound").?.object;
-    try std.testing.expectEqual(true, sound.get("turn_end").?.bool);
-    try std.testing.expectEqual(true, sound.get("attention_required").?.bool);
-    try std.testing.expectEqual(true, sound.get("max").?.bool);
-    try std.testing.expectEqual(@as(i64, 7), sound.get("future").?.integer);
+    // Saving moves the older `notifications` group to `sound`.
+    try std.testing.expect(parsed.value.object.get("notifications") == null);
+    const notifications = parsed.value.object.get("sound").?.object;
+    try std.testing.expectEqual(true, notifications.get("turn_end").?.bool);
+    try std.testing.expectEqual(true, notifications.get("attention_required").?.bool);
+    try std.testing.expectEqual(true, notifications.get("max").?.bool);
+    try std.testing.expectEqual(@as(i64, 7), notifications.get("future").?.integer);
 
-    const workspace_sound = parsed.value.object
+    const workspace_notifications = parsed.value.object
         .get("workspaces").?.object
         .get("/workspace").?.object
-        .get("sound").?.object;
-    try std.testing.expectEqual(false, workspace_sound.get("turn_end").?.bool);
-    try std.testing.expectEqual(false, workspace_sound.get("attention_required").?.bool);
-    try std.testing.expectEqual(@as(i64, 8), workspace_sound.get("future").?.integer);
+        .get("notifications").?.object;
+    try std.testing.expectEqual(false, workspace_notifications.get("turn_end").?.bool);
+    try std.testing.expectEqual(false, workspace_notifications.get("attention_required").?.bool);
+    try std.testing.expectEqual(@as(i64, 8), workspace_notifications.get("future").?.integer);
 }
 
 test "user patch snapshots and removes legacy workspace copies" {

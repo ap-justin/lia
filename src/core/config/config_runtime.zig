@@ -1949,12 +1949,17 @@ fn parseProfileOnlyFields(
         }
     }
 
-    // `sound` is read as it is saved. A value that isn't an object is
-    // ignored, as lia ignores any key it doesn't use.
-    if (root.object.get("sound")) |sound_value| {
-        if (sound_value != .object) {
-            debug_trace.logf("config", "ignoring sound: not an object", .{});
-        } else {
+    // `sound` was `notifications`. The older name is read first, so the
+    // current one wins any value both set. The current name was an unknown
+    // key before, which startup ignores, so a value under it that isn't an
+    // object is still ignored.
+    for ([_]?std.json.Value{ root.object.get("notifications"), root.object.get("sound") }, 0..) |group, index| {
+        if (group) |sound_value| {
+            if (sound_value != .object) {
+                if (index == 0) return error.InvalidNotificationsType;
+                debug_trace.logf("config", "ignoring sound: not an object", .{});
+                continue;
+            }
             if (sound_value.object.get("turn_end")) |value| {
                 if (value != .bool) return error.InvalidNotificationTurnEndType;
                 settings.notification_turn_end = value.bool;
@@ -3041,19 +3046,25 @@ test "review_model parses, merges, and yields to LIA_REVIEW_MODEL" {
     try std.testing.expectEqualStrings("process/review", result.settings.review_model.?);
 }
 
-test "the old notifications group is not read; sound is" {
+test "renamed groups read either spelling and the current one wins" {
     const alloc = std.testing.allocator;
     var both = try parseSettingsJson(alloc,
         \\{"sound":{"max":true},"notifications":{"max":false,"turn_end":true}}
     );
     defer both.deinit(alloc);
-    try std.testing.expect(both.notification_max.?);
-    try std.testing.expect(both.notification_turn_end == null);
+    try std.testing.expect(both.notification_max.? and both.notification_turn_end.?);
 
-    // A sound value that isn't an object is ignored, as any unused value is.
+    var older = try parseSettingsJson(alloc, "{\"notifications\":{\"attention_required\":false,\"max\":true}}");
+    defer older.deinit(alloc);
+    try std.testing.expect(!older.notification_attention_required.?);
+    try std.testing.expect(older.notification_max.?);
+
+    // The current name was an unknown key before the rename, so a stray value
+    // of another type under it is ignored, not a startup failure.
     var stray = try parseSettingsJson(alloc, "{\"sound\":false,\"notifications\":{\"max\":true}}");
     defer stray.deinit(alloc);
-    try std.testing.expect(stray.notification_max == null);
+    try std.testing.expect(stray.notification_max.?);
+    try std.testing.expectError(error.InvalidNotificationsType, parseSettingsJson(alloc, "{\"notifications\":\"on\"}"));
 }
 
 test "an LIA_* override beats a setting override for one run" {
