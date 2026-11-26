@@ -2,13 +2,14 @@ import { afterEach, describe, expect, test } from "bun:test";
 import {
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   realpathSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runLia } from "../evals/eval-helpers";
+import { LIA_BIN, runLia } from "../evals/eval-helpers";
 import {
   LEGACY_REMOTE_TOOL_RESULT,
   startLegacyStreamableHttpFixture,
@@ -117,6 +118,7 @@ async function runAsk(
   activeGateway: ReturnType<typeof startFakeGateway>,
   prompt: string,
   extraEnv: Record<string, string> = {},
+  timeoutMs = 20_000,
 ) {
   return runLia(
     ["ask", "--json", "--auto", "--no-save", prompt],
@@ -126,7 +128,7 @@ async function runAsk(
         ...fixtureEnv(root, activeGateway),
         ...extraEnv,
       },
-      timeoutMs: 20_000,
+      timeoutMs,
     },
   );
 }
@@ -465,6 +467,194 @@ describe("version-scoped legacy MCP remote transports", () => {
     }
     expect(streamable.cancelledCalls).toBe(1);
   }, 30_000);
+
+  test("Streamable HTTP ends at once a call whose JSON body lia cannot read, with words that say so", async () => {
+    streamable = startLegacyStreamableHttpFixture("2025-06-18", { mode: "refused_json_body" });
+    const root = createRoot("refused-json", "http", streamable.url, 300_000);
+    gateway = startToolGateway("Refused JSON body complete.");
+    const started = Date.now();
+
+    const result = await runAsk(root, gateway, "Call the refused-body fixture.");
+
+    // It used to say "the connection failed", though the connection worked.
+    expect(result.code).toBe(0);
+    const text = toolResultText(gateway.requests[2]?.body ?? "", "call_mcp");
+    expect(text).toContain("the server's answer was malformed");
+    expect(text).not.toContain("the connection failed");
+    expect(Date.now() - started).toBeLessThan(15_000);
+
+    // The debug trace says that the body could not be read and how long it was, to the byte, and
+    // nothing of what it held.
+    const call = streamable.requests.find((entry) => entry.message?.method === "tools/call");
+    const encoder = new TextEncoder();
+    const bodyBytes =
+      encoder.encode('{"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"x').length +
+      2 +
+      encoder.encode(`"}]},"id":${call?.message?.id}}`).length;
+    const trace = readFileSync(root.traceLogPath, "utf8");
+    const ended = trace.split("\n").filter((line) => line.includes("MCP call ended"));
+    expect(ended).toHaveLength(1);
+    expect(ended[0]).toContain(`transport=http code=malformed reason=unreadable_body bytes=${bodyBytes}`);
+    for (const held of ["jsonrpc", "content", '"text"', '"id"']) {
+      expect({ held, traced: trace.includes(held) }).toEqual({ held, traced: false });
+    }
+  }, 30_000);
+
+  test("Streamable HTTP ends at once a call whose SSE event has its id and a jsonrpc that is not 2.0, as stdio does", async () => {
+    streamable = startLegacyStreamableHttpFixture("2025-06-18", { mode: "refused_sse_readable_id" });
+    const root = createRoot("refused-sse-id", "http", streamable.url, 300_000);
+    gateway = startToolGateway("Refused SSE event with an id complete.");
+    const started = Date.now();
+
+    // The stream stays open, so only the event itself can end the call.
+    const result = await runAsk(root, gateway, "Call the refused-event fixture.", {}, 40_000);
+
+    expect(result.code).toBe(0);
+    const text = toolResultText(gateway.requests[2]?.body ?? "", "call_mcp");
+    expect(text).toContain("invalid reply (its jsonrpc isn't");
+    expect(Date.now() - started).toBeLessThan(20_000);
+  }, 60_000);
+
+  test("Streamable HTTP ends a call whose SSE event names no request lia can read 30 seconds later, as malformed, and cancels it", async () => {
+    streamable = startLegacyStreamableHttpFixture("2025-06-18", { mode: "refused_sse_no_id" });
+    const root = createRoot("refused-sse-no-id", "http", streamable.url, 300_000);
+    gateway = startToolGateway("Refused SSE event complete.");
+    const started = Date.now();
+
+    // The event's bytes are not UTF-8 and its id comes after them, and the stream stays open.
+    const result = await runAsk(root, gateway, "Call the refused-event fixture.", {}, 75_000);
+    const seconds = (Date.now() - started) / 1000;
+
+    expect(result.code).toBe(0);
+    const text = toolResultText(gateway.requests[2]?.body ?? "", "call_mcp");
+    expect(text).toContain("the server's answer was malformed");
+    expect(text).not.toContain("operation timeout");
+    expect(seconds).toBeGreaterThan(28);
+    expect(seconds).toBeLessThan(55);
+    const deadline = Date.now() + 5_000;
+    while (streamable.cancellationNotifications === 0 && Date.now() < deadline) await Bun.sleep(25);
+    expect(streamable.cancellationNotifications).toBe(1);
+  }, 90_000);
+
+  // An event lia can't read, with no readable id, is about the call whose stream carried it. A call on
+  // another stream keeps its own timers, though it has been waiting longer than the grace. Two
+  // `lia mcp call` commands in one shell command put both calls in flight in the one host.
+  test("Streamable HTTP gives the grace of an unreadable event with no id to the call on its stream alone", async () => {
+    streamable = startLegacyStreamableHttpFixture("2025-06-18", { mode: "refused_sse_other_stream" });
+    const root = createRoot("refused-sse-two-streams", "http", streamable.url, 300_000);
+    const call = (text: string) => `"${LIA_BIN}" mcp call ${TOOL_NAME} '{"text":"${text}"}' > ${text}.out 2> ${text}.err`;
+    const command = [
+      `${call("slow")} & slow=$!`,
+      `${call("noisy")}; echo "noisy exit=$?"; cat noisy.err`,
+      `wait $slow; echo "slow exit=$?"; cat slow.out slow.err`,
+    ].join("\n");
+    let seen = "";
+    gateway = startFakeGateway([
+      // The shell tool hands control back after 30 seconds, and the calls end after 30 and 36.
+      fakeGatewayToolCall("run_calls", "shell", { action: "run", command, yield_time_ms: 30_000, timeout_ms: 100_000 }),
+      fakeGatewayToolCall("collect_calls", "shell", { action: "interact", session_id: "shell-1", yield_time_ms: 60_000 }),
+      (body: string) => {
+        seen = `${toolResultText(body, "run_calls")}\n${toolResultText(body, "collect_calls")}`;
+        return fakeGatewayFinalText("Two streams complete.");
+      },
+    ], {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    const started = Date.now();
+
+    const result = await runLia(["ask", "--json", "--full-access", "--no-save", "Call both."], {
+      cwd: root.workspace,
+      env: fixtureEnv(root, gateway),
+      timeoutMs: 120_000,
+    });
+    const seconds = (Date.now() - started) / 1000;
+
+    expect(result.code).toBe(0);
+    // The call on the noisy stream ends when its grace does, as malformed.
+    expect(seen).toContain("the server's answer was malformed");
+    // The other call is not touched: it waits for its answer, which comes after 36 seconds.
+    expect(seen).toContain("slow exit=0");
+    expect(seen).toContain(`${LEGACY_REMOTE_TOOL_RESULT}:slow`);
+    expect(seconds).toBeGreaterThan(34);
+    // One cancel, for the noisy call.
+    const deadline = Date.now() + 5_000;
+    while (streamable.cancellationNotifications === 0 && Date.now() < deadline) await Bun.sleep(25);
+    expect(streamable.cancellationNotifications).toBe(1);
+  }, 150_000);
+
+  test("an HTTP server that loses two calls in a row is started again, and the third call works", async () => {
+    const lostArgument = "lost-call-argument-text";
+    const bearerToken = "lost-restart-legacy-bearer-secret";
+    streamable = startLegacyStreamableHttpFixture("2025-11-25", {
+      breakCallsUntilRedetect: 2,
+    });
+    const root = createRoot("lost-restart", "http", streamable.url, 5_000, {
+      headers: {},
+      bearer_token_env: "MCP_LOST_RESTART_BEARER",
+    });
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("lost_select", "toolbox", { open: TOOL_NAME }),
+      fakeGatewayToolCall("lost_call_1", "toolbox", { run: TOOL_NAME, arguments: { text: lostArgument } }),
+      fakeGatewayToolCall("lost_call_2", "toolbox", { run: TOOL_NAME, arguments: { text: lostArgument } }),
+      fakeGatewayToolCall("lost_call_3", "toolbox", { run: TOOL_NAME, arguments: { text: "after-restart-argument" } }),
+      fakeGatewayFinalText("LOST_CALLS_RESTARTED"),
+    ], {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+
+    const result = await runAsk(
+      root,
+      gateway,
+      "Call the echo tool three times.",
+      { MCP_LOST_RESTART_BEARER: bearerToken },
+      30_000,
+    );
+
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).output).toContain("LOST_CALLS_RESTARTED");
+    expect(toolResultText(gateway.requests[2]!.body, "lost_call_1")).toContain("the server went away");
+    expect(toolResultText(gateway.requests[3]!.body, "lost_call_2")).toContain("the server went away");
+    expect(toolResultText(gateway.requests[4]!.body, "lost_call_3")).toContain(
+      `${LEGACY_REMOTE_TOOL_RESULT}:after-restart-argument`,
+    );
+    // A new initialize, with a new session id, comes after the second broken call; call 3 goes out in that session.
+    expect(
+      streamable.requests
+        .filter((entry) => entry.httpMethod === "POST")
+        .map((entry) => entry.message?.method)
+        .filter((method) => method === "initialize" || method === "tools/call"),
+    ).toEqual(["initialize", "tools/call", "tools/call", "initialize", "tools/call"]);
+    expect(streamable.brokenCalls).toBe(2);
+    expect(
+      streamable.requests
+        .filter((entry) => entry.message?.method === "tools/call")
+        .map((entry) => [entry.message?.params?.arguments?.text, entry.headers["mcp-session-id"]]),
+    ).toEqual([
+      [lostArgument, "session-2025-11-25-1"],
+      [lostArgument, "session-2025-11-25-1"],
+      ["after-restart-argument", "session-2025-11-25-2"],
+    ]);
+    for (const request of streamable.requests) {
+      expect(request.headers.authorization).toBe(`Bearer ${bearerToken}`);
+    }
+
+    const trace = readFileSync(root.traceLogPath, "utf8");
+    expect(
+      trace
+        .split("\n")
+        .filter((line) => line.includes("MCP call lost"))
+        .map((line) => line.slice(line.indexOf("MCP call lost"))),
+    ).toEqual([
+      "MCP call lost server=fixture transport=http why=stream_ended protocol=2025-11-25 status=200 restarted=false",
+      "MCP call lost server=fixture transport=http why=stream_ended protocol=2025-11-25 status=200 restarted=true",
+    ]);
+    expect(trace).not.toContain("why=unknown");
+    expect(trace).not.toContain(bearerToken);
+    expect(trace).not.toContain(lostArgument);
+    expect(trace).not.toContain("after-restart-argument");
+    expect(result.stdout).not.toContain(bearerToken);
+    expect(result.stderr).not.toContain(bearerToken);
+  }, 60_000);
 
   test("Streamable HTTP reinitializes an expired session and retries the call it refused", async () => {
     const version = "2025-06-18";

@@ -64,16 +64,14 @@ pub const Snapshot = struct {
 };
 
 const CollectOptions = struct {
-    /// Old side folders whose session is gone: counted, or removed with
-    /// `lia doctor --fix`.
-    orphans: session_adapter.OrphanSweep = .count,
     version: []const u8 = "",
     channel: []const u8 = "",
     skill_root_policy: skill_contract.RootPolicy = .{ .managed_root_source = null },
 };
 
-/// The checks that read only this machine. The network and process checks
-/// live in `doctor_probes.zig`.
+/// The checks that read only this machine, except the saved sessions, which
+/// `appendStateChecks` checks. The network and process checks live in
+/// `doctor_probes.zig`.
 pub fn collect(
     alloc: Allocator,
     secret_store: host.SecretStore,
@@ -123,7 +121,6 @@ pub fn collect(
         try appendMcpIssueChecks(&checks, alloc, mcp_issues);
         try appendAuthCheck(&checks, alloc, snapshot.auth, snapshot.provider);
         try appendConfigLoadFailureCheck(&checks, alloc, "startup", "failed to resolve startup settings", err);
-        try appendStateChecks(&checks, alloc, options.orphans);
         try appendGitCheck(&checks, alloc, snapshot.workspace_root);
         try appendSkillChecks(&checks, alloc, snapshot.workspace_root, options.skill_root_policy);
 
@@ -157,7 +154,6 @@ pub fn collect(
         .permission_mode = detailed.settings.permission_mode,
         .max_agent_steps = detailed.settings.max_agent_steps,
     }, default_agent_step_limit);
-    try appendStateChecks(&checks, alloc, options.orphans);
     try appendGitCheck(&checks, alloc, snapshot.workspace_root);
     try appendSkillChecks(&checks, alloc, snapshot.workspace_root, options.skill_root_policy);
 
@@ -237,15 +233,6 @@ fn appendUnknownSettingChecksFor(
     defer alloc.free(unknown);
     for (unknown) |key| {
         try appendCheckOwnedFix(checks, alloc, "config", .warn, try settings_messages.formatUnknownSetting(alloc, key, display_path), try alloc.print("rename or remove that key in {s}", .{display_path}));
-    }
-    const older = try settings_keys.findOlderNames(alloc, parsed.value, file);
-    defer alloc.free(older);
-    for (older) |entry| {
-        const fix = if (entry.both)
-            try alloc.print("remove {s} from {s}", .{ entry.older, display_path })
-        else
-            try alloc.print("rename {s} to {s} in {s}", .{ entry.older, entry.current, display_path });
-        try appendCheckOwnedFix(checks, alloc, "config", .warn, try settings_messages.formatOlderName(alloc, entry, display_path), fix);
     }
     if (parsed.value != .object) return;
     try appendOldYolo(checks, alloc, parsed.value.object, null, display_path);
@@ -392,16 +379,38 @@ fn formatConfigLoadFailure(alloc: Allocator, prefix: []const u8, err: anyerror) 
     return alloc.print("{s}: {s}", .{ prefix, @errorName(err) });
 }
 
+/// How `appendStateChecks` checks the saved sessions.
+pub const StateOptions = struct {
+    orphans: session_adapter.OrphanSweep = .count,
+    /// Plain `lia doctor` uses `exists`; `lia doctor --deep` reads and hashes
+    /// every blob.
+    blobs: @FieldType(session_adapter.DoctorOptions, "blobs") = .hash,
+    stop: @FieldType(session_adapter.DoctorOptions, "stop") = null,
+    progress: @FieldType(session_adapter.DoctorOptions, "progress") = null,
+    /// The limit `stop` enforces, in milliseconds, for the report; null when
+    /// there is none.
+    limit_ms: ?i64 = null,
+};
+
 /// Reports damaged sessions, and counts side folders whose session is gone
-/// or removes them, as `orphans` says (D36). Rebuilds nothing.
-fn appendStateChecks(checks: *std.ArrayList(Check), alloc: Allocator, orphans: session_adapter.OrphanSweep) !void {
+/// or removes them, as `options.orphans` says (D36). Rebuilds nothing.
+/// `collect` leaves these checks out, so `lia doctor` can run them while it
+/// waits on the network checks.
+pub fn appendStateChecks(checks: *std.ArrayList(Check), alloc: Allocator, options: StateOptions) !void {
     var store = session_adapter.Store.openFromEnv(alloc) catch |err| {
         const status: CheckStatus = if (err == error.HomeNotSet) .warn else .fail;
         try appendStateFailure(checks, alloc, status, err);
         return;
     };
     defer store.deinit(alloc);
-    var report = session_adapter.doctor(&store, alloc, default_session_diagnostics_limit, io_mod.milliTimestamp(), orphans) catch |err| {
+    var report = session_adapter.doctorWith(&store, alloc, .{
+        .limit = default_session_diagnostics_limit,
+        .now_ms = io_mod.milliTimestamp(),
+        .orphans = options.orphans,
+        .blobs = options.blobs,
+        .stop = options.stop,
+        .progress = options.progress,
+    }) catch |err| {
         try appendStateFailure(checks, alloc, .fail, err);
         return;
     };
@@ -416,8 +425,22 @@ fn appendStateChecks(checks: *std.ArrayList(Check), alloc: Allocator, orphans: s
         const detail = try alloc.print("session {s}, a subagent an older lia saved, is kept as it is: {s}", .{ kept.id, kept.reason });
         try appendCheckOwned(checks, alloc, "session", .ok, detail);
     }
+    if (report.unfinished > 0) {
+        const detail = if (options.limit_ms) |limit_ms|
+            try alloc.print("{d} of {d} session(s) were not checked to the end in doctor's {d} s limit; lia doctor --deep checks them all", .{ report.unfinished, report.checked + report.unfinished, @divCeil(limit_ms, 1000) })
+        else
+            try alloc.print("{d} session(s) were not checked to the end", .{report.unfinished});
+        try appendCheckOwned(checks, alloc, "sessions", .ok, detail);
+    }
+    if (report.v1_incomplete) {
+        const detail = if (options.limit_ms) |limit_ms|
+            try alloc.print("sessions saved by an older lia were not all read in doctor's {d} s limit; lia doctor --deep reads them all", .{@divCeil(limit_ms, 1000)})
+        else
+            try alloc.dupe(u8, "sessions saved by an older lia were not all read");
+        try appendCheckOwned(checks, alloc, "sessions", .ok, detail);
+    }
     // The limit covers v1's unconverted sessions too (D73).
-    if (report.checked < report.sessions + report.unconverted) try appendSessionDiagnosticsTruncatedCheck(checks, alloc, report.checked);
+    if (report.checked + report.unfinished < report.sessions + report.unconverted) try appendSessionDiagnosticsTruncatedCheck(checks, alloc, report.checked + report.unfinished);
     if (report.removable > 0) {
         const detail = try alloc.print("{d} old terminal or side folder(s) whose session is gone can be removed", .{report.removable});
         try appendCheckOwnedFix(checks, alloc, "session", .warn, detail, try alloc.dupe(u8, "lia doctor --fix"));
@@ -523,6 +546,10 @@ fn appendGitCheck(checks: *std.ArrayList(Check), alloc: Allocator, workspace_roo
                 .repo_config_unavailable => .{ "lia could not read this repository's git config", "git config --list --show-origin" },
                 .unsupported_filter_name => .{ "this repository's git config names a filter lia cannot turn off, so lia does not run git here", "rename that filter in the repository's git config so its name has no =" },
                 .repository_mismatch => .{ "git would use a different repository than the one lia read here", "check GIT_DIR and GIT_WORK_TREE" },
+                .hook_config_unavailable => .{ "lia could not list the hooks your git config defines", "git config --get-regexp '^hook\\..*\\.command$'" },
+                .unsupported_hook_name => .{ "your git config names a hook with = in its name, which lia cannot turn off", "rename that hook so its name has no =" },
+                .timed_out => .{ "git did not answer lia's checks in time", "run lia doctor again" },
+                .cancelled => .{ "lia's git checks were cancelled", "run lia doctor again" },
             };
             try checks.append(alloc, .{ .name = "git", .status = .warn, .detail = text[0], .fix = text[1] });
         },
@@ -709,14 +736,14 @@ fn appendMcpConfigCheck(
     }
 }
 
-/// One failure for each issue the MCP config inspection found, as for a
-/// `~/.lia/mcp.json` lia cannot read. The inspection reads `~/.lia/mcp.json`
-/// whole, so a problem there fails the file (`appendMcpConfigCheck`), and
-/// its issues all come from the project's `.mcp.json`, each one a server
-/// that does not load (`builtin_mcp.inspectLocalConfig`).
+/// One failure for each issue the MCP config inspection found: a server of
+/// `~/.lia/mcp.json` or of the project's `.mcp.json` that does not load
+/// (`builtin_mcp.inspectLocalConfig`), which reads the profile as the runtime
+/// does, so one bad entry never fails the file (`appendMcpConfigCheck`).
 fn appendMcpIssueChecks(checks: *std.ArrayList(Check), alloc: Allocator, issues: []const mcp_health.ConfigurationIssue) !void {
     for (issues) |issue| {
-        try appendCheckOwnedStaticFix(checks, alloc, "mcp_config", .fail, try alloc.dupe(u8, issue.message), "fix .mcp.json, then run lia doctor again");
+        const fix = if (issue.profile) profile_paths.displayText("fix ~/.lia/mcp.json, then run lia doctor again") else "fix .mcp.json, then run lia doctor again";
+        try appendCheckOwnedStaticFix(checks, alloc, "mcp_config", .fail, try alloc.dupe(u8, issue.message), fix);
     }
 }
 

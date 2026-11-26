@@ -1,119 +1,152 @@
 ---
 name: lia-cli-shape
-description: Choose the mechanism and the names for any user-facing control in lia, and check changes against the agreed shape. Covers subcommands, arguments, flags and options, settings keys in settings.json and .lia.json, environment variables (LIA_ env vars), slash commands, JSON output, and exit codes. Use when adding, renaming, deprecating, removing, or reviewing one, for example "add a flag", "add an option", "new env var", "make this configurable", "let users turn on X", "add a slash command", "remove this command", "what should this flag be called", "deprecate this flag", "should this be a flag or a setting", or a diff that touches src/builtins/commands.zig, src/core/cli/, src/core/config/, or adds an LIA_ env read. Not for parser internals or writing documentation prose.
+description: Decide what kind of user-facing control to build in lia and what to call it, and check a change against the agreed shape. Covers top-level commands, subcommands, arguments, flags, settings keys in settings.json and .lia.json, LIA_ env vars, JSON output, and exit codes. Use when adding, renaming, deprecating, removing, or reviewing one, such as "add a command", "subcommand or flag?", "flag or setting?", "new env var", "make this configurable", "what should this be called", or a diff that touches src/builtins/commands.zig, src/core/cli/, src/core/config/, or adds an LIA_ env read. Not for writing documentation prose.
 ---
 
 # lia CLI shape
 
-lia follows git and Unix conventions for how people and scripts control it. Each concept gets one mechanism and one name, so anyone who knows git can guess the command, flag, or setting. Use this skill to pick the mechanism for a new control, name it on every surface, and check a change before it lands. The maintainers agreed on these rules; follow them unless a maintainer says otherwise in the conversation.
+This skill tells you which kind of control to build and what to call it. lia follows the shape that git, gh, docker, and the Vercel CLI share, so people who know those tools can guess lia's commands. Follow these rules unless a maintainer says otherwise in the conversation.
 
-## Values
+## The shape of a command
 
-Every rule below comes from these values. When a case isn't covered, decide by them, then ask a maintainer.
+```
+lia  session  fork    last --json
+     group    verb    argument flag
 
-- **Guessable.** Someone who knows git and the Unix command line should predict what a control is called, where its options go, and which source wins. Follow open standards first, such as `AGENTS.md`, the Agent Skills folders, MCP's `mcp.json`, and `NO_COLOR`; then git; then what other coding agents agree on. When copying a reference would make a command harder to type, the shorter form wins.
-- **One concept, one name.** A setting is spelled the same in settings files, flags, env vars, slash commands, JSON, and ACP. Only each surface's case changes.
-- **One job per mechanism.** Subcommands act, arguments name what they act on, flags shape one run, settings persist, env vars carry context from the surroundings, and slash commands act inside a session.
-- **Scripts are first-class.** Data goes to stdout and diagnostics to stderr, JSON fields stay stable, exit codes mean something, and lia never prompts without a terminal.
-- **Untrusted input stays limited.** A committed project file or a repository's content never gets the power of the user's own profile.
-- **One source of truth.** Help, parsing, completion, and the CI checks read the same specs and registries, so they can't disagree.
-- **Small surface.** Adding a control takes one change and taking it back takes a deprecation, so a new control has to show why an existing one can't be extended.
-- **Never break users silently.** A rename keeps the old spelling working with a warning that names its replacement and the release that drops it.
+lia  ask      "fix the login bug"  --model <id>
+     verb     argument             flag
+```
 
-## Current versus target
+| Part | Job | Lasts | Example |
+|---|---|---|---|
+| Top-level command | A main job, or a group of jobs on one thing | One run | `lia ask`, `lia session` |
+| Subcommand | One job on the group's thing | One run | `lia session fork`, `lia mcp add` |
+| Argument | What the job works on | One run | `<id>`, `<name>`, `<path>` |
+| Flag | How this run works: scope, amount, filter, or format | One run | `--all`, `--limit 20`, `--json` |
+| Setting | A choice lia remembers | Until changed | `fast_mode` in `~/.lia/settings.json` |
+| Env var | Context from CI, a wrapper, the terminal, debugging, or tests | The process | `LIA_TRACE=1` |
 
-One piece the rules rely on isn't built yet: the Experimental section of `/settings`. Design new work toward them, but never tell a user to run something that doesn't exist yet. Check `./zig-out/bin/lia help` and `./zig-out/bin/lia <command> --help` when unsure. When a target piece is missing, use the nearest current pattern and say what's missing.
+## Ways into lia
 
-## Decision order
+lia has no interactive session: plain `lia` prints its help and exits 0, and a first word that is no command exits 2 with a hint.
 
-Ask in order and stop at the first yes:
+| Way in | What it does | Takes |
+|---|---|---|
+| `lia ask "<prompt>"` | Runs one request and exits. Scripts use this; `--resume <last\|id>` continues a saved session | The agent-run set, plus `--json`, `--timeout`, and `--config key=value` |
+| `lia acp` | Serves an editor over ACP | The agent-run set without the 2 provider-order flags, which do nothing in ACP |
+| `lia pr`, `lia issue` | Runs the agent on a pull request or an issue | The agent-run set |
+| Every other command | Does one job without the agent, such as `lia status` | Only its own flags |
 
-1. Is it an action? Use a subcommand, named as a verb or a noun plus a verb. Inside a session, a slash command with the same name.
-2. Is it what the action works on? Use an argument.
-3. Is it a secret? Use the credential store, with an env var only for CI. Never a flag, which shows up in `ps` and shell history, and never `.lia.json`.
-4. Does it matter for this run only? Use a flag.
-5. Should it persist? Use a setting, plus a flag with the same name for one-off overrides.
-6. Is it safe for an untrusted repo to set, and useful for a team to share? It may also be project-safe in `.lia.json`, with a maintainer's approval.
-7. Is it set by CI, a wrapper, a terminal, debugging, or tests? Use an env var in the right namespace.
-8. Is it unfinished? Use an `experimental.<name>` setting.
+A flag goes in one of 2 places:
 
-## Core rules
+- **Launch-wide flags go before the command**, because they shape the whole launch, as in `git -C dir log`: `--add-dir`, `--no-additional-dirs`, `--context-limit`, and `--tool-placement`.
+- **Agent-run flags go after the command**: `--model`, `--provider`, `--effort`, `--fast`, `--ultrafast`, `--provider-order`, `--provider-strict`, and `--permission-mode`. Every way in that runs the agent takes the whole set, so a new agent-run flag is added to the set once and works everywhere.
 
-These are the rules agents most often get wrong. [references/rules.md](references/rules.md) has the full set, with what's built today.
+A new way in is a new top-level command, and it takes the whole agent-run set.
 
-**Extend before adding.** Before adding a command, flag, setting, or env var, check whether extending an existing command or control covers the need, for example a scope flag on `lia usage` instead of a new `lia stats`. Every new control is a promise that costs a deprecation to take back. When a new one is still the right call, say why the existing one can't be extended.
+## Pick the mechanism
 
-**Names.** One concept, one name, cased per surface: snake_case for settings and JSON (`permission_mode`), kebab-case for flags (`--permission-mode`), `LIA_` plus upper snake case for env vars (`LIA_PERMISSION_MODE`). Values use the same words everywhere. Before naming anything, check [references/decided-names.md](references/decided-names.md) and reuse what's there. A second spelling for an existing concept is the drift this skill exists to stop.
+Ask in order, and stop at the first yes:
 
-**Run flags never save; setter commands do.** A flag that shapes a run, on `lia`, `lia ask`, `lia pr`, or `lia acp`, affects only that run. git works the same way: `git pull --rebase` doesn't save `pull.rebase`. A setter command, whose whole job is to change something, saves what it changes, like `rustup default stable`: `lia config set`, `lia provider gateway`, `lia login`, and `lia teams`. A setter should print one line naming the value and the file it went to, as `lia config set fast_mode on` prints `fast_mode set to true in ~/.lia/settings.json.` If asked for a run flag that saves, lead with the conflict and the compliant path: a setter command, or for the default model an edit to `~/.lia/settings.json`, since `lia config set` refuses the model keys and points there.
+1. Is it a job people do? Make it a subcommand of the group for that thing.
+2. Is it the thing the job works on? Make it an argument.
+3. Is it a secret? Use the credential store through `lia login`, with an env var only for CI. Never a flag, which shows in `ps` and shell history, and never `.lia.json`.
+4. Does it change how one run works? Make it a flag.
+5. Should lia remember it? Make it a setting, plus a flag with the same name for one run.
+6. Should a team share it, and is it safe when an untrusted repo sets it? It may also go in `.lia.json`, with a maintainer's approval.
+7. Does it come from CI, a wrapper, the terminal, debugging, or tests? Make it an env var. An env var for a setting uses the setting's name, as `LIA_MODEL` pins the model for a whole CI job.
+8. Is it unfinished? Make it an `experimental.<name>` setting.
 
-**Flag syntax.** `--x value` and `--x=value` both work. Booleans pair `--x` with `--no-x`. When a flag repeats or conflicts, the last one wins, so wrappers and aliases can override earlier flags. An enum is one flag that takes the value. No value goes inside a flag name.
+### Subcommand or flag
 
-**Flag placement.** Agent-run flags (`--model`, `--provider`, `--effort`, `--fast`, `--ultrafast`, `--provider-order`, `--provider-strict`, `--permission-mode`) go after the subcommand, and every command that runs the agent accepts the whole set, parsed by `src/core/cli/agent_run_flags.zig`. `lia acp` leaves out the two provider-order flags, because ACP sessions don't apply gateway provider routing. Only launch-wide flags such as `--add-dir` go before a subcommand, as in `git -C dir log`.
+A different job is a subcommand. The same job done another way is a flag.
 
-**Env vars are for context, not preferences.** A setting gets a named env override only when CI or wrapper scripts need it for a whole process tree, and the override uses the setting's name: `max_agent_steps` becomes `LIA_MAX_AGENT_STEPS`, never a shorter invented name. Other settings take `lia ask --config key=value` for one run. Diagnostics use `LIA_TRACE*` and `LIA_RECORD*`, tests use `LIA_TEST_*`, and `LIA_HOME` moves lia's home. Respect `NO_COLOR` and `TERM=dumb`.
+| You want | Build | Why |
+|---|---|---|
+| List the saved sessions | `lia sessions ls` | A job on sessions |
+| List sessions from every workspace | `lia sessions ls --all` | Same job, wider scope |
+| Get the list as JSON | `lia sessions ls --json` | Same job, other format |
+| Copy one session | `lia session fork <id>` | Another job on one session |
+| Pick one of several values | `lia usage --period <today\|7d\|month>` | One flag takes the value |
 
-**Experiments are settings.** An unfinished feature is `experimental.<name>`, off by default and profile-only. It never gets its own flag or env var, so finishing or dropping it removes nothing people type.
+Wrong shapes, with made-up examples:
 
-**Project files are untrusted.** Anyone who can commit to a repo controls its `.lia.json`, so it accepts only project-safe keys. Permission settings, credentials, and experiments are never project-safe.
+- A flag that does a job: `lia session --delete <id>`. Make it `lia session remove <id>`.
+- A subcommand that only changes format, scope, or amount: `lia sessions list-json`. Make it a flag.
+- One flag per value: `--today`, `--week`, `--month`. Make one flag that takes the value.
+- A value in a flag's name: `--resume-<id>`. Make it `--resume <id>`.
 
-**Slash commands use the setting's name.** A slash command that changes a setting uses that setting's name and values (`/fast on` writes `fast_mode`), like vim's `:set number`. A slash action uses the CLI command's name (`/workspace add` matches `lia workspace add`).
+### Top-level command or subcommand
 
-**Output.** Results go to stdout and diagnostics to stderr. Every command that prints data accepts `--json`, and its fields are only added; a shape that must change goes behind `--json=v2`. Don't add a `schema_version` field: commands such as `lia status --json` name their shape with `kind`. Usage errors exit with 2 and real failures with 1. Errors name the bad input and suggest the closest match.
+When the job acts on a thing that already has a group, make it a subcommand. That is almost always the answer.
 
-**Precedence.** Highest first: managed by an administrator (reserved, not built), flag, env var, the profile's entry for this folder, the profile, the project's `.lia.json`, the default.
+A new top-level command needs a maintainer's approval, and one of these must be true:
 
-**Scopes.** Commands that choose where a setting lives use `--global` and `--workspace`, plus `--project` only when they write a committed file.
+- It is a main job that people start often and that belongs to no group, like `lia ask` and `lia login`.
+- It is a new kind of thing with 2 or more jobs, so it becomes a group, like `lia workspace` with `list`, `add`, `remove`, and `clear`.
 
-**Change over time.** Every control is stable, experimental, deprecated, or internal. Renaming or removing a stable control keeps the old name working with a warning for at least two releases and 30 days. The warning names the release that drops it, `old_spelling_removal` (0.2.0 for the current set), and CI fails once lia reaches it. Help and completion show only the new name.
+A thing with 1 job is a plain command with flags. First check whether a flag on an existing command covers the need, such as a scope flag on `lia usage` instead of a new `lia stats`.
+
+## Name it
+
+- **Groups use the singular noun**: `lia session`, `lia workspace`, `lia config`, as in `docker container` and `gh pr`. Where people already type the plural, it stays: `lia sessions`, `lia models`.
+- **Every group uses the same verbs**: `list`, `show`, `add`, `remove`, `get`, `set`, `unset`, `clear`. The short Unix word works too: `ls` for `list`, `rm` for `remove`. gh, docker, and the Vercel CLI accept both.
+- **A bare group runs its list** when listing changes nothing: `lia config` runs `lia config list`, and `lia sessions` runs `lia sessions ls`.
+- **One concept has one name on every surface**, and only the case changes:
+
+| Surface | Case | Example |
+|---|---|---|
+| Setting key and JSON field | snake_case | `permission_mode` |
+| Flag | kebab-case | `--permission-mode` |
+| Env var | `LIA_` plus upper snake case | `LIA_PERMISSION_MODE` |
+
+A flag or env var for a setting takes the setting's name: `session_titles` gets `--session-titles`, `--no-session-titles`, and `LIA_SESSION_TITLES`, never `--no-titles`. Read [references/decided-names.md](references/decided-names.md) before you name anything, and reuse what is there.
+
+## Rules agents get wrong
+
+- **Run flags never save, and setter commands do.** `lia ask --model <id>` changes only that run. A command whose whole job is to change something saves it and prints one line that names the value and the file: `lia config set fast_mode on` prints `fast_mode set to true in ~/.lia/settings.json.` Others are `lia provider gateway`, `lia login`, and `lia teams`. `lia config set` refuses the model keys; the default model is an edit to `~/.lia/settings.json`.
+- **Flag syntax.** `--x value` and `--x=value` both work, a boolean pairs `--x` with `--no-x`, and when flags repeat or conflict the last one wins.
+- **Env vars carry context, not preferences.** To change a setting for one `lia ask` run, use `--config key=value`.
+- **Output.** Results go to stdout and diagnostics to stderr. A command that prints data takes `--json`, and its fields are only added; commands such as `lia status --json` name their shape with `kind`, never a `schema_version`. Exit 0 means success, 1 means the work failed, and 2 means the command line is wrong.
+- **Renames never break users.** The old name keeps working for at least 2 releases and 30 days, with a warning built from `command_specs.deprecated_until` that names its replacement and `old_spelling_removal` (0.2.0 for the current set).
+
+[references/rules.md](references/rules.md) has these rules in full, and the rest: experiments, precedence, scopes, and error text.
+
+## Built today and planned
+
+Design toward the planned shape, but never tell a user to run something that does not exist. When unsure, run `./zig-out/bin/lia <command> --help`.
+
+| Planned | Today |
+|---|---|
+| One `lia session` group, also reached as `lia sessions` | 2 groups: `lia session` reads, forks, and recovers one session, and `lia sessions` lists and converts |
+| `lia model`, also reached as `lia models` | Only `lia models` |
+| `ls` and `rm` in every group, declared in the command specs | `ls` only in `lia sessions` and `lia models`, through a hand-written check. `list` only in `lia config`, `lia mcp`, and `lia workspace` |
 
 ## Workflow
 
-1. List every control the change adds, renames, or removes. For a diff, run [scripts/surface_diff.sh](scripts/surface_diff.sh) from the repo root; it prints lines such as `+ flag --fast-diff  src/builtins/commands.zig`. Matches come from string literals, so skip test fixtures.
-2. Walk each control through the decision order.
-3. Name it on every surface where it appears, starting from an existing name for the same concept. Search the settings list in `src/core/config/settings_keys.zig`, the specs in `src/builtins/commands.zig`, and decided-names.md. A one-run flag or env override for an existing setting takes that setting's name: for the `session_titles` setting it would be `--session-titles` and `--no-session-titles`, plus `LIA_SESSION_TITLES` if an env var is warranted, never `--no-titles`.
-4. Check it against the matching section of rules.md.
-5. List what else must change: the spec and help text in `src/builtins/commands.zig`, which completion also reads; parsing in `src/core/cli/`; for a setting, its `settings_keys.zig` entry, parsing in `src/core/config/config_runtime.zig`, and the `lia config` lists in `src/core/cli/cli_config.zig`; `tests/e2e/cli.test.ts`.
-6. Report, in this order: any conflict or approval the request needs; then the control, its mechanism, its name on each surface, and the rule behind each choice; then what else changes and what isn't built yet.
+1. List every control the change adds, renames, or removes. For a diff, run [scripts/surface_diff.sh](scripts/surface_diff.sh) from the repo root.
+2. Walk each one through "Pick the mechanism", and name it from an existing name: search `src/core/config/settings_keys.zig`, `src/builtins/commands.zig`, and decided-names.md.
+3. Check it against its section in [references/rules.md](references/rules.md).
+4. Find the files to change and the traps in [references/implementation.md](references/implementation.md).
+5. Run `python3 -m scripts.check_cli_shape`, the shape check CI runs.
+6. Report any conflict or needed approval first. Then give each control, its mechanism, its name on each surface, the rule behind each choice, and what is not built yet.
 
-When a request conflicts with a rule or needs a maintainer's approval, lead with the conflict: name the rule, say why it exists, and give the compliant version first. Describe the requested version only as a conditional, to build only if a maintainer approves the exception. Don't quietly build the non-compliant version, and don't quietly refuse.
+When a request breaks a rule, say so first: name the rule, give its reason, and offer the version that follows the rules. Build the requested version only if a maintainer approves the exception. When you review a diff, report shape problems next to bugs.
 
-When reviewing a diff, report shape findings alongside bug findings. A change can be broken and misnamed at once, and fixing the bug doesn't fix the name.
+## Stop and ask a maintainer
 
-## Stop and ask
+Ask before you:
 
-Ask a maintainer before:
+- add a top-level command, a stable env var, or a project-safe setting;
+- rename or remove a stable control: `lia ask --json` fields, ACP behavior, or stable env vars;
+- make an exception to these rules;
+- invent a rule for something they do not cover, such as `--quiet`, `--verbose`, `--dry-run`, signals, or file-write safety.
 
-- adding a new top-level command, a new stable env var, or a new project-safe setting;
-- renaming or removing a stable control: `lia ask --json` fields, ACP behavior, or stable env vars;
-- making any exception to a rule above.
-
-Ask before inventing a rule for something these rules don't cover: keyboard shortcuts, prompt shortcuts (`@`, `$`, `!`), verbosity levels (`--quiet`, `--verbose`), `--dry-run`, Ctrl+C and signals, and file-write safety.
-
-## Gotchas
-
-- Every command and slash command reads its flags through `cli_flags.Parser` in `src/core/cli/cli_flags.zig`, from the same `OptionDoc` list its help renders. The global flags before a command read `launch_options` in prefix mode, which stops at the first argument it doesn't own.
-- To add a flag, add an `OptionDoc` to the command's list and a field to that command's flag enum in its parser. `cli_flags.idTable` fails the build when the list and the enum disagree in either direction, so a flag can't be parsed and missing from help. When subcommands take different flags, give each list its own enum or map names to one enum at compile time, as `src/core/mcp_host/verbs.zig` does. A new global flag also needs a `top_level_flags` row, and a launch-wide one goes in `launch_wide_options`; a test in `commands.zig` checks both directions, and the usage line after a launch-flag mistake is built from `launch_options`.
-- Words typed in a session are plain slices, but the parser reads arguments as the CLI receives them. Copy them with `dupeSentinel` into an arena first, as `parse` in `src/core/mcp_host/verbs.zig` does for `lia mcp` and `/mcp`, rather than comparing flags by hand.
-- A subcommand offers only the flags in its own `options`, plus `--help`, in completion. When it takes its parent's flags, declare them on it, as `config list` and `get` and `login vercel` do; otherwise Tab stops offering them. Set `settable_key` on a `<key>` word that takes only the keys `lia config set` changes.
-- A flag that takes a number in a range writes the range in its placeholder, as `--limit <1-100>`, so a bad value gets `--limit takes a whole number from 1 to 100, not abc`. `flagProblem` in `cli_surface.zig` writes the same text for plain and `--json` errors; don't add a separate message for one of them.
-- `lia config get` without a scope reports the value a run uses, through `resolveSettings` in `src/core/app/app_lifecycle.zig`. A new plain setting goes in `resolved_keys` in `cli_config.zig`, or in `files_only_keys` with a reason; a unit test fails until it does.
-- Don't compare an argument with a flag literal by hand. CI's `python3 -m scripts.check_cli_shape` fails on it anywhere in `src/`, in either argument order or through a named constant, unless `scripts/cli_shape_registry.json` lists the flag in `hand_parsed_flags`, as it does for help and version detection and the fixed resume grammar, or the file in `hand_parsed_files`, as it does for code that reads another program's flags, such as the shell-command checks.
-- Run `./zig-out/bin/lia <command> --help` and the command itself after changing a flag.
-- `.lia.json` filtering is structural: only `parseProjectSafeFields` reads project files. Every key also goes in the settings list, `src/core/config/settings_keys.zig`, marked `.profile` or `.project_safe`. That list drives the "ignored in project" warning and `lia doctor`'s unknown-key report, and the CI shape check fails if a parser reads a key it lacks.
-- Every `LIA_*` name in `src/` must be registered, with a job and a stability, in `scripts/cli_shape_registry.json`, or CI fails. Known violations are listed there as exceptions, each with the change that removes it. A new exception needs a maintainer's approval; never add one to make a new control pass.
-- Full access is saved and printed as `full-access`, and `yolo` is read until lia 0.2.0, with `lia doctor` pointing it out. Only ACP's mode `_meta` and the lia-managed `yolo_acknowledged` key keep the old word.
-- Build a deprecation warning from `command_specs.deprecated_until`, as the replaced-command warning in `src/core/slash_commands/command_specs.zig` does with `"lia {s} " ++ deprecated_until ++ "; use {s}\n"`. Tests pin the full text, and writing the release by hand breaks when it moves.
-- A warning first ships in the first release tagged after it merges, which can be later than planned: check with `git tag --contains <merge commit>`. A version bump that reaches `old_spelling_removal` before a warning has shipped fails the shape check, so merge the change that removes old spellings only after the last release that warns about them is tagged.
-- Adding or removing a slash command changes the `/help` catalog count, which tests write as literals: `Commands <n>` in unit and E2E tests, `waitForHelpMenu(session, <n>)` in the E2E tests, and the `helpCatalogCount` assertion in `src/core/slash_commands/command_specs.zig`. Search `src` and `tests` for the old count and update every one; a missed one fails a unit test or a TUI test.
-- Remove a slash command that only prints a placeholder rather than hiding it, since a hidden command must be internal or deprecated. Add its name to the router's `parse rejects removed slash commands` test in `src/core/slash_commands/command_router.zig`, which uses the built-in registry, so the name can't come back by accident.
-- An `LIA_*` override listed in `src/core/config/env_settings.zig` shows in `lia config list`, and the shape check fails unless `scripts/cli_shape_registry.json` marks it `stable`.
-- `lia login vercel --api-key` pastes an AI Gateway API key. `lia setup` and `/setup` still work until lia 0.2.0 but warn: `lia setup` points to `lia login vercel --api-key`, and `/setup`, an alias of `/provider`, points to `/login` and `/provider`. Neither appears in help. Don't give "setup" a new meaning.
-- Resume has one kept spelling, `lia ask --resume <last|id>`; never add another form such as `--resume-latest`.
-- Every test hook starts with `LIA_TEST_`; CI rejects a test hook with any other prefix.
+When the rules do not cover a case, copy an open standard first, such as `AGENTS.md`, MCP's `mcp.json`, or `NO_COLOR`, then git, gh, and docker, and then ask.
 
 ## References
 
-- [references/rules.md](references/rules.md): every rule by mechanism, marked as built or planned. Read it when choosing names or reviewing a change in detail.
-- [references/decided-names.md](references/decided-names.md): names already settled. Read it before naming anything near resume, permissions, scopes, sound, experiments, aliases, setup, or login.
-- [scripts/surface_diff.sh](scripts/surface_diff.sh): lists the env vars, flags, commands, slash commands, and settings keys a diff adds or removes. Run `scripts/surface_diff.sh --help` for options.
+- [references/rules.md](references/rules.md): every rule by mechanism, with what is built.
+- [references/decided-names.md](references/decided-names.md): names already settled.
+- [references/implementation.md](references/implementation.md): where each control lives in the code, and the traps.
+- [scripts/surface_diff.sh](scripts/surface_diff.sh): the controls a diff adds or removes. Run it with `--help`.

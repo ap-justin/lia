@@ -138,7 +138,7 @@ pub fn run(arena: Allocator, io: std.Io, out: *Writer, err: *Writer, command: Co
             try err.print("lia mcp call: the connection to lia was lost ({s}). The call may have run; check its effect before running it again.\n", .{@errorName(e)});
             return exit.failed;
         },
-        else => return unavailable(err),
+        else => return shellCallReturned(err, e),
     };
     return printReply(arena, io, out, err, operation, reply);
 }
@@ -295,6 +295,11 @@ fn repeatedValues(items: []const std.json.Value, key: []const u8, out: *[max_hin
 
 fn unavailable(err: *Writer) !u8 {
     try err.writeAll("lia mcp call: no running lia shell call to reach. It works only in a command that lia's shell tool runs, while that call runs.\n");
+    return exit.unavailable;
+}
+
+fn shellCallReturned(err: *Writer, cause: anyerror) !u8 {
+    try err.print("lia mcp call: cannot reach lia ({s}). The lia shell call that ran this command has returned, or lia has exited. " ++ capability_mod.short_checks_advice ++ "\n", .{@errorName(cause)});
     return exit.unavailable;
 }
 

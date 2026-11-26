@@ -211,7 +211,7 @@ test "the settings.json schema lists every key lia reads there and nothing else"
     const sound = properties.get("sound").?.object;
     try std.testing.expectEqualStrings("boolean", sound.get("properties").?.object.get("turn_end").?.object.get("type").?.string);
     try std.testing.expect(!sound.contains("deprecated"));
-    try std.testing.expect(properties.get("notifications").?.object.get("deprecated").?.bool);
+    try std.testing.expect(properties.get("notifications") == null);
     try std.testing.expect(properties.get("status_line").?.object.get("deprecated").?.bool);
     try std.testing.expect(properties.get("model").?.object.get("deprecated").?.bool);
     try std.testing.expect(properties.get("skill_match_fuzzy").?.object.contains("not"));

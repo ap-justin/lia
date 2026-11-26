@@ -14,7 +14,7 @@ Report security vulnerabilities privately to the maintainers, not in a public is
 
 You need:
 
-- [Zig 0.17.0](https://ziglang.org/download/), the version CI builds with. Check `zig version` before you build, because an older Zig fails inside `build.zig` with errors such as `no field or member function named 'poisonCache'` that don't mention the version.
+- [Zig 0.17.1](https://ziglang.org/download/), the version CI builds with. Check `zig version` before you build. Zig 0.17.0 still builds lia without a warning, but CI tests only 0.17.1, and the PGSO pipeline stops on any other version. A Zig older than 0.17 fails inside `build.zig` with errors such as `no field or member function named 'poisonCache'` that don't mention the version.
 - [Bun](https://bun.sh) for the end-to-end tests.
 - [hyperfine](https://github.com/sharkdp/hyperfine), if you want to run the startup benchmark locally.
 
@@ -224,7 +224,7 @@ Other workflows and benchmark jobs also report on pull requests, such as the `Sh
 
 - The binary size workflow builds each release target for the pull request and its base commit on native runners, reports the size change, and smoke-tests every target's binary. Growth of 52,429 bytes (0.05 MiB) or more on a platform adds a warning. Investigate growth you can't explain.
 - The macOS arm64 PGSO workflow runs on a pull request only when the PGSO pipeline itself changes: `scripts/pgso/` other than `corpus.json`, the `setup-pgso` action, or `.github/workflows/pgso-macos-arm64.yml`. Stable releases always run it. [scripts/pgso/README.md](scripts/pgso/README.md) explains the pipeline and its acceptance gates.
-- The Linux arm64 PGSO workflow runs on the same pull request paths, with `.github/workflows/pgso-linux-arm64.yml` in place of the macOS workflow file. It qualifies a Linux candidate in one job, which takes several hours. The stable release always runs it and ships its candidate as the Linux arm64 binary. `.github/workflows/pgso-linux-x86_64.yml` qualifies a Linux x86_64 candidate the same way, and the stable release ships it as the Linux x86_64 binary.
+- The Linux arm64 PGSO workflow runs on the same pull request paths, with `.github/workflows/pgso-linux-arm64.yml` in place of the macOS workflow file. It qualifies a Linux candidate with the same sharded jobs as the macOS workflow. The stable release always runs it and ships its candidate as the Linux arm64 binary. `.github/workflows/pgso-linux-x86_64.yml` qualifies a Linux x86_64 candidate the same way, and the stable release ships it as the Linux x86_64 binary.
 
 Other runs start only on request:
 

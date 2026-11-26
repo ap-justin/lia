@@ -2,6 +2,7 @@
 //! does it, and so do `lia login`, `lia teams` and ACP `authenticate` once a
 //! sign-in is saved.
 const std = @import("std");
+const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const config_runtime = @import("../config/config_runtime.zig");
@@ -14,6 +15,10 @@ const provider_set = @import("../gateway/provider_set.zig");
 const host = @import("../hosts/host.zig");
 const login_flow = @import("../auth/login_flow.zig");
 const provider_catalog = @import("../auth/provider_catalog.zig");
+const output_contracts = @import("../output/output_contracts.zig");
+const token_pass = @import("../gateway/token_pass.zig");
+const token_pass_memory = @import("../gateway/token_pass_memory.zig");
+const token_pass_check = @import("../app/token_pass_check.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -79,6 +84,19 @@ fn writeProviderActivationError(
     try output.stderr(message);
 }
 
+/// What `lia login` says about the team's Token Pass after a Gateway sign-in.
+pub const TokenPassLoginNotice = struct {
+    /// The team has an active Token Pass, so the billing hint is left out.
+    active: bool = false,
+    /// Owned; null when there is nothing to say.
+    line: ?[]u8 = null,
+
+    pub fn deinit(self: *TokenPassLoginNotice, alloc: Allocator) void {
+        if (self.line) |line| alloc.free(line);
+        self.* = .{};
+    }
+};
+
 /// Saves `target` as the profile's provider, with its model and, when
 /// `exact_source` is set, its credential source. Returns false after
 /// reporting why it could not.
@@ -90,7 +108,22 @@ pub fn activateProviderSelection(
     caller: Caller,
     exact_source: ?credentials.Source,
 ) !bool {
-    return activateProviderSelectionFallible(alloc, env, output, target, caller, exact_source) catch |err| {
+    return activateProviderSelectionWithNotice(alloc, env, output, target, caller, exact_source, null);
+}
+
+/// `activateProviderSelection` that also fills `out_token_pass`, when set,
+/// for a Gateway credential: the team's Token Pass, from its credits and the
+/// catalog's marks.
+pub fn activateProviderSelectionWithNotice(
+    alloc: Allocator,
+    env: Env,
+    output: Output,
+    target: model_provider.ProviderId,
+    caller: Caller,
+    exact_source: ?credentials.Source,
+    out_token_pass: ?*TokenPassLoginNotice,
+) !bool {
+    return activateProviderSelectionFallible(alloc, env, output, target, caller, exact_source, out_token_pass) catch |err| {
         switch (err) {
             error.CredentialStorageUnavailable,
             error.CredentialTemporarilyUnavailable,
@@ -137,6 +170,7 @@ fn activateProviderSelectionFallible(
     target: model_provider.ProviderId,
     caller: Caller,
     exact_source: ?credentials.Source,
+    out_token_pass: ?*TokenPassLoginNotice,
 ) !bool {
     const workspace_root = if (env.workspace_root) |root| try alloc.dupe(u8, root) else try io_mod.realpathAlloc(alloc, ".");
     defer alloc.free(workspace_root);
@@ -245,6 +279,28 @@ fn activateProviderSelectionFallible(
         });
         return false;
     };
+    var credits_task: TeamCreditsTask = undefined;
+    var credits_future: ?std.Io.Future(void) = null;
+    if (comptime !builtin.single_threaded) {
+        if (out_token_pass != null and target == .gateway and credential != null) {
+            if (env.provider_set.select(.gateway).credits) |credits_provider| {
+                credits_task = .{
+                    .alloc = alloc,
+                    .provider = credits_provider,
+                    .credential = credential.?.token,
+                    .credential_source = credential.?.source,
+                    .tenant = credential.?.gatewayTeam(),
+                };
+                credits_future = io_mod.getIo().concurrent(TeamCreditsTask.run, .{&credits_task}) catch null;
+            }
+        }
+    }
+    defer if (credits_future) |*future| {
+        credits_task.cancel.store(true, .seq_cst);
+        future.await(io_mod.getIo());
+        credits_task.snapshot.deinit(alloc);
+    };
+
     const fetch_result = model_catalog.fetchWithPublicFallback(catalog_provider, alloc, .{
         .access = if (env.auth_mode == .host_managed)
             .host_managed
@@ -310,6 +366,45 @@ fn activateProviderSelectionFallible(
         },
         .outcome => {},
     }
+    if (out_token_pass) |dest| {
+        if (target == .gateway and credential != null) {
+            var credits_snapshot: ?output_contracts.CreditsSnapshot = null;
+            defer if (credits_snapshot) |*snapshot| snapshot.deinit(alloc);
+            if (credits_future) |*future| {
+                const deadline = io_mod.awakeMilliTimestamp() + auth_runtime.default_team_credits_wait_ms;
+                while (!credits_task.done.load(.acquire)) {
+                    if (io_mod.awakeMilliTimestamp() >= deadline) {
+                        credits_task.cancel.store(true, .seq_cst);
+                        break;
+                    }
+                    // Poll the concurrent credits task until it finishes or hits the wait budget (RULES.md R2.3).
+                    io_mod.sleep(team_credits_poll_ms * std.time.ns_per_ms);
+                }
+                const finished_in_time = credits_task.done.load(.acquire);
+                future.await(io_mod.getIo());
+                credits_future = null;
+                if (finished_in_time) {
+                    credits_snapshot = credits_task.snapshot;
+                } else {
+                    credits_task.snapshot.deinit(alloc);
+                }
+            }
+            const catalog_has_marks = catalogHasTokenPassMarks(loaded.catalog.items);
+            const credits_answer = if (credits_snapshot) |snapshot| token_pass_check.answerOf(snapshot) else null;
+            const remaining = if (credits_snapshot) |snapshot|
+                if (snapshot.token_pass) |credit| credit.remaining else null
+            else
+                null;
+            if (credits_answer orelse (if (catalog_has_marks) token_pass.Answer.has_pass else null)) |answer| {
+                saveTokenPassAnswer(alloc, credential.?.*, answer);
+            }
+            const notice = token_pass.resolveTeamNotice(credits_answer, remaining, catalog_has_marks);
+            dest.* = .{
+                .active = notice == .active,
+                .line = try token_pass.formatTeamNotice(alloc, notice, .plain),
+            };
+        }
+    }
     if (performed_login) |provider| switch (provider) {
         .gateway, .configured => unreachable,
     };
@@ -320,4 +415,55 @@ fn activateProviderSelectionFallible(
         });
     }
     return true;
+}
+
+const team_credits_poll_ms: u64 = 10;
+
+/// Fetches the team's credits beside the catalog fetch, so the Token Pass
+/// notice costs `lia login` no extra wait when both answer in time.
+const TeamCreditsTask = struct {
+    alloc: Allocator,
+    provider: gateway_provider.CreditsProvider,
+    credential: ?[]const u8,
+    credential_source: credentials.Source,
+    tenant: ?[]const u8,
+    cancel: std.atomic.Value(bool) = .init(false),
+    done: std.atomic.Value(bool) = .init(false),
+    snapshot: output_contracts.CreditsSnapshot = .{},
+
+    fn run(self: *TeamCreditsTask) void {
+        self.snapshot = self.provider.fetch(self.alloc, .{
+            .credential = self.credential,
+            .credential_source = self.credential_source,
+            .tenant = self.tenant,
+            .cancel_flag = &self.cancel,
+        });
+        self.done.store(true, .release);
+    }
+};
+
+fn catalogHasTokenPassMarks(entries: []const model_catalog.ModelCatalogEntry) bool {
+    for (entries) |entry| {
+        if (entry.token_pass) return true;
+    }
+    return false;
+}
+
+fn saveTokenPassAnswer(
+    alloc: Allocator,
+    credential: credentials.Credential,
+    answer: token_pass.Answer,
+) void {
+    const home = io_mod.homeDir() orelse return;
+    const named = token_pass_check.name(
+        alloc,
+        credential.source,
+        credential.token,
+        credential.accountId(),
+        credential.gatewayTeam(),
+    ) orelse return;
+    const id = named.saved_as orelse return;
+    token_pass_memory.save(alloc, home, &id, answer) catch |err| {
+        debug_trace.logf("token_pass", "saved answer not written err={s}", .{@errorName(err)});
+    };
 }

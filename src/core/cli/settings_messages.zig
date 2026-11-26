@@ -2,7 +2,6 @@
 //! `lia config`.
 
 const std = @import("std");
-const command_specs = @import("../slash_commands/command_specs.zig");
 const cli_flags = @import("cli_flags.zig");
 const settings_keys = @import("../config/settings_keys.zig");
 const text_utils = @import("../shared/text_utils.zig");
@@ -16,8 +15,8 @@ pub fn closest(name: []const u8, known: []const []const u8) ?[]const u8 {
     return nearest.best;
 }
 
-/// `unknown setting notifications.mx in ~/.lia/settings.json (did you mean
-/// notifications.max?)`, for a key found in a settings file. Caller owns the
+/// `unknown setting sound.trun_end in ~/.lia/settings.json (did you mean
+/// sound.turn_end?)`, for a key found in a settings file. Caller owns the
 /// result.
 pub fn formatUnknownSetting(alloc: Allocator, key: settings_keys.UnknownKey, display_path: []const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
@@ -31,32 +30,14 @@ pub fn formatUnknownSetting(alloc: Allocator, key: settings_keys.UnknownKey, dis
     return out.toOwnedSlice();
 }
 
-/// `notifications and sound are both set in ~/.lia/settings.json; lia uses
-/// sound where they differ, so remove notifications`. Caller owns the result.
-pub fn formatOlderName(alloc: Allocator, twice: settings_keys.OlderName, display_path: []const u8) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    errdefer out.deinit();
-    const writer = &out.writer;
-    if (twice.both) {
-        try writer.print("{s} and {s} are both set in {s}", .{ twice.older, twice.current, display_path });
-        try writeWorkspace(writer, twice.workspace);
-        try writer.print("; lia uses {s} where they differ, so remove {s}", .{ twice.current, twice.older });
-    } else {
-        try writer.print("{s} in {s}", .{ twice.older, display_path });
-        try writeWorkspace(writer, twice.workspace);
-        try writer.print(" " ++ command_specs.deprecated_until ++ "; rename it to {s}", .{twice.current});
-    }
-    return out.toOwnedSlice();
-}
-
-/// `permission_mode yolo in ~/.lia/settings.json is deprecated and stops
-/// working in lia 0.2.0; use full-access`. Caller owns the result.
+/// `permission_mode yolo in ~/.lia/settings.json is an older name for
+/// full-access; set permission_mode to full-access`. Caller owns the result.
 pub fn formatOldYolo(alloc: Allocator, workspace: ?[]const u8, display_path: []const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     try out.writer.print("permission_mode yolo in {s}", .{display_path});
     try writeWorkspace(&out.writer, workspace);
-    try out.writer.writeAll(" " ++ command_specs.deprecated_until ++ "; use full-access");
+    try out.writer.writeAll(" is an older name for full-access; set permission_mode to full-access");
     return out.toOwnedSlice();
 }
 
@@ -98,9 +79,9 @@ test "unknown settings name the file, the workspace, and the closest key" {
             .expected = "unknown setting fast_mdoe in ~/.lia/settings.json (did you mean fast_mode?)",
         },
         .{
-            .key = .{ .name = "mx", .parent = "notifications", .workspace = "/w", .known = &.{ "max", "turn_end" } },
+            .key = .{ .name = "mx", .parent = "sound", .workspace = "/w", .known = &.{ "max", "turn_end" } },
             .file = "~/.lia/settings.json",
-            .expected = "unknown setting notifications.mx in ~/.lia/settings.json for workspace /w (did you mean notifications.max?)",
+            .expected = "unknown setting sound.mx in ~/.lia/settings.json for workspace /w (did you mean sound.max?)",
         },
         .{
             .key = .{ .name = "colour", .known = &.{ "model", "theme" } },
@@ -115,24 +96,11 @@ test "unknown settings name the file, the workspace, and the closest key" {
     }
 }
 
-test "a setting under both its older and its current name names the one to remove" {
+test "a saved yolo names full-access as its current name, with no release" {
     const alloc = std.testing.allocator;
-    const top = try formatOlderName(alloc, .{ .older = "notifications", .current = "sound" }, "~/.lia/settings.json");
-    defer alloc.free(top);
-    try std.testing.expectEqualStrings("notifications and sound are both set in ~/.lia/settings.json; lia uses sound where they differ, so remove notifications", top);
-    const workspace = try formatOlderName(alloc, .{ .older = "notifications", .current = "sound", .workspace = "/w" }, "~/.lia/settings.json");
-    defer alloc.free(workspace);
-    try std.testing.expectEqualStrings("notifications and sound are both set in ~/.lia/settings.json for workspace /w; lia uses sound where they differ, so remove notifications", workspace);
-}
-
-test "an older setting name or a saved yolo names the release that drops it" {
-    const alloc = std.testing.allocator;
-    const older = try formatOlderName(alloc, .{ .older = "notifications", .current = "sound", .both = false }, "~/.lia/settings.json");
-    defer alloc.free(older);
-    try std.testing.expectEqualStrings("notifications in ~/.lia/settings.json is deprecated and stops working in lia 0.2.0; rename it to sound", older);
     const yolo = try formatOldYolo(alloc, "/w", "~/.lia/settings.json");
     defer alloc.free(yolo);
-    try std.testing.expectEqualStrings("permission_mode yolo in ~/.lia/settings.json for workspace /w is deprecated and stops working in lia 0.2.0; use full-access", yolo);
+    try std.testing.expectEqualStrings("permission_mode yolo in ~/.lia/settings.json for workspace /w is an older name for full-access; set permission_mode to full-access", yolo);
 }
 
 test "a mistyped key on the command line gets the closest known key" {

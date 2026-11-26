@@ -11,6 +11,9 @@ zig-cache/
 zig-out/
 zig-pkg/
 
+# Python bytecode written when the scripts run
+__pycache__/
+
 # Workspace-local runtime state
 /skills/
 

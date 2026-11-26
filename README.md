@@ -41,7 +41,7 @@ lia loads skills from `.lia/skills` and `~/.lia/skills`, and from the folders ot
 
 ## Contributing
 
-You need [Zig 0.17.0](https://ziglang.org/download/) to build lia:
+You need [Zig 0.17.1](https://ziglang.org/download/) to build lia:
 
 ```bash
 git clone https://github.com/ap-justin/lia.git

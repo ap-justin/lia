@@ -90,13 +90,16 @@
     {"name": "verify-configured-providers", "argv": ["bun", "test", "--max-concurrency", "1", "./configured-providers.test.ts"], "test_file": "configured-providers.test.ts", "requires_tmux": false},
     {"name": "verify-oauth-keychain-migration", "argv": ["bun", "test", "--max-concurrency", "1", "./oauth-keychain-migration.test.ts"], "test_file": "oauth-keychain-migration.test.ts", "allow_keychain": true},
     {"name": "verify-mcp-verbs", "argv": ["bun", "test", "--max-concurrency", "1", "./mcp-verbs.test.ts"], "test_file": "mcp-verbs.test.ts"},
+    {"name": "verify-mcp-subagent-bridge", "argv": ["bun", "test", "--max-concurrency", "1", "./mcp-subagent-bridge.test.ts"], "test_file": "mcp-subagent-bridge.test.ts"},
     {"name": "verify-compaction-policy", "argv": ["bun", "test", "--max-concurrency", "1", "./compaction-policy.test.ts"], "test_file": "compaction-policy.test.ts", "requires_tmux": false},
+    {"name": "verify-provider-compaction", "argv": ["bun", "test", "--max-concurrency", "1", "./provider-compaction.test.ts"], "test_file": "provider-compaction.test.ts"},
     {"name": "verify-poisoned-repository", "argv": ["bun", "test", "--max-concurrency", "1", "./poisoned-repository.test.ts"], "test_file": "poisoned-repository.test.ts"},
     {"name": "verify-ultrafast-fake-gateway", "argv": ["bun", "test", "--max-concurrency", "1", "./ultrafast-fake-gateway.test.ts"], "test_file": "ultrafast-fake-gateway.test.ts"},
     {"name": "verify-web-fetch-permission-progress", "argv": ["bun", "test", "--max-concurrency", "1", "./web-fetch-permission-progress.test.ts"], "test_file": "web-fetch-permission-progress.test.ts", "requires_tmux": false},
     {"name": "verify-web-search-permission-progress", "argv": ["bun", "test", "--max-concurrency", "1", "./web-search-permission-progress.test.ts"], "test_file": "web-search-permission-progress.test.ts", "requires_tmux": false},
     {"name": "verify-yolo-permission-mode", "argv": ["bun", "test", "--max-concurrency", "1", "./yolo-permission-mode.test.ts"], "test_file": "yolo-permission-mode.test.ts"},
     {"name": "verify-ask-presentation", "argv": ["bun", "test", "--max-concurrency", "1", "./ask-presentation.test.ts"], "test_file": "ask-presentation.test.ts", "requires_tmux": false},
-    {"name": "verify-doctor", "argv": ["bun", "test", "--max-concurrency", "1", "./doctor.test.ts"], "test_file": "doctor.test.ts", "requires_tmux": false}
+    {"name": "verify-doctor", "argv": ["bun", "test", "--max-concurrency", "1", "./doctor.test.ts"], "test_file": "doctor.test.ts", "requires_tmux": false},
+    {"name": "verify-mcp-shared", "argv": ["bun", "test", "--max-concurrency", "1", "./mcp-shared.test.ts"], "test_file": "mcp-shared.test.ts", "requires_tmux": false}
   ]
 }

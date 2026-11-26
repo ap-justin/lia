@@ -12,6 +12,7 @@ const gateway_provider = @import("../gateway/gateway_provider.zig");
 const provider_set = @import("../gateway/provider_set.zig");
 const host = @import("../hosts/host.zig");
 const io_mod = @import("../shared/io.zig");
+const crash_panic = @import("crash_panic.zig");
 const prompt_policy = @import("../config/prompt_policy.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
@@ -98,6 +99,19 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
         .returned => .returned,
         .exit => |code| .{ .exit = code },
     };
+}
+
+/// Arms the crash record (`crash_panic.zig`) before the command's setup runs,
+/// so a panic in that setup still saves one. Only `lia acp` arms it: a client
+/// keeps that process up for a whole session, while every other command is
+/// short and prints its own failure.
+pub fn armCrashRecord(cfg: Config, args: []const [:0]const u8) void {
+    if (!armsCrashRecord(cfg.command_catalog, args)) return;
+    if (io_mod.homeDir()) |home| crash_panic.prepare(home);
+}
+
+fn armsCrashRecord(command_catalog: command_specs.TopLevelRegistry, args: []const [:0]const u8) bool {
+    return cli_surface.parse(command_catalog, cli_surface.argsAfterGlobalLaunchArgs(args)) == .acp;
 }
 
 pub fn runBeforeInteractive(alloc: Allocator, args: []const [:0]const u8, cfg: Config) !BeforeInteractiveResult {
@@ -396,6 +410,14 @@ test "app entry honors LIA_BENCH for an interactive launch" {
 
     try std.testing.expectEqual(RunOutcome.returned, outcome);
     try std.testing.expectEqualStrings("", capture.stderr.written());
+}
+
+test "only lia acp arms the crash record" {
+    const catalog = testConfig().command_catalog;
+    try std.testing.expect(armsCrashRecord(catalog, &.{"acp"}));
+    try std.testing.expect(!armsCrashRecord(catalog, &.{}));
+    try std.testing.expect(!armsCrashRecord(catalog, &.{ "ask", "hello" }));
+    try std.testing.expect(!armsCrashRecord(catalog, &.{"--help"}));
 }
 
 test "an interactive launch says the build has no terminal UI" {

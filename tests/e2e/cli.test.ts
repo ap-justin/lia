@@ -443,7 +443,8 @@ Options:
 The prompt may be passed as arguments or piped on stdin when no prompt args are given.
 Assistant output is raw Markdown on stdout.
 Operational progress and diagnostics are written to stderr. JSON \`output\` keeps accumulated assistant Markdown; \`final_output\` contains only the completed final response, or an empty string when absent.
-JSON usage sums reported main-agent input_tokens and output_tokens, including with --no-save; unreported counts are null. cache_read_tokens and cache_write_tokens appear only when the provider reports them. Nested usage and dollar spend are excluded.
+JSON usage sums reported main-agent input_tokens and output_tokens, including with --no-save; unreported counts are null. cache_read_tokens and cache_write_tokens appear only when the provider reports them. Subagent usage and dollar spend are excluded.
+JSON subagents appears only when a subagent did work in this request. It lists each one in the order it first ran, with its name, id, and usage in the same shape, counted for this request alone. lia session <session_id>/<name> reads one and prints the same id.
 --system replaces only the built-in base prompt for this request; tool, skill, project, and runtime context still apply.
 With --prompt-permissions, JSON and quiet requests may prompt on stderr only when stdin is a TTY.
 `;
@@ -465,9 +466,10 @@ With --prompt-permissions, JSON and quiet requests may prompt on stderr only whe
         const r = await runLia(args);
         expect(r.code).toBe(0);
         expect(r.stderr).toBe("");
-        expect(r.stdout).toContain("Inspect or recover saved sessions");
+        expect(r.stdout).toContain("Inspect, fork, or recover saved sessions");
         expect(r.stdout).toContain("session <last|id|id/agent>|--id <id> [--tail <1-1000>]");
         expect(r.stdout).not.toContain("session resume");
+        expect(r.stdout).toContain("session fork <last|id>|--id <id>");
         expect(r.stdout).toContain("session recover <id>|--id <id>");
         // Sessions convert on open; there is nothing to migrate by hand.
         expect(r.stdout).not.toContain("migrate");
@@ -799,7 +801,7 @@ describe("cli: status", () => {
           mcp_config_error: "McpConfigInvalidJson",
         });
         expect(doctorText.stdout).toContain(
-          "[fail] mcp_config: failed to load ~/.lia/mcp.json: McpConfigInvalidJson\n",
+          "MCP servers\n  \u2717 mcp_config failed to load ~/.lia/mcp.json: McpConfigInvalidJson\n",
         );
         const doctorJson = JSON.parse(doctorJsonResult.stdout);
         expect(doctorJson.fail_count).toBe(1);
@@ -869,6 +871,147 @@ describe("cli: status", () => {
   );
 
   test(
+    "status, status --json and doctor name why lia skips a plain-http server of .mcp.json that is not local",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "lia-e2e-mcp-url-reason-")));
+      const gateway = startFakeGateway([]);
+      try {
+        const home = join(root, "home");
+        const workspace = join(root, "workspace");
+        mkdirSync(join(home, ".lia"), { recursive: true, mode: 0o700 });
+        mkdirSync(workspace);
+        writeFileSync(
+          join(workspace, ".mcp.json"),
+          JSON.stringify({
+            mcpServers: {
+              web: { type: "http", url: "http://example.com/mcp" },
+              odd: { type: "http", url: "not a url" },
+            },
+          }) + "\n",
+        );
+        const env = {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "mcp-url-reason-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          LIA_DISABLE_KEYCHAIN: "1",
+          LIA_AUTO_UPGRADE: "0",
+          LIA_MODEL: FAKE_GATEWAY_MODEL,
+          LIA_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+          LIA_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        };
+        const statusText = await runLia(["status"], { cwd: workspace, env });
+        const statusJson = await runLia(["status", "--json"], { cwd: workspace, env });
+        const doctorText = await runLia(["doctor"], { cwd: workspace, env });
+        const doctorJson = await runLia(["doctor", "--json"], { cwd: workspace, env });
+
+        // The reason is the URL's own, so a person knows what to change. Another URL fault keeps the generic words.
+        const web = ".mcp.json server 'web' was skipped: lia uses plain http only for localhost, 127.0.0.1 and [::1]; use https.";
+        const odd = ".mcp.json server 'odd' was skipped: its \"url\" isn't valid.";
+        const fix = "\n               fix: fix .mcp.json, then run lia doctor again\n";
+
+        expect(statusText.code, statusText.stderr).toBe(0);
+        expect(statusText.stdout).toContain(`[status] mcp_configuration_issue=${web}\n`);
+        expect(statusText.stdout).toContain(`[status] mcp_configuration_issue=${odd}\n`);
+
+        expect(statusJson.code, statusJson.stderr).toBe(0);
+        expect(JSON.parse(statusJson.stdout).mcp.configuration_issues).toEqual([web, odd]);
+
+        expect(doctorText.code, doctorText.stderr).toBe(1);
+        expect(doctorText.stdout).toContain(`  \u2717 mcp_config ${web}${fix}`);
+        expect(doctorText.stdout).toContain(`  \u2717 mcp_config ${odd}${fix}`);
+
+        const doctorChecks = JSON.parse(doctorJson.stdout);
+        expect(doctorJson.code, doctorJson.stderr).toBe(1);
+        expect(doctorChecks.mcp.configuration_issues).toEqual([web, odd]);
+        expect(
+          doctorChecks.checks.filter((check: { name: string }) => check.name === "mcp_config").map((check: { detail: string }) => check.detail),
+        ).toEqual([web, odd]);
+        expect(gateway.requestCount()).toBe(0);
+      } finally {
+        gateway.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "status and doctor skip one bad entry of ~/.lia/mcp.json with a note, and still show its good entry and the project's server",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "lia-e2e-mcp-profile-entry-")));
+      const gateway = startFakeGateway([]);
+      try {
+        const home = join(root, "home");
+        const workspace = join(root, "workspace");
+        mkdirSync(join(home, ".lia"), { recursive: true, mode: 0o700 });
+        mkdirSync(workspace);
+        // Disabled, so doctor makes no connection: both still show, as configured.
+        writeFileSync(
+          join(home, ".lia", "mcp.json"),
+          JSON.stringify({
+            mcp: {
+              bad: { type: "http", url: "http://example.com/mcp" },
+              good: { type: "http", url: "http://127.0.0.1:1/mcp", enabled: false },
+            },
+          }) + "\n",
+          { mode: 0o600 },
+        );
+        writeFileSync(join(workspace, ".mcp.json"), JSON.stringify({ mcpServers: { project: { type: "http", url: "http://127.0.0.1:2/mcp", enabled: false } } }) + "\n");
+        const env = {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "mcp-profile-entry-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          LIA_DISABLE_KEYCHAIN: "1",
+          LIA_AUTO_UPGRADE: "0",
+          LIA_MODEL: FAKE_GATEWAY_MODEL,
+          LIA_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+          LIA_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        };
+        const statusText = await runLia(["status"], { cwd: workspace, env });
+        const statusJson = await runLia(["status", "--json"], { cwd: workspace, env });
+        const doctorText = await runLia(["doctor"], { cwd: workspace, env });
+        const doctorJson = await runLia(["doctor", "--json"], { cwd: workspace, env });
+
+        const note = "~/.lia/mcp.json server 'bad' was skipped: lia uses plain http only for localhost, 127.0.0.1 and [::1]; use https.";
+        const fix = "fix ~/.lia/mcp.json, then run lia doctor again";
+        const named = (stdout: string) =>
+          (JSON.parse(stdout).mcp.servers as { name: string; source: string }[]).map((server) => `${server.source}:${server.name}`).sort();
+
+        expect(statusText.code, statusText.stderr).toBe(0);
+        expect(statusText.stderr).toBe("");
+        expect(statusText.stdout).not.toContain("mcp_config_error");
+        expect(statusText.stdout).toContain(`[status] mcp_configuration_issue=${note}\n`);
+        expect(statusText.stdout).toContain("[status] mcp_servers=2 mcp_configuration_issues=1\n");
+
+        expect(statusJson.code, statusJson.stderr).toBe(0);
+        const status = JSON.parse(statusJson.stdout);
+        expect(status).not.toHaveProperty("mcp_config_error");
+        expect(status.mcp.servers.map((server: { source: string }) => server.source).sort()).toEqual(["profile", "workspace"]);
+        expect(named(statusJson.stdout)).toEqual(["profile:good", "workspace:project"]);
+        expect(status.mcp.configuration_issues).toEqual([note]);
+        expect(status.mcp.inspection_error).toBeNull();
+        expect(status.mcp.connection_check).toBe("not_checked");
+
+        const doctor = JSON.parse(doctorJson.stdout);
+        expect(doctor.mcp.connection_check).toBe("checked");
+        expect(named(doctorJson.stdout)).toEqual(["profile:good", "workspace:project"]);
+        expect(doctor.mcp.configuration_issues).toEqual([note]);
+        expect(doctor.mcp.inspection_error).toBeNull();
+        const configChecks = doctor.checks.filter((check: { name: string }) => check.name === "mcp_config");
+        expect(configChecks).toEqual([{ name: "mcp_config", status: "fail", detail: note, fix }]);
+        expect(doctorJson.code, doctorJson.stderr).toBe(1);
+        expect(doctorText.stdout).toContain(`  \u2717 mcp_config ${note}\n               fix: ${fix}\n`);
+        expect(doctorText.stdout).not.toContain("failed to load");
+        expect(gateway.requestCount()).toBe(0);
+      } finally {
+        gateway.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "doctor names unknown settings keys while status stays quiet",
     async () => {
       const root = realpathSync(mkdtempSync(join(tmpdir(), "lia-e2e-unknown-settings-")));
@@ -897,6 +1040,8 @@ describe("cli: status", () => {
         const warnings = JSON.parse(doctor.stdout)
           .checks.filter((check: { name: string; status: string }) => check.name === "config" && check.status === "warn")
           .map((check: { detail: string }) => check.detail);
+        // The old `statusLine` group is an unknown key now, so doctor names its
+        // current key. Its children are not checked, since the group is ignored.
         expect(warnings).toEqual([
           "unknown setting fast_mdoe in ~/.lia/settings.json (did you mean fast_mode?)",
           `unknown setting efort in ~/.lia/settings.json for workspace ${cwd} (did you mean effort?)`,
@@ -1549,11 +1694,10 @@ describe("cli: status", () => {
         };
         expect(JSON.parse(statusJsonResult.stdout.trim())).toMatchObject(expectedAuth);
         expect(JSON.parse(doctorJsonResult.stdout.trim())).toMatchObject(expectedAuth);
-        for (const output of [statusText.stdout, doctorText.stdout]) {
-          expect(output).toContain("auth=lia login");
-          expect(output).toContain("auth_refreshable=true");
-          expect(output).toContain("team=vercel-labs");
-        }
+        expect(statusText.stdout).toContain("auth=lia login");
+        expect(statusText.stdout).toContain("auth_refreshable=true");
+        expect(statusText.stdout).toContain("team=vercel-labs");
+        expect(doctorText.stdout).toContain("  Auth         lia login \u00b7 team vercel-labs\n");
         for (const output of [
           statusText.stdout,
           statusJsonResult.stdout,
@@ -1873,7 +2017,7 @@ describe("cli: status", () => {
             model: 123,
             permission_mode: "danger",
             permission: { bash: true },
-            statusLine: 7,
+            status_line: 7,
             max_agent_steps: 7,
           }) + "\n",
         );
@@ -2844,7 +2988,7 @@ describe("cli: setup", () => {
       const r = await runLia(["setup"], {
         env: { ...NO_GATEWAY_AUTH, LIA_DISABLE_KEYCHAIN: "1" },
       });
-      expect(r.code).toBe(1);
+      expect(r.code).toBe(2);
       expect(r.stdout).toBe("");
       expect(r.stderr).toBe(
         "lia setup is deprecated and stops working in lia 0.2.0; use lia login vercel --api-key\n" +
@@ -2910,7 +3054,7 @@ exit 99
           },
           timeoutMs: TIMEOUT,
         });
-        expect(r.code).toBe(1);
+        expect(r.code).toBe(2);
         expect(r.stdout).toBe("");
         expect(r.stderr).toContain("lia setup is deprecated and stops working in lia 0.2.0; use lia login vercel --api-key\n");
         expect(r.stderr).toContain("interactive terminal is required");
@@ -3257,6 +3401,45 @@ describe("cli: missing durable home", () => {
 });
 
 describe("cli: sessions", () => {
+  test(
+    "lia sessions ls lists the same sessions as lia sessions",
+    async () => {
+      const home = mkdtempSync(join(tmpdir(), "lia-e2e-sessions-ls-"));
+      try {
+        const bare = await runLia(["sessions", "--json"], { env: { HOME: home } });
+        const explicit = await runLia(["sessions", "ls", "--json"], {
+          env: { HOME: home },
+        });
+        expect(bare.code).toBe(0);
+        expect(explicit.code).toBe(0);
+        expect(explicit.stderr).toBe("");
+        const listed = JSON.parse(explicit.stdout);
+        expect(listed).toMatchObject({ kind: "sessions", count: 0, sessions: [] });
+        expect(listed).toEqual(JSON.parse(bare.stdout));
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "lia sessions --help lists ls and convert",
+    async () => {
+      const home = mkdtempSync(join(tmpdir(), "lia-e2e-sessions-help-"));
+      try {
+        const help = await runLia(["sessions", "--help"], { env: { HOME: home } });
+        expect(help.code).toBe(0);
+        expect(help.stdout).toContain("sessions [ls]");
+        expect(help.stdout).toContain("  ls");
+        expect(help.stdout).toContain("  convert");
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
   test(
     "lia sessions --json returns valid sessions JSON",
     async () => {
@@ -4905,6 +5088,195 @@ describe("cli: session", () => {
     },
     TIMEOUT,
   );
+  // The environment a run gets from `gateway`, with no key but the test's.
+  function forkEnv(home: string, gateway: ReturnType<typeof startFakeGateway>): Record<string, string | undefined> {
+    return {
+      HOME: home,
+      AI_GATEWAY_API_KEY: "session-fork-test-key",
+      VERCEL_OIDC_TOKEN: undefined,
+      LIA_DISABLE_KEYCHAIN: "1",
+      LIA_AUTO_UPGRADE: "0",
+      LIA_MODEL: FAKE_GATEWAY_MODEL,
+      LIA_GATEWAY_BASE_URL: gateway.baseUrl,
+      LIA_GATEWAY_CHAT_URL: gateway.chatUrl,
+      LIA_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+    };
+  }
+
+  // Starts lia without waiting, so a test can work while it runs. The caller
+  // owns `proc` and must end it.
+  function startLia(args: string[], env: Record<string, string | undefined>, cwd: string) {
+    const proc = Bun.spawn([LIA_BIN, ...args], {
+      cwd,
+      env: Object.fromEntries(
+        Object.entries({ ...env, NO_COLOR: "1", LIA_SOUND: "0", PATH: process.env.PATH })
+          .filter((entry): entry is [string, string] => entry[1] !== undefined),
+      ),
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const finished = Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited])
+      .then(([stdout, stderr, code]) => ({ stdout, stderr, code }));
+    return { proc, finished };
+  }
+
+  test(
+    "session fork copies a saved session by id and last, marks its title, leaves source untouched, and resumes cleanly",
+    async () => {
+      const root = createIsolatedTestHome();
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      mkdirSync(home);
+      mkdirSync(workspace);
+      const workspaceRoot = realpathSync(workspace);
+      const gateway = startFakeGateway([fakeGatewayFinalText("turn one ok"), fakeGatewayFinalText("follow up ok")]);
+      const env = forkEnv(home, gateway);
+      try {
+        const first = await runLia(["ask", "--json", "Say the first answer."], { cwd: workspace, env });
+        expect(first.code, first.stderr).toBe(0);
+        const sourceId: string = JSON.parse(first.stdout).session_id;
+        const sourceBefore = savedText(home, sourceId);
+
+        const fork = await runLia(["session", "fork", sourceId, "--json"], { cwd: workspace, env: { HOME: home } });
+        expect(fork.code, fork.stderr).toBe(0);
+        expect(fork.stderr).toBe("");
+        const forked = JSON.parse(fork.stdout);
+        expect(forked).toMatchObject({
+          kind: "session_fork",
+          source_id: sourceId,
+          workspace_root: workspaceRoot,
+          history_turns: 1,
+          copied_agents: 0,
+          files_complete: true,
+        });
+        expect(forked.fork_id).not.toBe(sourceId);
+        expect(savedText(home, sourceId)).toBe(sourceBefore);
+
+        const follow = await runLia(["ask", "--resume", forked.fork_id, "--json", "follow up"], { cwd: workspace, env });
+        expect(follow.code, follow.stderr).toBe(0);
+        expect(follow.stdout).toContain("follow up ok");
+        const forkDetail = await runLia(["session", forked.fork_id, "--json"], { cwd: workspace, env: { HOME: home } });
+        expect(forkDetail.code, forkDetail.stderr).toBe(0);
+        expect(JSON.parse(forkDetail.stdout).history_len).toBe(2);
+        const sourceDetail = await runLia(["session", sourceId, "--json"], { cwd: workspace, env: { HOME: home } });
+        expect(JSON.parse(sourceDetail.stdout).history_len).toBe(1);
+
+        const last = await runLia(["session", "fork", "last"], { cwd: workspace, env: { HOME: home } });
+        expect(last.code, last.stderr).toBe(0);
+        expect(last.stderr).toBe("");
+        expect(last.stdout).toContain("[session fork] copied");
+        expect(last.stdout).toContain("history_turns:");
+        expect(last.stdout).toContain("resume: lia --resume");
+      } finally {
+        gateway.stop();
+        cleanupIsolatedTestHome(root);
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "session fork copies a live mid-turn session without blocking the running agent",
+    async () => {
+      const root = createIsolatedTestHome();
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      mkdirSync(home);
+      mkdirSync(workspace);
+      let signalTurn2Started!: () => void;
+      const turn2Started = new Promise<void>((resolve) => (signalTurn2Started = resolve));
+      let releaseTurn2!: () => void;
+      const turn2Released = new Promise<void>((resolve) => (releaseTurn2 = resolve));
+      const gateway = startFakeGateway([
+        fakeGatewayFinalText("turn one ok"),
+        async () => {
+          signalTurn2Started();
+          await turn2Released;
+          return fakeGatewayFinalText("turn two ok");
+        },
+        fakeGatewayFinalText("side answer"),
+      ]);
+      const env = forkEnv(home, gateway);
+      let turn2: ReturnType<typeof startLia> | undefined;
+      try {
+        const first = await runLia(["ask", "--json", "Say the first answer."], { cwd: workspace, env });
+        expect(first.code, first.stderr).toBe(0);
+        const sourceId: string = JSON.parse(first.stdout).session_id;
+
+        turn2 = startLia(["ask", "--resume", sourceId, "--json", "Say the second answer."], env, workspace);
+        await Promise.race([
+          turn2Started,
+          turn2.finished.then((done) => {
+            throw new Error(`turn two ended before the gateway saw it: ${done.stderr}`);
+          }),
+        ]);
+
+        const live = await runLia(["sessions", "--live", "--all", "--json"], { cwd: workspace, env: { HOME: home } });
+        expect(live.code, live.stderr).toBe(0);
+        expect(JSON.parse(live.stdout).sessions).toContainEqual(expect.objectContaining({ id: sourceId, state: "working" }));
+
+        const fork = await runLia(["session", "fork", sourceId, "--json"], { cwd: workspace, env: { HOME: home } });
+        expect(fork.code, fork.stderr).toBe(0);
+        expect(fork.stderr).toBe("");
+        const forked = JSON.parse(fork.stdout);
+        expect(forked.fork_id).not.toBe(sourceId);
+        expect(forked).toMatchObject({ kind: "session_fork", source_id: sourceId, history_turns: 1, files_complete: true });
+
+        const side = await runLia(["ask", "--resume", forked.fork_id, "--json", "side question"], { cwd: workspace, env });
+        expect(side.code, side.stderr).toBe(0);
+        expect(side.stdout).toContain("side answer");
+
+        releaseTurn2();
+        const done = await turn2.finished;
+        expect(done.code, done.stderr).toBe(0);
+        expect(done.stdout).toContain("turn two ok");
+        const detail = await runLia(["session", sourceId, "--json"], { cwd: workspace, env: { HOME: home } });
+        expect(JSON.parse(detail.stdout).history_len).toBe(2);
+      } finally {
+        releaseTurn2();
+        if (turn2 && turn2.proc.exitCode === null) turn2.proc.kill();
+        if (turn2) await turn2.finished;
+        gateway.stop();
+        cleanupIsolatedTestHome(root);
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "session fork reports usage and lookup errors with stable exit codes",
+    async () => {
+      const root = createIsolatedTestHome();
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      mkdirSync(home);
+      mkdirSync(workspace);
+      try {
+        const usage = await runLia(["session", "fork"], { cwd: workspace, env: { HOME: home } });
+        expect(usage.code).toBe(2);
+        expect(usage.stderr).toContain("session fork <last|id>|--id <id> [--json]");
+
+        const tail = await runLia(["session", "fork", "id", "--tail", "5", "--json"], { cwd: workspace, env: { HOME: home } });
+        expect(tail.code).toBe(2);
+        expect(tail.stderr).toBe("");
+        expect(JSON.parse(tail.stdout)).toEqual({ kind: "session", error: "invalid arguments", code: "InvalidSessionForkArgs" });
+
+        const missing = await runLia(["session", "fork", "missing-session", "--json"], { cwd: workspace, env: { HOME: home } });
+        expect(missing.code).toBe(1);
+        expect(missing.stderr).toBe("");
+        expect(JSON.parse(missing.stdout)).toEqual({ kind: "session", error: "record not found", code: "SessionNotFound" });
+
+        const last = await runLia(["session", "fork", "last", "--json"], { cwd: workspace, env: { HOME: home } });
+        expect(last.code).toBe(1);
+        expect(last.stderr).toBe("");
+        expect(JSON.parse(last.stdout)).toMatchObject({ kind: "session", code: "NoSavedSessions" });
+      } finally {
+        cleanupIsolatedTestHome(root);
+      }
+    },
+    TIMEOUT,
+  );
 });
 
 describe("cli: interactive startup", () => {
@@ -5267,6 +5639,101 @@ describe("cli: ask success", () => {
       }
     },
     60_000,
+  );
+
+  test(
+    "lia ask requests compressed model catalog and decodes gzip responses",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "lia-e2e-ask-gzip-catalog-"));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const model = "provider/compressed-catalog-model";
+      let modelsAcceptEncoding: string | null = null;
+      let chatBody = "";
+      const catalogJson = JSON.stringify({
+        object: "list",
+        data: [
+          {
+            id: model,
+            type: "language",
+            tags: ["reasoning", "tool-use"],
+            context_window: 500_000,
+            max_tokens: 32_000,
+            reasoning_options: [{ type: "effort", values: ["high"] }],
+          },
+        ],
+      });
+      const gzippedCatalog = Bun.gzipSync(Buffer.from(catalogJson));
+      const sseBody =
+        `data: ${JSON.stringify({ type: "text-delta", id: "a1", delta: "compressed catalog ok\n" })}\n\n` +
+        `data: ${JSON.stringify({
+          type: "finish",
+          finishReason: { unified: "stop", raw: "stop" },
+          usage: { inputTokens: { total: 4 }, outputTokens: { total: 3 } },
+        })}\n\ndata: [DONE]\n\n`;
+
+      const server = Bun.serve({
+        hostname: "127.0.0.1",
+        port: 0,
+        async fetch(request) {
+          const url = new URL(request.url);
+          if (url.pathname === "/coding-agent/v1/models") {
+            modelsAcceptEncoding = request.headers.get("accept-encoding");
+            return new Response(gzippedCatalog, {
+              headers: {
+                "content-type": "application/json",
+                "content-encoding": "gzip",
+              },
+            });
+          }
+          if (url.pathname === "/ai/v1/chat/completions") {
+            chatBody = await request.text();
+            return new Response(sseBody, {
+              headers: { "content-type": "text/event-stream" },
+            });
+          }
+          return new Response("not found", { status: 404 });
+        },
+      });
+
+      try {
+        mkdirSync(join(home, ".lia"), { recursive: true, mode: 0o700 });
+        mkdirSync(workspace);
+        writeFileSync(
+          join(home, ".lia", "settings.json"),
+          `${JSON.stringify({ model, effort: "high" })}\n`,
+        );
+
+        const baseUrl = `http://127.0.0.1:${server.port}`;
+        const result = await runLia(
+          ["ask", "--json", "--auto", "--no-save", "Check compressed catalog."],
+          {
+            cwd: realpathSync(workspace),
+            env: {
+              ...NO_GATEWAY_AUTH,
+              HOME: realpathSync(home),
+              AI_GATEWAY_API_KEY: "fake-gzip-catalog-key",
+              LIA_GATEWAY_BASE_URL: baseUrl,
+              LIA_GATEWAY_CHAT_URL: `${baseUrl}/ai/v1/chat/completions`,
+              LIA_AUTO_UPGRADE: "0",
+            },
+            timeoutMs: TIMEOUT,
+          },
+        );
+
+        expect(result.code).toBe(0);
+        expect(modelsAcceptEncoding ?? "").toContain("gzip");
+        expect(JSON.parse(result.stdout).output.trim()).toBe("compressed catalog ok");
+        expect(JSON.parse(chatBody)).toMatchObject({
+          reasoning: "high",
+          maxOutputTokens: 32_000,
+        });
+      } finally {
+        server.stop(true);
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
   );
 
   test.skipIf(!HAS_API_KEY)(
@@ -6609,6 +7076,7 @@ describe("cli: completion", () => {
     [["lia", "ask", "--permission-mode", ""], "ask auto full-access"],
     [["lia", "--model", "gpt-5", "ask", "--permission-m"], "--permission-mode"],
     [["lia", "mcp", ""], "list show add remove login logout approve reject call"],
+    [["lia", "sessions", ""], "ls convert"],
     [["lia", "mcp", "add", "--g"], "--global"],
     [["lia", "usage", "--period", ""], "today 7d month"],
     [["lia", "login", ""], "vercel"],
@@ -6710,6 +7178,200 @@ describe("cli: completion", () => {
         expect(got).toEqual(want.split(" ").filter(Boolean).sort());
       }
     } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  }, TIMEOUT);
+});
+
+describe("lia login Token Pass status", () => {
+  function startCliLoginIssuer(team: { id: string; slug: string; name: string }) {
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      async fetch(request) {
+        const url = new URL(request.url);
+        const issuer = `http://127.0.0.1:${server.port}`;
+        if (url.pathname === "/.well-known/openid-configuration") {
+          return Response.json({
+            issuer,
+            device_authorization_endpoint: `${issuer}/oauth/device`,
+            token_endpoint: `${issuer}/oauth/token`,
+            revocation_endpoint: `${issuer}/oauth/revoke`,
+          });
+        }
+        if (url.pathname === "/oauth/device") {
+          return Response.json({
+            device_code: "cli-device-code",
+            user_code: "TEST-1234",
+            verification_uri: `${issuer}/device`,
+            verification_uri_complete: `${issuer}/device?code=TEST-1234`,
+            expires_in: 300,
+            interval: 1,
+          });
+        }
+        if (url.pathname === "/oauth/token") {
+          return Response.json({
+            access_token: "cli-login-token",
+            refresh_token: "cli-refresh-token",
+            expires_in: 3600,
+            scope: "openid offline_access use:ai-gateway",
+            token_type: "Bearer",
+          });
+        }
+        if (url.pathname === "/v2/teams") {
+          return Response.json({ teams: [team] });
+        }
+        return new Response("not found", { status: 404 });
+      },
+    });
+    return {
+      issuerUrl: `http://127.0.0.1:${server.port}`,
+      stop() {
+        server.stop(true);
+      },
+    };
+  }
+
+  test("lia login confirms active Token Pass with remaining credit and omits the buy offer", async () => {
+    const home = realpathSync(mkdtempSync(join(tmpdir(), "lia-cli-login-tp-active-")));
+    const issuer = startCliLoginIssuer({ id: "team_tp", slug: "tp-team", name: "Token Pass Team" });
+    const gateway = startFakeGateway([], {
+      models: () => [
+        { id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] },
+        { id: "deepseek/deepseek-v4.1-flash", type: "language", tags: ["tool-use"], token_pass: true },
+      ],
+      usage: (url) => {
+        if (url.pathname !== "/coding-agent/v1/credits") return null;
+        return Response.json({
+          balance: "12.50",
+          token_pass: { remaining: "120.5", resets_at: "2026-12-05T08:00:00.000Z" },
+        });
+      },
+    });
+    try {
+      const r = await runLia(["login"], {
+        env: {
+          ...NO_GATEWAY_AUTH,
+          HOME: home,
+          LIA_DISABLE_KEYCHAIN: "1",
+          LIA_NO_OPEN_BROWSER: "1",
+          LIA_OAUTH_CLIENT_ID: "test-client",
+          LIA_TEST_OAUTH_ISSUER_URL: issuer.issuerUrl,
+          LIA_GATEWAY_BASE_URL: gateway.baseUrl,
+        },
+      });
+      expect(r.code).toBe(0);
+      expect(r.stdout).toContain("Signed in to Vercel.\nVercel Token Pass is active ($120.50 remaining).\n");
+      expect(r.stdout).not.toContain("may still require billing");
+      expect(r.stdout).not.toContain("Get $150 of tokens");
+    } finally {
+      gateway.stop();
+      issuer.stop();
+      rmSync(home, { recursive: true, force: true });
+    }
+  }, TIMEOUT);
+
+  test("lia login shows the plain Token Pass offer when credits reports no active pass", async () => {
+    const home = realpathSync(mkdtempSync(join(tmpdir(), "lia-cli-login-tp-offer-")));
+    const issuer = startCliLoginIssuer({ id: "team_plain", slug: "plain-team", name: "Plain Team" });
+    const gateway = startFakeGateway([], {
+      models: () => [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
+      usage: (url) => {
+        if (url.pathname !== "/coding-agent/v1/credits") return null;
+        return Response.json({ balance: "12.50", token_pass: null });
+      },
+    });
+    try {
+      const r = await runLia(["login"], {
+        env: {
+          ...NO_GATEWAY_AUTH,
+          HOME: home,
+          LIA_DISABLE_KEYCHAIN: "1",
+          LIA_NO_OPEN_BROWSER: "1",
+          LIA_OAUTH_CLIENT_ID: "test-client",
+          LIA_TEST_OAUTH_ISSUER_URL: issuer.issuerUrl,
+          LIA_GATEWAY_BASE_URL: gateway.baseUrl,
+        },
+      });
+      expect(r.code).toBe(0);
+      expect(r.stdout).toContain("Signed in to Vercel.\n");
+      expect(r.stdout).toContain("Get $150 of tokens for $30 with Vercel Token Pass (https://vercel.com/get/token-pass).\n");
+      expect(r.stdout).not.toContain("Vercel Token Pass is active");
+    } finally {
+      gateway.stop();
+      issuer.stop();
+      rmSync(home, { recursive: true, force: true });
+    }
+  }, TIMEOUT);
+
+  test("lia login omits the buy offer when credits fails and catalog has no Token Pass marks", async () => {
+    const home = realpathSync(mkdtempSync(join(tmpdir(), "lia-cli-login-tp-unknown-")));
+    const issuer = startCliLoginIssuer({ id: "team_unknown", slug: "unknown-team", name: "Unknown Team" });
+    const gateway = startFakeGateway([], {
+      models: () => [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
+      usage: (url) => {
+        if (url.pathname !== "/coding-agent/v1/credits") return null;
+        return Response.json({ error: { message: "unavailable" } }, { status: 500 });
+      },
+    });
+    try {
+      const r = await runLia(["login"], {
+        env: {
+          ...NO_GATEWAY_AUTH,
+          HOME: home,
+          LIA_DISABLE_KEYCHAIN: "1",
+          LIA_NO_OPEN_BROWSER: "1",
+          LIA_OAUTH_CLIENT_ID: "test-client",
+          LIA_TEST_OAUTH_ISSUER_URL: issuer.issuerUrl,
+          LIA_GATEWAY_BASE_URL: gateway.baseUrl,
+        },
+      });
+      expect(r.code).toBe(0);
+      expect(r.stdout).toContain("Signed in to Vercel.\nAI Gateway access may still require billing or API setup for the selected account.\n");
+      expect(r.stdout).not.toContain("Get $150 of tokens");
+      expect(r.stdout).not.toContain("Vercel Token Pass is active");
+    } finally {
+      gateway.stop();
+      issuer.stop();
+      rmSync(home, { recursive: true, force: true });
+    }
+  }, TIMEOUT);
+
+  test("lia teams confirms active Token Pass with remaining credit", async () => {
+    const home = realpathSync(mkdtempSync(join(tmpdir(), "lia-cli-teams-tp-active-")));
+    const issuer = startCliLoginIssuer({ id: "team_tp", slug: "tp-team", name: "Token Pass Team" });
+    const gateway = startFakeGateway([], {
+      models: () => [
+        { id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] },
+        { id: "deepseek/deepseek-v4.1-flash", type: "language", tags: ["tool-use"], token_pass: true },
+      ],
+      usage: (url) => {
+        if (url.pathname !== "/coding-agent/v1/credits") return null;
+        return Response.json({
+          balance: "12.50",
+          token_pass: { remaining: "79.92906", resets_at: "2026-12-05T08:00:00.000Z" },
+        });
+      },
+    });
+    const env = {
+      ...NO_GATEWAY_AUTH,
+      HOME: home,
+      LIA_DISABLE_KEYCHAIN: "1",
+      LIA_NO_OPEN_BROWSER: "1",
+      LIA_OAUTH_CLIENT_ID: "test-client",
+      LIA_TEST_OAUTH_ISSUER_URL: issuer.issuerUrl,
+      LIA_GATEWAY_BASE_URL: gateway.baseUrl,
+    };
+    try {
+      const login = await runLia(["login"], { env });
+      expect(login.code).toBe(0);
+      const teams = await runLia(["teams"], { env });
+      expect(teams.code).toBe(0);
+      expect(teams.stdout).toContain("Vercel Token Pass is active ($79.93 remaining).\n");
+      expect(teams.stdout).not.toContain("Get $150 of tokens");
+    } finally {
+      gateway.stop();
+      issuer.stop();
       rmSync(home, { recursive: true, force: true });
     }
   }, TIMEOUT);
