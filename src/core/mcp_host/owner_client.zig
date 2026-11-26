@@ -363,9 +363,10 @@ fn readExact(io: std.Io, stream: std.Io.net.Stream, buffer: []u8) !void {
 const testing = std.testing;
 
 /// The most a session queues from the owner: two frames of the largest size
-/// the owner can send, as the owner's own per-connection queue holds. Past it
-/// the session stops sharing and runs every server itself, so one that stops
-/// taking frames (in a permission question, say) is not grown without end.
+/// the owner can send, as the owner's own per-connection queue holds, so a
+/// third behind them is past it. Past it the session stops sharing and runs
+/// every server itself, so one that stops taking frames (in a permission
+/// question, say) is not grown without end.
 const max_queue_bytes = 2 * wire.max_frame_bytes;
 
 /// Removes a test's folder. Cleanup only: a folder that won't go leaves
@@ -415,8 +416,8 @@ fn writeRaw(io: std.Io, fd: std.posix.socket_t, bytes: []const u8) void {
     }
 }
 
-/// Welcomes the client, then sends two frames of `size` bytes each.
-fn floodFrames(io: std.Io, path: []const u8, size: usize) void {
+/// Welcomes the client, then sends `count` frames of `size` bytes each.
+fn floodFrames(io: std.Io, path: []const u8, count: usize, size: usize) void {
     const address = std.Io.net.UnixAddress.init(path) catch return;
     var server = address.listen(io, .{}) catch return;
     defer server.deinit(io);
@@ -431,22 +432,16 @@ fn floodFrames(io: std.Io, path: []const u8, size: usize) void {
     writeRaw(io, stream.socket.handle, buf[0 .. 4 + welcome.len]);
     var header: [4]u8 = undefined;
     std.mem.writeInt(u32, &header, @intCast(size), .big);
-    writeRaw(io, stream.socket.handle, &header);
     // A reader takes the bytes and queues them: it reads no JSON.
     var chunk: [4096]u8 = @splat(0);
-    var left = size;
-    while (left > 0) {
-        const n = @min(left, chunk.len);
-        writeRaw(io, stream.socket.handle, chunk[0..n]);
-        left -= n;
-    }
-    std.mem.writeInt(u32, &header, @intCast(size), .big);
-    writeRaw(io, stream.socket.handle, &header);
-    left = size;
-    while (left > 0) {
-        const n = @min(left, chunk.len);
-        writeRaw(io, stream.socket.handle, chunk[0..n]);
-        left -= n;
+    for (0..count) |_| {
+        writeRaw(io, stream.socket.handle, &header);
+        var left = size;
+        while (left > 0) {
+            const n = @min(left, chunk.len);
+            writeRaw(io, stream.socket.handle, chunk[0..n]);
+            left -= n;
+        }
     }
 }
 
@@ -561,8 +556,9 @@ test "a session that stops taking frames caps its queue and stops sharing" {
     try std.Io.Dir.cwd().createDir(testing.io, run, .fromMode(0o700));
     const path = try std.Io.Dir.path.join(alloc, &.{ home, owner.run_dir_name, owner.socket_name });
     defer alloc.free(path);
-    // Two frames, each over half the cap: the second one trips it.
-    const thread = try std.Thread.spawn(.{}, floodFrames, .{ testing.io, path, max_queue_bytes / 2 + 1 });
+    // Three frames of the largest size the wire allows: each passes the frame
+    // limit, two fill the queue to its cap and the third trips it.
+    const thread = try std.Thread.spawn(.{}, floodFrames, .{ testing.io, path, 3, wire.max_frame_bytes });
     defer thread.join();
     try waitForSocket(path);
 

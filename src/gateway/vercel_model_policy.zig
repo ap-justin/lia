@@ -96,13 +96,30 @@ const ModelVersion = struct {
     }
 };
 
-/// "anthropic/claude-opus-4.6" reads 4.6: the version follows the family name.
+/// "anthropic/claude-opus-4.6" and "anthropic/claude-opus-4-6" read 4.6: the
+/// version follows the family name. Names before Claude 4 put it first
+/// ("anthropic/claude-3-5-haiku" reads 3.5).
 fn claudeVersion(model: []const u8) ?ModelVersion {
     const prefix = "anthropic/claude-";
     if (!std.mem.startsWith(u8, model, prefix)) return null;
-    const rest = model[prefix.len..];
-    const dash = std.mem.findScalar(u8, rest, '-') orelse return null;
-    return leadingVersion(rest[dash + 1 ..]);
+    var rest = model[prefix.len..];
+    if (rest.len == 0 or !std.ascii.isDigit(rest[0])) {
+        const dash = std.mem.findScalar(u8, rest, '-') orelse return null;
+        rest = rest[dash + 1 ..];
+    }
+    const digits = "0123456789";
+    const major_end = std.mem.findNone(u8, rest, digits) orelse rest.len;
+    if (major_end < rest.len and rest[major_end] == '-') {
+        const after_dash = rest[major_end + 1 ..];
+        const minor_end = std.mem.findNone(u8, after_dash, digits) orelse after_dash.len;
+        // a longer run is a release date: "claude-opus-4-20250514" is 4.0
+        if (minor_end >= 1 and minor_end <= 2) {
+            const major = std.fmt.parseUnsigned(u32, rest[0..major_end], 10) catch return null;
+            const minor = std.fmt.parseUnsigned(u32, after_dash[0..minor_end], 10) catch return null;
+            return .{ .major = major, .minor = minor };
+        }
+    }
+    return leadingVersion(rest);
 }
 
 /// "openai/gpt-6.1-sol" reads 6.1.
@@ -125,13 +142,13 @@ fn leadingVersion(rest: []const u8) ?ModelVersion {
 }
 
 test "Claude 4.6 and later and GPT-6 and later compact through their provider" {
-    for ([_][]const u8{ "anthropic/claude-opus-4.6", "anthropic/claude-sonnet-4.6", "anthropic/claude-opus-4.8-fast", "anthropic/claude-haiku-5.5", "anthropic/claude-fable-5", "anthropic/claude-fable-5.2", "anthropic/claude-opus-5.5-batch" }) |model| {
+    for ([_][]const u8{ "anthropic/claude-opus-4.6", "anthropic/claude-sonnet-4.6", "anthropic/claude-opus-4.8-fast", "anthropic/claude-haiku-5.5", "anthropic/claude-fable-5", "anthropic/claude-fable-5.2", "anthropic/claude-opus-5.5-batch", "anthropic/claude-opus-4-6", "anthropic/claude-opus-4-7", "anthropic/claude-opus-4-8", "anthropic/claude-sonnet-4-6", "anthropic/claude-opus-4-8-fast" }) |model| {
         try std.testing.expectEqual(@as(?ProviderCompaction, .anthropic), providerCompaction(model));
     }
     for ([_][]const u8{ "openai/gpt-6-sol", "openai/gpt-6.1-sol", "openai/gpt-6.1-terra-fast", "openai/gpt-7" }) |model| {
         try std.testing.expectEqual(@as(?ProviderCompaction, .openai), providerCompaction(model));
     }
-    for ([_][]const u8{ "anthropic/claude-haiku-4.5", "anthropic/claude-opus-4.5", "anthropic/claude-sonnet-4.5", "anthropic/claude-sonnet", "anthropic/claude-", "openai/gpt-5.6-sol", "openai/gpt-5", "openai/gpt-oss-120b", "openai/gpt-", "zai/glm-5.3", "google/gemini-4-argon", "fixture/compaction" }) |model| {
+    for ([_][]const u8{ "anthropic/claude-haiku-4.5", "anthropic/claude-opus-4.5", "anthropic/claude-sonnet-4.5", "anthropic/claude-sonnet-4-5", "anthropic/claude-sonnet-4-5-20250929", "anthropic/claude-opus-4-20250514", "anthropic/claude-opus-4-1", "anthropic/claude-3-5-haiku", "anthropic/claude-3-7-sonnet-20250219", "anthropic/claude-3-haiku-20240307", "anthropic/claude-sonnet", "anthropic/claude-", "openai/gpt-5.6-sol", "openai/gpt-5", "openai/gpt-oss-120b", "openai/gpt-", "zai/glm-5.3", "google/gemini-4-argon", "fixture/compaction" }) |model| {
         try std.testing.expectEqual(@as(?ProviderCompaction, null), providerCompaction(model));
     }
 }

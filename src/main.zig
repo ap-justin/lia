@@ -814,6 +814,14 @@ test {
     _ = @import("core/mcp_host/verbs.zig");
     _ = @import("core/mcp_host/login_words.zig");
     _ = @import("core/mcp_host/kept_sign_outs.zig");
+    _ = @import("core/mcp_host/owner.zig");
+    _ = @import("core/mcp_host/owner_core.zig");
+    _ = @import("core/mcp_host/owner_wire.zig");
+    _ = @import("core/mcp_host/owner_client.zig");
+    _ = @import("core/mcp_host/idle_control.zig");
+    _ = @import("core/mcp_host/shared_servers.zig");
+    _ = @import("core/mcp_host/share_key.zig");
+    _ = @import("core/mcp_host/config.zig");
     _ = @import("core/mcp/tool_lookup.zig");
     _ = @import("core/recovery/recovery.zig");
     _ = @import("core/config/model_provider.zig");
