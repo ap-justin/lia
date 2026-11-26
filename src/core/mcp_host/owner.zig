@@ -196,6 +196,14 @@ const Owner = struct {
     /// leaves, so a long-lived owner holds only the keys in use, and the
     /// engine is reloaded with the shorter list.
     engine_configs: std.ArrayList(EngineEntry) = .empty,
+    /// The name the engine runs each key's server under, such as `shared-3`,
+    /// numbered in the order keys first register. Trace lines and the
+    /// server's stderr lines carry this name, never the key, since the key
+    /// hashes the server's environment and directory. A name stays with its
+    /// key for the owner's life, so a server the engine is still stopping
+    /// keeps its name; the list grows by one short entry per key ever run.
+    /// Only the owner loop reads or changes it.
+    labels: std.ArrayList(Label) = .empty,
 
     fn stopping(o: *Owner) bool {
         return o.stop.load(.acquire) or signal_stop.load(.acquire);
@@ -526,6 +534,8 @@ const Owner = struct {
         const gpa = o.gpa;
         for (o.engine_configs.items) |*entry| entry.deinit();
         o.engine_configs.deinit(gpa);
+        for (o.labels.items) |label| gpa.free(label.name);
+        o.labels.deinit(gpa);
         for (o.events.items) |*event| event.deinit(gpa);
         o.events.deinit(gpa);
         var iterator = o.configs.iterator();
@@ -536,6 +546,39 @@ const Owner = struct {
         o.configs.deinit(gpa);
     }
 };
+
+const Label = struct { key: core.Key, name: []u8 };
+
+/// The engine's name for `key`, or null when this owner never ran it.
+fn labelOf(owner: *const Owner, key: core.Key) ?[]const u8 {
+    for (owner.labels.items) |label| {
+        if (std.mem.eql(u8, &label.key, &key)) return label.name;
+    }
+    return null;
+}
+
+/// The engine's name for `key`, given the next number when the key has none.
+fn labelFor(owner: *Owner, key: core.Key) Allocator.Error![]const u8 {
+    if (labelOf(owner, key)) |name| return name;
+    try owner.labels.ensureUnusedCapacity(owner.gpa, 1);
+    const name = try std.fmt.allocPrint(owner.gpa, "shared-{d}", .{owner.labels.items.len + 1});
+    owner.labels.appendAssumeCapacity(.{ .key = key, .name = name });
+    return name;
+}
+
+/// The name to hand the engine for `key`. A key this owner never ran gets an
+/// empty name, which names no server, so the engine refuses it as it would
+/// any unknown server.
+fn engineName(owner: *const Owner, key: core.Key) []const u8 {
+    return labelOf(owner, key) orelse "";
+}
+
+fn keyOfLabel(owner: *const Owner, name: []const u8) ?core.Key {
+    for (owner.labels.items) |label| {
+        if (std.mem.eql(u8, label.name, name)) return label.key;
+    }
+    return null;
+}
 
 /// One key's engine config, with the arena that owns its strings: freed when
 /// the key's last client leaves, so the owner never holds a key it stopped
@@ -617,7 +660,7 @@ fn ownConfig(gpa: Allocator, config: wire.ServerConfig) Allocator.Error!OwnedCon
 /// The engine's copy of a key's config, built in `arena`. Every string is
 /// copied into the arena, so the config the engine keeps never borrows the
 /// `OwnedConfig` the owner frees when the key's last session leaves.
-fn engineConfig(arena: Allocator, key: core.Key, config: *const OwnedConfig) Allocator.Error!engine.Config {
+fn engineConfig(arena: Allocator, name: []const u8, config: *const OwnedConfig) Allocator.Error!engine.Config {
     const argv = try arena.alloc([]const u8, config.argv.len);
     for (config.argv, argv) |arg, *copy| copy.* = try arena.dupe(u8, arg);
     const map = try arena.create(std.process.Environ.Map);
@@ -636,7 +679,7 @@ fn engineConfig(arena: Allocator, key: core.Key, config: *const OwnedConfig) All
         .refused_ms = t.refused_ms,
     } else null;
     return .{
-        .name = try arena.dupe(u8, &key),
+        .name = try arena.dupe(u8, name),
         .transport = .{ .stdio = .{ .argv = argv, .environ_map = map, .cwd = if (config.cwd) |cwd| try arena.dupe(u8, cwd) else null } },
         .auth = auth,
         .timeouts = timeouts,
@@ -653,16 +696,10 @@ fn logStderr(_: *anyopaque, server: []const u8, line: []const u8) void {
     debug_trace.logf("mcp", "MCP server stderr server={s} line={s}", .{ server, line[0..@min(line.len, 512)] });
 }
 
-fn keyFromName(name: []const u8) ?core.Key {
-    if (name.len != 32) return null;
-    var key: core.Key = undefined;
-    @memcpy(&key, name);
-    return key;
-}
-
 fn slotOf(owner: *Owner, key: core.Key) ?usize {
+    const name = labelOf(owner, key) orelse return null;
     for (owner.engine_configs.items, 0..) |entry, index| {
-        if (std.mem.eql(u8, entry.config.name, &key)) return index;
+        if (std.mem.eql(u8, entry.config.name, name)) return index;
     }
     return null;
 }
@@ -704,7 +741,7 @@ fn removeEngineConfig(owner: *Owner, engine_value: *engine.Engine, a: Allocator,
         at += 1;
     }
     engine_value.reload(configs) catch |err| {
-        debug_trace.logf("mcp-owner", "owner engine slot not dropped reason={s} key={s}", .{ @errorName(err), key[0..] });
+        debug_trace.logf("mcp-owner", "owner engine slot not dropped reason={s} server={s}", .{ @errorName(err), engineName(owner, key) });
         return false;
     };
     var removed = owner.engine_configs.orderedRemove(index);
@@ -720,7 +757,7 @@ fn storeConfig(owner: *Owner, key: core.Key, config: OwnedConfig) void {
     const name = owner.gpa.dupe(u8, &key) catch {
         var copy = config;
         copy.deinit(owner.gpa);
-        debug_trace.logf("mcp-owner", "owner config dropped reason=out of memory key={s}", .{key[0..]});
+        debug_trace.logf("mcp-owner", "owner config dropped reason=out of memory", .{});
         return;
     };
     owner.configs_mutex.lockUncancelable(owner.io);
@@ -735,7 +772,7 @@ fn storeConfig(owner: *Owner, key: core.Key, config: OwnedConfig) void {
         owner.gpa.free(name);
         var copy = config;
         copy.deinit(owner.gpa);
-        debug_trace.logf("mcp-owner", "owner config dropped reason=out of memory key={s}", .{key[0..]});
+        debug_trace.logf("mcp-owner", "owner config dropped reason=out of memory", .{});
     };
 }
 /// Drops a key's config once no session is left on it. A session that
@@ -851,7 +888,7 @@ fn startKey(event: *const ShellEvent) ?core.Key {
 /// key is still stopping, and running it now could start a second copy of that
 /// name (`runtime.zig` holds the same requests for the same reason).
 fn stepShellEvent(owner: *Owner, state: *core.State, engine_value: *engine.Engine, scratch: *std.heap.ArenaAllocator, shell_event: *ShellEvent) bool {
-    if (startKey(shell_event)) |key| if (engine_value.stopping(&key)) return false;
+    if (startKey(shell_event)) |key| if (engine_value.stopping(engineName(owner, key))) return false;
     const event = shell_event.event();
     // The route table applied this client's leave: its id can be used again
     // once its tasks have ended too.
@@ -953,18 +990,19 @@ fn ownerLoop(owner: *Owner) void {
     }
 }
 
-/// What a frame that could not be built was about, for its trace line.
-fn frameAbout(a: Allocator, message: wire.OwnerMessage) Allocator.Error![]const u8 {
+/// What a frame that could not be built was about, for its trace line. A key
+/// is written as the engine's name for it, never as the key.
+fn frameAbout(owner: *const Owner, a: Allocator, message: wire.OwnerMessage) Allocator.Error![]const u8 {
     return switch (message) {
         .welcome => |m| a.print("owner={d}", .{m.owner}),
-        .phase => |m| a.print("key={s}", .{m.key[0..]}),
-        .tools => |m| a.print("key={s}", .{m.key[0..]}),
-        .question => |m| a.print("key={s} slot={d}", .{ m.key[0..], m.slot }),
-        .elicitation_complete => |m| a.print("key={s} slot={d}", .{ m.key[0..], m.slot }),
-        .elicit_withdrawn => |m| a.print("key={s} slot={d}", .{ m.key[0..], m.slot }),
-        .stopped_idle => |m| a.print("key={s}", .{m.key[0..]}),
-        .refused => |m| if (m.key) |key| a.print("key={s} reason={s}", .{ key[0..], @tagName(m.reason) }) else a.print("call={?d} reason={s}", .{ m.call, @tagName(m.reason) }),
-        .status => |m| a.print("key={s}", .{m.key[0..]}),
+        .phase => |m| a.print("server={s}", .{engineName(owner, m.key)}),
+        .tools => |m| a.print("server={s}", .{engineName(owner, m.key)}),
+        .question => |m| a.print("server={s} slot={d}", .{ engineName(owner, m.key), m.slot }),
+        .elicitation_complete => |m| a.print("server={s} slot={d}", .{ engineName(owner, m.key), m.slot }),
+        .elicit_withdrawn => |m| a.print("server={s} slot={d}", .{ engineName(owner, m.key), m.slot }),
+        .stopped_idle => |m| a.print("server={s}", .{engineName(owner, m.key)}),
+        .refused => |m| if (m.key) |key| a.print("server={s} reason={s}", .{ engineName(owner, key), @tagName(m.reason) }) else a.print("call={?d} reason={s}", .{ m.call, @tagName(m.reason) }),
+        .status => |m| a.print("server={s}", .{engineName(owner, m.key)}),
         .called => |m| a.print("call={d}", .{m.id}),
         .progress => |m| a.print("call={d}", .{m.id}),
         .input => |m| a.print("call={d}", .{m.id}),
@@ -995,7 +1033,7 @@ fn frameThatEndsTheCall(message: wire.OwnerMessage) ?wire.OwnerMessage {
 fn sendFrame(owner: *Owner, conn: *Connection, message: wire.OwnerMessage, a: Allocator) void {
     const what = @tagName(std.meta.activeTag(message));
     const frame = wire.encode(owner.gpa, message) catch |err| {
-        debug_trace.logf("mcp-owner", "owner frame dropped kind={s} {s} err={s}", .{ what, frameAbout(a, message) catch "?", @errorName(err) });
+        debug_trace.logf("mcp-owner", "owner frame dropped kind={s} {s} err={s}", .{ what, frameAbout(owner, a, message) catch "?", @errorName(err) });
         const end = frameThatEndsTheCall(message) orelse return;
         const small = wire.encode(owner.gpa, end) catch return;
         owner.enqueue(conn, small, "called");
@@ -1033,29 +1071,34 @@ fn apply(owner: *Owner, state: *core.State, engine_value: *engine.Engine, scratc
                 owner.configs_mutex.unlock(owner.io);
                 continue;
             };
+            const name = labelFor(owner, slot.key) catch {
+                owner.configs_mutex.unlock(owner.io);
+                debug_trace.logf("mcp-owner", "owner server not registered reason=out of memory", .{});
+                continue;
+            };
             var entry: EngineEntry = .{ .config = undefined, .arena = .init(owner.gpa) };
-            entry.config = engineConfig(entry.arena.allocator(), slot.key, config) catch {
+            entry.config = engineConfig(entry.arena.allocator(), name, config) catch {
                 entry.arena.deinit();
                 owner.configs_mutex.unlock(owner.io);
-                debug_trace.logf("mcp-owner", "owner server not registered reason=out of memory key={s}", .{slot.key[0..]});
+                debug_trace.logf("mcp-owner", "owner server not registered reason=out of memory server={s}", .{name});
                 continue;
             };
             owner.configs_mutex.unlock(owner.io);
             owner.engine_configs.append(owner.gpa, entry) catch {
                 var copy = entry;
                 copy.deinit();
-                debug_trace.logf("mcp-owner", "owner server not registered reason=out of memory key={s}", .{slot.key[0..]});
+                debug_trace.logf("mcp-owner", "owner server not registered reason=out of memory server={s}", .{name});
                 continue;
             };
             reloadEngine(owner, engine_value, a);
         },
         .need => |need| {
-            engine_value.needTools(&need.key) catch |err| {
+            engine_value.needTools(engineName(owner, need.key)) catch |err| {
                 debug_trace.logf("mcp-owner", "owner tool list not started err={s}", .{@errorName(err)});
             };
         },
         .call => |call| {
-            const handle = engine_value.call(&call.key, call.tool, call.arguments) catch |err| {
+            const handle = engine_value.call(engineName(owner, call.key), call.tool, call.arguments) catch |err| {
                 debug_trace.logf("mcp-owner", "owner call not issued err={s}", .{@errorName(err)});
                 owner.push(.{ .core = .{ .issue_failed = .{ .call = call.call } } });
                 continue;
@@ -1086,7 +1129,7 @@ fn apply(owner: *Owner, state: *core.State, engine_value: *engine.Engine, scratc
                 debug_trace.logf("mcp-owner", "owner respond not sent err={s}", .{@errorName(err)});
             };
         },
-        .answer => |answer| engine_value.answerElicitation(&answer.key, .{ .slot = answer.slot, .n = answer.n }, .{ .action = answer.action, .content = answer.content }) catch |err| {
+        .answer => |answer| engine_value.answerElicitation(engineName(owner, answer.key), .{ .slot = answer.slot, .n = answer.n }, .{ .action = answer.action, .content = answer.content }) catch |err| {
             debug_trace.logf("mcp-owner", "owner answer not sent err={s}", .{@errorName(err)});
         },
         .disconnect => |disconnect| {
@@ -1096,7 +1139,7 @@ fn apply(owner: *Owner, state: *core.State, engine_value: *engine.Engine, scratc
             // not hold is disconnected here instead.
             forgetConfig(owner, disconnect.key);
             if (removeEngineConfig(owner, engine_value, a, disconnect.key)) continue;
-            engine_value.disconnect(&disconnect.key) catch |err| {
+            engine_value.disconnect(engineName(owner, disconnect.key)) catch |err| {
                 debug_trace.logf("mcp-owner", "owner server not disconnected err={s}", .{@errorName(err)});
             };
         },
@@ -1104,7 +1147,7 @@ fn apply(owner: *Owner, state: *core.State, engine_value: *engine.Engine, scratc
             const conn = owner.connectionOf(refuse.to) orelse continue;
             // One refused request, not one lost connection: the session falls
             // back for this server or this call and keeps every other key.
-            debug_trace.logf("mcp-owner", "owner request refused reason={s} client={d} key={?s}", .{ @tagName(refuse.reason), @backingInt(refuse.to), if (refuse.key) |key| key[0..] else null });
+            debug_trace.logf("mcp-owner", "owner request refused reason={s} client={d} server={?s}", .{ @tagName(refuse.reason), @backingInt(refuse.to), if (refuse.key) |key| engineName(owner, key) else null });
             sendFrame(owner, conn, .{ .refused = .{
                 .reason = refuse.reason,
                 .key = refuse.key,
@@ -1154,7 +1197,7 @@ fn statusMessage(owner: *Owner, engine_value: *engine.Engine, a: Allocator, key:
         .version = if (status.version) |v| a.dupe(u8, v) catch null else null,
         .last_error = if (status.last_error) |e| a.dupe(u8, e) catch null else null,
         .stderr_tail = if (tail) |t| a.dupe(u8, t) catch null else null,
-        .instructions = if (engine_value.instructions(&key)) |text| a.dupe(u8, text) catch null else null,
+        .instructions = if (engine_value.instructions(engineName(owner, key))) |text| a.dupe(u8, text) catch null else null,
         .exit_code = if (status.exit) |e| (switch (e) {
             .code => |c| c,
             .signal => null,
@@ -1179,8 +1222,7 @@ fn refusalMessage(owner: *Owner, engine_value: *engine.Engine, a: Allocator, key
 }
 
 fn toolsJson(owner: *Owner, engine_value: *engine.Engine, a: Allocator, key: core.Key) []const u8 {
-    _ = owner;
-    const list = engine_value.toolList(&key) catch return "[]";
+    const list = engine_value.toolList(engineName(owner, key)) catch return "[]";
     var out: std.ArrayList(u8) = .empty;
     out.append(a, '[') catch return "[]";
     for (0..list.len()) |i| {
@@ -1196,7 +1238,7 @@ fn toolsJson(owner: *Owner, engine_value: *engine.Engine, a: Allocator, key: cor
 fn stepEngineEvent(owner: *Owner, state: *core.State, engine_value: *engine.Engine, scratch: *std.heap.ArenaAllocator, event: engine.Event) void {
     _ = scratch.reset(.retain_capacity);
     const a = scratch.allocator();
-    const key = keyFromName(event.server) orelse return;
+    const key = keyOfLabel(owner, event.server) orelse return;
     // What the clients know about the server goes out first: a phase or a
     // listing frame ends a session's waiting request, and that session builds
     // its failure text from this status, so the status must be there before
@@ -1251,9 +1293,9 @@ fn stepEngineEvent(owner: *Owner, state: *core.State, engine_value: *engine.Engi
                 const kind = questionKind(elicit.params, &form) orelse {
                     // No session could show a question lia cannot read: decline
                     // it, so the server does not wait for an answer.
-                    debug_trace.logf("mcp-owner", "owner question declined reason=unreadable params key={s} slot={d} n={d}", .{ key[0..], elicit.id.slot, elicit.id.n });
-                    engine_value.answerElicitation(&key, .{ .slot = elicit.id.slot, .n = elicit.id.n }, .{ .action = .cancel, .content = null }) catch |err| {
-                        debug_trace.logf("mcp-owner", "owner question not declined reason={s} key={s}", .{ @errorName(err), key[0..] });
+                    debug_trace.logf("mcp-owner", "owner question declined reason=unreadable params server={s} slot={d} n={d}", .{ event.server, elicit.id.slot, elicit.id.n });
+                    engine_value.answerElicitation(event.server, .{ .slot = elicit.id.slot, .n = elicit.id.n }, .{ .action = .cancel, .content = null }) catch |err| {
+                        debug_trace.logf("mcp-owner", "owner question not declined reason={s} server={s}", .{ @errorName(err), event.server });
                     };
                     return;
                 };
@@ -1263,7 +1305,7 @@ fn stepEngineEvent(owner: *Owner, state: *core.State, engine_value: *engine.Engi
                     .n = elicit.id.n,
                     .kind = kind,
                     .params = a.dupe(u8, elicit.params) catch {
-                        debug_trace.logf("mcp-owner", "owner question dropped reason=out of memory key={s} slot={d} n={d}", .{ key[0..], elicit.id.slot, elicit.id.n });
+                        debug_trace.logf("mcp-owner", "owner question dropped reason=out of memory server={s} slot={d} n={d}", .{ event.server, elicit.id.slot, elicit.id.n });
                         return;
                     },
                     .version = if (version) |v| a.dupe(u8, v) catch null else null,
@@ -2415,4 +2457,87 @@ test "a failing server's status reaches a client before the phase frame that end
         }
     }
     return error.NoFailedPhaseFrame;
+}
+
+test "each key the owner runs gets the next label, kept for the owner's life" {
+    const alloc = testing.allocator;
+    var stop = std.atomic.Value(bool).init(false);
+    var owner: Owner = .{ .io = testing.io, .gpa = alloc, .stop = &stop, .client_version = test_client_version };
+    defer owner.deinit();
+    try testing.expectEqualStrings("", engineName(&owner, test_key));
+    try testing.expectEqualStrings("shared-1", try labelFor(&owner, test_key));
+    try testing.expectEqualStrings("shared-2", try labelFor(&owner, testKey(2)));
+    try testing.expectEqualStrings("shared-1", try labelFor(&owner, test_key));
+    try testing.expectEqual(test_key, keyOfLabel(&owner, "shared-1").?);
+    try testing.expect(keyOfLabel(&owner, &test_key) == null);
+}
+
+test "the owner's trace lines name a shared server by its label, never by its key" {
+    const alloc = testing.allocator;
+    const home = try shortHome(alloc);
+    defer removeHome(alloc, home);
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ home, "trace.log" });
+    defer alloc.free(trace_path);
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTest(alloc, trace_path);
+
+    // The key a session sends: a hash over the server's environment.
+    const secret = "lia-test-secret-value";
+    var env: std.process.Environ.Map = .init(alloc);
+    defer env.deinit();
+    try env.put("LIA_TEST_TOKEN", secret);
+    const argv = [_][]const u8{ "sh", "-c", "echo 'stderr from the server' >&2; exit 7" };
+    const key = @import("share_key.zig").of(.{ .name = "web", .transport = .{ .stdio = .{ .argv = &argv, .environ_map = &env } } });
+
+    var stop = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, serveThread, .{ testing.io, alloc, home, &stop });
+    var joined = false;
+    defer if (!joined) {
+        stop.store(true, .release);
+        thread.join();
+    };
+    const path = try socketPath(alloc, home);
+    defer alloc.free(path);
+    try waitForSocket(path);
+
+    var client = try TestClient.connect(path);
+    defer client.close();
+    try client.send(.{ .hello = .{ .pid = 1 } });
+    try client.send(.{ .register = .{
+        .key = key,
+        .config = .{ .argv = &argv, .env = &.{.{ .name = "LIA_TEST_TOKEN", .value = secret }}, .timeouts = .{ .start_ms = 15_000 } },
+        .ask_form = false,
+        .ask_url = false,
+    } });
+    try client.send(.{ .need = .{ .key = key } });
+    var arena: std.heap.ArenaAllocator = .init(alloc);
+    defer arena.deinit();
+    var failed = false;
+    const deadline = std.Io.Clock.awake.now(testing.io).toMilliseconds() + 20_000;
+    while (!failed and std.Io.Clock.awake.now(testing.io).toMilliseconds() < deadline) {
+        const message = client.receive(arena.allocator(), 500) catch |err| switch (err) {
+            error.Timeout => continue,
+            else => return err,
+        };
+        if (message == .owner and message.owner == .phase) {
+            const phase = message.owner.phase.phase;
+            failed = phase == .backoff or phase == .failed;
+        }
+    }
+    try testing.expect(failed);
+    client.close();
+    stop.store(true, .release);
+    thread.join();
+    joined = true;
+    debug_trace.shutdown();
+
+    var file = try std.Io.Dir.openFileAbsolute(testing.io, trace_path, .{});
+    defer file.close(testing.io);
+    const trace = try io_mod.readFileToEnd(alloc, &file, 1 << 20);
+    defer alloc.free(trace);
+    try testing.expect(std.mem.find(u8, trace, "server=shared-1") != null);
+    try testing.expect(std.mem.find(u8, trace, &key) == null);
+    try testing.expect(std.mem.find(u8, trace, key[0..8]) == null);
+    try testing.expect(std.mem.find(u8, trace, secret) == null);
 }

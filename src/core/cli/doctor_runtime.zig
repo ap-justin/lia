@@ -234,6 +234,11 @@ fn appendUnknownSettingChecksFor(
     for (unknown) |key| {
         try appendCheckOwnedFix(checks, alloc, "config", .warn, try settings_messages.formatUnknownSetting(alloc, key, display_path), try alloc.print("rename or remove that key in {s}", .{display_path}));
     }
+    const older = try settings_keys.findOlderNames(alloc, parsed.value, file);
+    defer alloc.free(older);
+    for (older) |entry| {
+        try appendCheckOwnedFix(checks, alloc, "config", .warn, try settings_messages.formatOlderName(alloc, entry, display_path), try alloc.print("rename {s} to {s} in {s}", .{ entry.older, entry.current, display_path }));
+    }
     if (parsed.value != .object) return;
     try appendOldYolo(checks, alloc, parsed.value.object, null, display_path);
     if (file != .profile) return;

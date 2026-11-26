@@ -30,6 +30,17 @@ pub fn formatUnknownSetting(alloc: Allocator, key: settings_keys.UnknownKey, dis
     return out.toOwnedSlice();
 }
 
+/// `notifications in ~/.lia/settings.json is an older name for sound, which
+/// lia no longer reads; rename it to sound`. Caller owns the result.
+pub fn formatOlderName(alloc: Allocator, older: settings_keys.OlderName, display_path: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try out.writer.print("{s} in {s}", .{ older.older, display_path });
+    try writeWorkspace(&out.writer, older.workspace);
+    try out.writer.print(" is an older name for {s}, which lia no longer reads; rename it to {s}", .{ older.current, older.current });
+    return out.toOwnedSlice();
+}
+
 /// `permission_mode yolo in ~/.lia/settings.json is an older name for
 /// full-access; set permission_mode to full-access`. Caller owns the result.
 pub fn formatOldYolo(alloc: Allocator, workspace: ?[]const u8, display_path: []const u8) ![]u8 {
@@ -94,6 +105,16 @@ test "unknown settings name the file, the workspace, and the closest key" {
         defer alloc.free(detail);
         try std.testing.expectEqualStrings(case.expected, detail);
     }
+}
+
+test "an older setting name names its current one" {
+    const alloc = std.testing.allocator;
+    const top = try formatOlderName(alloc, .{ .older = "notifications", .current = "sound" }, "~/.lia/settings.json");
+    defer alloc.free(top);
+    try std.testing.expectEqualStrings("notifications in ~/.lia/settings.json is an older name for sound, which lia no longer reads; rename it to sound", top);
+    const workspace = try formatOlderName(alloc, .{ .older = "statusLine", .current = "status_line", .workspace = "/w" }, "~/.lia/settings.json");
+    defer alloc.free(workspace);
+    try std.testing.expectEqualStrings("statusLine in ~/.lia/settings.json for workspace /w is an older name for status_line, which lia no longer reads; rename it to status_line", workspace);
 }
 
 test "a saved yolo names full-access as its current name, with no release" {

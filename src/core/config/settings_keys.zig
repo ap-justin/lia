@@ -69,6 +69,10 @@ pub const Key = struct {
     /// The key that replaced an older form lia still reads but no longer
     /// writes, such as `models.gateway` for `model`.
     superseded_by: ?[]const u8 = null,
+    /// The current name of a retired key that was renamed, such as `sound`
+    /// for `notifications`. `lia doctor` names it in a warning until
+    /// `command_specs.old_spelling_removal`.
+    renamed_to: ?[]const u8 = null,
     /// Read only inside a `workspaces` entry, never at the top of the file.
     workspace_only: bool = false,
     /// Read only at the top of the profile, never inside a `workspaces` entry.
@@ -125,6 +129,7 @@ pub const keys = [_]Key{
     .{ .name = "maxxing_mode", .where = .retired, .kind = .any, .description = retired_description },
     .{ .name = "model", .where = .profile, .kind = .string, .superseded_by = "models.gateway", .description = "Older form of models.gateway" },
     .{ .name = "models", .where = .profile, .kind = .string_map, .map = true, .description = "The saved model for each provider or connection, such as {\"gateway\": \"<model id>\"}" },
+    .{ .name = "notifications", .where = .retired, .kind = .any, .renamed_to = "sound", .description = "Older name of sound; lia no longer reads it" },
     .{ .name = "permission", .where = .profile, .kind = .object, .map = true, .description = "Permission rules; lia permissions shows them" },
     .{ .name = "permission_mode", .where = .profile, .kind = .string, .values = &.{ "ask", "auto", "full-access", "yolo" }, .description = "How lia handles tool calls that need permission; yolo is an older name for full-access" },
     .{ .name = "prompt_history", .where = .profile, .kind = .switches, .children = &.{"enabled"}, .child_descriptions = &.{"Save prompts and slash commands for input history"}, .description = "Input history" },
@@ -141,7 +146,7 @@ pub const keys = [_]Key{
     .{ .name = "slash_menu_categories", .where = .retired, .kind = .any, .description = retired_description },
     .{ .name = "sound", .where = .profile, .kind = .switches, .children = &sound_children, .child_descriptions = &sound_child_descriptions, .description = "Sounds" },
     .{ .name = "startup_scrollback", .where = .retired, .kind = .any, .description = retired_description },
-    .{ .name = "statusLine", .where = .retired, .kind = .any, .description = retired_description },
+    .{ .name = "statusLine", .where = .retired, .kind = .any, .renamed_to = "status_line", .description = "Older name of status_line; lia no longer reads it" },
     .{ .name = "status_line", .where = .retired, .kind = .any, .description = retired_description },
     .{ .name = "theme", .where = .profile, .kind = .string, .description = "light, dark, or the name of a theme file in ~/.lia/themes" },
     .{ .name = "tool_placement", .where = .profile, .kind = .string_map, .map = true, .values = &.{ "direct", "toolbox" }, .description = "Where each built-in tool is offered: \"direct\" sends it with the tools, \"toolbox\" lists it in the toolbox menu" },
@@ -184,6 +189,45 @@ pub fn ignoredInProject(name: []const u8) bool {
 }
 
 pub const File = enum { profile, project };
+
+pub const OlderName = struct {
+    older: []const u8,
+    current: []const u8,
+    /// The workspace override holding it, borrowed from the parsed settings,
+    /// or null at the top level.
+    workspace: ?[]const u8 = null,
+};
+
+/// Lists the renamed keys that `root` still sets under their older name. A
+/// profile `settings.json` is also checked inside each `workspaces` override.
+/// Caller owns the returned slice; its strings borrow from `root` and the
+/// list.
+pub fn findOlderNames(alloc: Allocator, root: std.json.Value, file: File) ![]OlderName {
+    var found: std.ArrayList(OlderName) = .empty;
+    errdefer found.deinit(alloc);
+    if (root != .object) return found.toOwnedSlice(alloc);
+    try appendOlderNames(alloc, &found, root.object, null);
+    if (file == .profile) {
+        if (root.object.get("workspaces")) |workspaces| {
+            if (workspaces == .object) {
+                var iterator = workspaces.object.iterator();
+                while (iterator.next()) |entry| {
+                    if (entry.value_ptr.* != .object) continue;
+                    try appendOlderNames(alloc, &found, entry.value_ptr.object, entry.key_ptr.*);
+                }
+            }
+        }
+    }
+    return found.toOwnedSlice(alloc);
+}
+
+fn appendOlderNames(alloc: Allocator, found: *std.ArrayList(OlderName), object: std.json.ObjectMap, workspace: ?[]const u8) !void {
+    for (keys) |key| {
+        const current = key.renamed_to orelse continue;
+        if (!object.contains(key.name)) continue;
+        try found.append(alloc, .{ .older = key.name, .current = current, .workspace = workspace });
+    }
+}
 
 pub const UnknownKey = struct {
     /// The key, borrowed from the parsed settings.
@@ -291,7 +335,40 @@ test "every key says what it holds and what it does" {
             const dot = std.mem.findScalar(u8, path, '.') orelse path.len;
             try std.testing.expect(find(path[0..dot]) != null);
         }
+        if (key.renamed_to) |current| {
+            try std.testing.expectEqual(Where.retired, key.where);
+            try std.testing.expect(find(current) != null);
+        }
     }
+}
+
+test "older names are found at the top level and in workspace overrides" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"notifications":{"max":true},"sound":{"max":false},"statusLine":7,
+        \\ "workspaces":{"/w":{"notifications":{}},"/x":{"sound":{}},"/bad":3}}
+    , .{});
+    defer parsed.deinit();
+    const found = try findOlderNames(alloc, parsed.value, .profile);
+    defer alloc.free(found);
+    try std.testing.expectEqual(@as(usize, 3), found.len);
+    try std.testing.expectEqualStrings("notifications", found[0].older);
+    try std.testing.expectEqualStrings("sound", found[0].current);
+    try std.testing.expect(found[0].workspace == null);
+    try std.testing.expectEqualStrings("statusLine", found[1].older);
+    try std.testing.expectEqualStrings("status_line", found[1].current);
+    try std.testing.expectEqualStrings("notifications", found[2].older);
+    try std.testing.expectEqualStrings("/w", found[2].workspace.?);
+
+    // They are retired keys, so they aren't reported as unknown as well.
+    const unknown = try findUnknown(alloc, parsed.value, .profile);
+    defer alloc.free(unknown);
+    try std.testing.expectEqual(@as(usize, 0), unknown.len);
+
+    // A project file is checked at its top level only.
+    const project = try findOlderNames(alloc, parsed.value, .project);
+    defer alloc.free(project);
+    try std.testing.expectEqual(@as(usize, 2), project.len);
 }
 
 test "keys are unique and sorted so the list stays easy to scan" {
@@ -359,21 +436,15 @@ test "unknown keys are found at the top level, in fixed objects, and in workspac
 
     const unknown = try findUnknown(alloc, parsed.value, .profile);
     defer alloc.free(unknown);
-    try std.testing.expectEqual(@as(usize, 4), unknown.len);
+    // The retired notifications group is left to findOlderNames.
+    try std.testing.expectEqual(@as(usize, 2), unknown.len);
 
     try std.testing.expectEqualStrings("fast_mdoe", unknown[0].name);
     try std.testing.expect(unknown[0].parent == null and unknown[0].workspace == null);
     try std.testing.expectEqual(@as(usize, names.len), unknown[0].known.len);
 
-    // The old group name is an unknown key now, like any other.
-    try std.testing.expectEqualStrings("notifications", unknown[1].name);
-    try std.testing.expect(unknown[1].parent == null and unknown[1].workspace == null);
-
-    try std.testing.expectEqualStrings("efort", unknown[2].name);
-    try std.testing.expectEqualStrings("/w", unknown[2].workspace.?);
-
-    try std.testing.expectEqualStrings("notifications", unknown[3].name);
-    try std.testing.expectEqualStrings("/w", unknown[3].workspace.?);
+    try std.testing.expectEqualStrings("efort", unknown[1].name);
+    try std.testing.expectEqualStrings("/w", unknown[1].workspace.?);
 }
 
 test "a project file is checked at its top level only" {
@@ -398,7 +469,7 @@ test "dotted paths name listed keys, fixed children, and paths into maps" {
         try std.testing.expect(unknownPart(path) == null);
     }
 
-    // The old group name is an unknown top-level key, not a child of a setting.
+    // The old group name is a retired top-level key, not a child of a setting.
     const old_group = unknownPart("notifications.max").?;
     try std.testing.expectEqualStrings("notifications", old_group.name);
     try std.testing.expect(old_group.parent == null);

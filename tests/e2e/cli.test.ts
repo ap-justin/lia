@@ -1028,7 +1028,7 @@ describe("cli: status", () => {
             statusLine: { contxt: true },
             status_line: { context: true },
             maxxing_mode: 1,
-            workspaces: { [cwd]: { efort: "low" } },
+            workspaces: { [cwd]: { efort: "low", notifications: { turn_end: true } } },
           }) + "\n",
           { mode: 0o600 },
         );
@@ -1040,16 +1040,18 @@ describe("cli: status", () => {
         const warnings = JSON.parse(doctor.stdout)
           .checks.filter((check: { name: string; status: string }) => check.name === "config" && check.status === "warn")
           .map((check: { detail: string }) => check.detail);
-        // The old `statusLine` group is an unknown key now, so doctor names its
-        // current key. Its children are not checked, since the group is ignored.
+        // The renamed `statusLine` and `notifications` groups warn with their
+        // current names until lia 0.2.0. Their children are not checked, since
+        // lia ignores the groups.
         expect(warnings).toEqual([
           "unknown setting fast_mdoe in ~/.lia/settings.json (did you mean fast_mode?)",
           `unknown setting efort in ~/.lia/settings.json for workspace ${cwd} (did you mean effort?)`,
+          "statusLine in ~/.lia/settings.json is an older name for status_line, which lia no longer reads; rename it to status_line",
+          `notifications in ~/.lia/settings.json for workspace ${cwd} is an older name for sound, which lia no longer reads; rename it to sound`,
           "unknown setting max_agent_step in .lia.json (did you mean max_agent_steps?)",
         ]);
-        // statusLine and status_line are retired: loaded and ignored, never diagnosed.
-        expect(doctor.stdout).not.toContain("statusLine");
-        expect(doctor.stdout).not.toContain("status_line");
+        // status_line itself is retired: loaded and ignored, never diagnosed.
+        expect(doctor.stdout).not.toContain("status_line.");
 
         const status = await runLia(["status"], { cwd, env });
         expect(status.code).toBe(0);

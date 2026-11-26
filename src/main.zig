@@ -879,6 +879,7 @@ test {
     _ = @import("core/cli/doctor_runtime.zig");
     _ = @import("core/cli/doctor_probes.zig");
     _ = @import("core/cli/doctor_child_status.zig");
+    _ = @import("core/cli/settings_messages.zig");
     _ = @import("core/auth/login_flow.zig");
     _ = @import("core/auth/provider_catalog.zig");
     _ = @import("gateway/responses_protocol.zig");
