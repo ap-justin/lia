@@ -2988,7 +2988,7 @@ describe("cli: setup", () => {
       const r = await runLia(["setup"], {
         env: { ...NO_GATEWAY_AUTH, LIA_DISABLE_KEYCHAIN: "1" },
       });
-      expect(r.code).toBe(2);
+      expect(r.code).toBe(1);
       expect(r.stdout).toBe("");
       expect(r.stderr).toBe(
         "lia setup is deprecated and stops working in lia 0.2.0; use lia login vercel --api-key\n" +
@@ -3054,7 +3054,7 @@ exit 99
           },
           timeoutMs: TIMEOUT,
         });
-        expect(r.code).toBe(2);
+        expect(r.code).toBe(1);
         expect(r.stdout).toBe("");
         expect(r.stderr).toContain("lia setup is deprecated and stops working in lia 0.2.0; use lia login vercel --api-key\n");
         expect(r.stderr).toContain("interactive terminal is required");
