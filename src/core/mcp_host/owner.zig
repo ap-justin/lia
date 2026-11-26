@@ -561,7 +561,7 @@ fn labelOf(owner: *const Owner, key: core.Key) ?[]const u8 {
 fn labelFor(owner: *Owner, key: core.Key) Allocator.Error![]const u8 {
     if (labelOf(owner, key)) |name| return name;
     try owner.labels.ensureUnusedCapacity(owner.gpa, 1);
-    const name = try std.fmt.allocPrint(owner.gpa, "shared-{d}", .{owner.labels.items.len + 1});
+    const name = try owner.gpa.print("shared-{d}", .{owner.labels.items.len + 1});
     owner.labels.appendAssumeCapacity(.{ .key = key, .name = name });
     return name;
 }
