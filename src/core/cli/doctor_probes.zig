@@ -1581,7 +1581,7 @@ test "stopping a check that keeps starting processes in groups of their own leav
     defer test_after_listing = null;
     defer holding_forker = null;
     // The forker starts a process about every millisecond, records its pid,
-    // moves it to a group of its own, like a stdio server an `lia mcp show`
+    // moves it to a group of its own, like a stdio server a `lia mcp show`
     // child starts, and writes a byte to a named pipe. It does all of that
     // itself, right after the fork, so that a byte says the process is out of
     // the group, and the pid is written first, so a process that is out of the

@@ -211,13 +211,14 @@ pub const OlderName = struct {
     current: []const u8,
     /// Whether the current name is set beside it.
     both: bool = true,
-    /// The workspace override holding both, borrowed from the parsed
+    /// The workspace override that sets it, borrowed from the parsed
     /// settings, or null at the top level.
     workspace: ?[]const u8 = null,
 };
 
-/// Lists the renamed settings that `root` sets under both their older and
-/// their current name, where the current one wins. A profile `settings.json`
+/// Lists the renamed settings that `root` sets under their older name, and
+/// whether it sets the current name too. A pair where lia ignores the current
+/// group and keeps reading the older one is left out. A profile `settings.json`
 /// is also checked inside each `workspaces` override. Caller owns the
 /// returned slice; its strings borrow from `root` and the list.
 pub fn findOlderNames(alloc: Allocator, root: std.json.Value, file: File) ![]OlderName {
@@ -439,7 +440,7 @@ test "older names map to the current ones, in paths and in files" {
     try std.testing.expectEqualStrings("notifications", twice[1].older);
     try std.testing.expectEqualStrings("/w", twice[1].workspace.?);
 
-    // A top-level older name is reported alone too, so lia doctor can say when
+    // An older name set alone is reported too, so lia doctor can say when
     // it stops working.
     var alone = try std.json.parseFromSlice(std.json.Value, alloc,
         \\{"notifications":{"max":true}}

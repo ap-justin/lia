@@ -3236,7 +3236,7 @@ test "a reload under another cwd and a new session drop what the host they repla
     try server.releaseActiveSession(&state);
     server.stopSubagentsForReopen(&state);
 
-    // A new session replaces a session whose host queued a report, and drops all the mail, a message too.
+    // A new session replaces one whose host queued a report, and drops everything queued, messages included.
     try handleNewSession(&state, arena, &new_msg);
     const next = state.subagent_host.?;
     try next.report_sink.?.post(next, .{ .report = .{ .agent = "reviewer", .child_id = "child-2", .work_id = "work-2", .call_id = "call-2", .outcome = .completed, .output = "done" } });

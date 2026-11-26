@@ -3025,7 +3025,7 @@ fn runSessionRecovery(alloc: Allocator, deps: RunDeps, recovery: SessionRecovery
     return writeSessionRecovery(alloc, deps, result, recovery.format);
 }
 
-/// `lia session fork <last|id>` (D5): copies a saved or live root session up
+/// `lia session fork <last|id>`: copies a saved or live root session up
 /// to its last finished turn. The result borrows the source id and the fork,
 /// which this function frees.
 fn runSessionFork(alloc: Allocator, deps: RunDeps, fork: SessionForkOptions) !RunResult {

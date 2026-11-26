@@ -363,9 +363,9 @@ fn readExact(io: std.Io, stream: std.Io.net.Stream, buffer: []u8) !void {
 const testing = std.testing;
 
 /// The most a session queues from the owner: two frames of the largest size
-/// the owner can send, as the owner's own per-connection queue holds, so a
-/// third behind them is past it. Past it the session stops sharing and runs
-/// every server itself, so one that stops taking frames (in a permission
+/// the owner can send, which is what the owner's own per-connection queue
+/// holds, so a third frame goes past it. Past it the session stops sharing and
+/// runs every server itself, so one that stops taking frames (in a permission
 /// question, say) is not grown without end.
 const max_queue_bytes = 2 * wire.max_frame_bytes;
 

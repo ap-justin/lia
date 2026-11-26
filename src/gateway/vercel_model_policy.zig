@@ -112,7 +112,7 @@ fn claudeVersion(model: []const u8) ?ModelVersion {
     if (major_end < rest.len and rest[major_end] == '-') {
         const after_dash = rest[major_end + 1 ..];
         const minor_end = std.mem.findNone(u8, after_dash, digits) orelse after_dash.len;
-        // a longer run is a release date: "claude-opus-4-20250514" is 4.0
+        // A longer run is a release date: "claude-opus-4-20250514" is 4.0.
         if (minor_end >= 1 and minor_end <= 2) {
             const major = std.fmt.parseUnsigned(u32, rest[0..major_end], 10) catch return null;
             const minor = std.fmt.parseUnsigned(u32, after_dash[0..minor_end], 10) catch return null;

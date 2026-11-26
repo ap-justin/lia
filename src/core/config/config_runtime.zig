@@ -1950,9 +1950,9 @@ fn parseProfileOnlyFields(
     }
 
     // `sound` was `notifications`. The older name is read first, so the
-    // current one wins any value both set. The current name was an unknown
-    // key before, which startup ignores, so a value under it that isn't an
-    // object is still ignored.
+    // current one wins any value both set. Before the rename, the current name
+    // was an unknown key, which startup ignores, so a value under it that
+    // isn't an object is still ignored.
     for ([_]?std.json.Value{ root.object.get("notifications"), root.object.get("sound") }, 0..) |group, index| {
         if (group) |sound_value| {
             if (sound_value != .object) {
