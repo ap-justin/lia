@@ -220,7 +220,8 @@ pub const OlderName = struct {
 /// whether it sets the current name too. A pair where lia ignores the current
 /// group and keeps reading the older one is left out. A profile `settings.json`
 /// is also checked inside each `workspaces` override. Caller owns the
-/// returned slice; its strings borrow from `root` and the list.
+/// returned slice; `workspace` borrows from `root`, and `older` and `current`
+/// are static.
 pub fn findOlderNames(alloc: Allocator, root: std.json.Value, file: File) ![]OlderName {
     var found: std.ArrayList(OlderName) = .empty;
     errdefer found.deinit(alloc);
