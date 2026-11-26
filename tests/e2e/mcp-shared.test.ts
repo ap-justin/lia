@@ -49,7 +49,7 @@ function createRoot(
   label: string,
   options: { shared?: boolean; callDelayMs?: number; mode?: string; profileServer?: boolean } = {},
 ): Root {
-  const root = mkdtempSync(join("/tmp", `fxs-${label}-`));
+  const root = mkdtempSync(join("/tmp", `lia-${label}-`));
   cleanupRoot = root;
   const home = join(root, "home");
   const workspace = join(root, "workspace");

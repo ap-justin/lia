@@ -2926,7 +2926,7 @@ describe("lia mcp call", () => {
   // A socket that answers like a lia bridge, so the client's own refusals
   // can be driven without a session.
   const withFakeBridge = async (reply: string | null, run: (env: Record<string, string>) => Promise<void>) => {
-    const dir = mkdtempSync(join(tmpdir(), "fxmc-"));
+    const dir = mkdtempSync(join(tmpdir(), "lia-mc-"));
     const socketPath = join(dir, "s");
     const server = Bun.listen({
       unix: socketPath,
