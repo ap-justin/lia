@@ -48,7 +48,9 @@ VERIFICATION_E2E_TESTS = (
     "configured-providers.test.ts",
     "oauth-keychain-migration.test.ts",
     "mcp-verbs.test.ts",
+    "mcp-subagent-bridge.test.ts",
     "compaction-policy.test.ts",
+    "provider-compaction.test.ts",
     "poisoned-repository.test.ts",
     "ultrafast-fake-gateway.test.ts",
     "web-fetch-permission-progress.test.ts",
@@ -56,6 +58,7 @@ VERIFICATION_E2E_TESTS = (
     "yolo-permission-mode.test.ts",
     "ask-presentation.test.ts",
     "doctor.test.ts",
+    "mcp-shared.test.ts",
 )
 
 EXCLUDED_E2E_TESTS = (
@@ -375,7 +378,7 @@ class PgsoCorpusTests(unittest.TestCase):
             tuple(test_file for test_file, _ in corpus.intentional_exclusions),
         )
         self.assertEqual(24, len(corpus.scenarios))
-        self.assertEqual(38, len(corpus.candidate_scenarios))
+        self.assertEqual(41, len(corpus.candidate_scenarios))
         self.assertEqual(
             {
                 "direct-help": 100,

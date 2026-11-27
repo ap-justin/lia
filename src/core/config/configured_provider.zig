@@ -61,8 +61,10 @@ pub const Protocol = enum {
         };
     }
 
-    /// The top-level request fields lia writes itself. A model's `request`
-    /// fields and its effort levels cannot name one
+    /// The top-level request fields lia writes itself, plus `instructions`:
+    /// lia sends the system text as the first `input` item instead, so a
+    /// fragment cannot add a second copy. A model's `request` fields and its
+    /// effort levels cannot name one
     /// (`tests/tla/configured_provider/ConfiguredRequest.tla`
     /// OwnedKeysKeepLiaValue). The reasoning controls are left out on purpose:
     /// an effort level is how a connection sets them.
@@ -1226,6 +1228,11 @@ test "configured provider refuses lia's own fields and headers, and malformed op
             registry.deinit(std.testing.allocator);
         }
     }
+}
+
+test "configured provider refuses a Responses fragment that names instructions" {
+    const json = "{\"c\":{\"protocol\":\"openai-responses\",\"base_url\":\"https://example.com\",\"auth\":{\"type\":\"none\"},\"model_metadata\":{\"m\":{\"request\":{\"instructions\":\"second copy\"}}}}}";
+    try std.testing.expectError(error.ReservedRequestField, Registry.parse_json(std.testing.allocator, json));
 }
 
 test "configured provider takes sixteen effort levels and sixteen headers, and one more of neither" {

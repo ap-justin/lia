@@ -312,6 +312,16 @@ const SessionRecoveryOptions = struct {
     }
 };
 
+const SessionForkOptions = struct {
+    format: output_contracts.OutputFormat = .text,
+    target: SessionDetailTarget,
+
+    fn deinit(self: *SessionForkOptions, alloc: Allocator) void {
+        self.target.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
 const AcpOptions = struct {
     agent: agent_run_flags.Overrides = .{},
     log_file: ?[]const u8 = null,
@@ -1080,19 +1090,31 @@ fn runNonInteractiveWithDeps(
                 try provider_activation.writeProviderLoginFailure(alloc, activationOutput(deps), login_provider, .provider_login, err);
                 return .handled_failure;
             };
-            if (!try provider_activation.activateProviderSelection(
+            var token_pass_notice: provider_activation.TokenPassLoginNotice = .{};
+            defer token_pass_notice.deinit(alloc);
+            if (!try provider_activation.activateProviderSelectionWithNotice(
                 alloc,
                 activationEnv(cfg),
                 activationOutput(deps),
                 login_provider,
                 .provider_login,
                 if (login_provider == .gateway) .fx_login else null,
+                if (login_provider == .gateway) &token_pass_notice else null,
             )) return .handled_failure;
             retryKeptSignOuts(alloc, cfg, deps, login_provider);
-            try writeStdout(deps, switch (login_provider) {
-                .gateway => "Signed in to Vercel.\nAI Gateway access may still require billing or API setup for the selected account.\n",
-                .configured => "Configured providers use settings.json authentication.\n",
-            });
+            switch (login_provider) {
+                .gateway => {
+                    try writeStdout(deps, "Signed in to Vercel.\n");
+                    if (!token_pass_notice.active) {
+                        try writeStdout(deps, "AI Gateway access may still require billing or API setup for the selected account.\n");
+                    }
+                    if (token_pass_notice.line) |line| {
+                        try writeStdout(deps, line);
+                        try writeStdout(deps, "\n");
+                    }
+                },
+                .configured => try writeStdout(deps, "Configured providers use settings.json authentication.\n"),
+            }
             return .handled_success;
         },
         .logout => |rest| {
@@ -1185,14 +1207,21 @@ fn runNonInteractiveWithDeps(
                 try writeStderr(deps, message);
                 return .handled_failure;
             };
-            if (!try provider_activation.activateProviderSelection(
+            var token_pass_notice: provider_activation.TokenPassLoginNotice = .{};
+            defer token_pass_notice.deinit(alloc);
+            if (!try provider_activation.activateProviderSelectionWithNotice(
                 alloc,
                 activationEnv(cfg),
                 activationOutput(deps),
                 .gateway,
                 .provider_login,
                 .fx_login,
+                &token_pass_notice,
             )) return .handled_failure;
+            if (token_pass_notice.line) |line| {
+                try writeStdout(deps, line);
+                try writeStdout(deps, "\n");
+            }
             return .handled_success;
         },
         .provider => |rest| {
@@ -1300,7 +1329,7 @@ fn runNonInteractiveWithDeps(
             return runTopLevelMcp(alloc, rest, cfg, deps);
         },
         .models => |rest| {
-            const opts = parseLocalSurfaceArgs(rest) catch |err| {
+            const opts = parseLocalSurfaceArgs(modelsListArgs(rest)) catch |err| {
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .models, "models", err, rest);
                 return usage_failure;
             };
@@ -1399,6 +1428,14 @@ fn runNonInteractiveWithDeps(
             return runDoctor(alloc, cfg, deps, opts);
         },
         .session => |rest| {
+            if (rest.len > 0 and std.mem.eql(u8, rest[0], "fork")) {
+                var fork = parseSessionForkArgs(alloc, rest[1..]) catch |err| {
+                    try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .session, "session", err, rest[1..]);
+                    return usage_failure;
+                };
+                defer fork.deinit(alloc);
+                return runSessionFork(alloc, deps, fork);
+            }
             if (rest.len > 0 and std.mem.eql(u8, rest[0], "recover")) {
                 var recovery = parseSessionRecoveryArgs(
                     alloc,
@@ -1439,7 +1476,7 @@ fn runNonInteractiveWithDeps(
                 };
                 return runSessionConvert(alloc, deps, format);
             }
-            const opts = parseSessionListArgs(rest) catch |err| {
+            const opts = parseSessionListArgs(sessionListArgs(rest)) catch |err| {
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .sessions, "sessions", err, rest);
                 return usage_failure;
             };
@@ -2116,6 +2153,7 @@ fn runMcpVerbs(alloc: Allocator, rest: []const [:0]const u8, cfg: Config, deps: 
     var out: DepsWriter = .init(deps, .stdout, &out_buffer);
     var err: DepsWriter = .init(deps, .stderr, &err_buffer);
     var hosts: CliMcpHosts = .{ .alloc = alloc, .cfg = cfg, .workspace_root = workspace_root };
+    const wait_line: LogoutWaitLine = .{ .deps = deps, .text = LogoutWaitLine.mcp_kept };
     const code = mcp_verbs.run(.{
         .gpa = alloc,
         .out = &out.interface,
@@ -2124,6 +2162,7 @@ fn runMcpVerbs(alloc: Allocator, rest: []const [:0]const u8, cfg: Config, deps: 
         .home = home,
         .workspace_root = workspace_root,
         .hosts = .{ .context = &hosts, .get = CliMcpHosts.get, .release = CliMcpHosts.release, .changed = CliMcpHosts.changed },
+        .kept_sign_outs = .{ .transport = cfg.gateway_provider.oauth_transport, .notice = wait_line.notice() },
     }, args);
     return switch (code) {
         0 => .handled_success,
@@ -2660,6 +2699,18 @@ fn writeSessionRecovery(
 }
 
 /// `lia sessions` on v2: the page v1 shows, from the v2 catalog.
+fn writeSessionFork(
+    alloc: Allocator,
+    deps: RunDeps,
+    result: session_store.SessionForkResult,
+    format: output_contracts.OutputFormat,
+) !RunResult {
+    const text = try (output_contracts.SessionForkSnapshot{ .result = result }).render(alloc, format);
+    defer alloc.free(text);
+    try writeFormattedOutput(deps, text, format);
+    return .handled_success;
+}
+
 fn runSessionList(alloc: Allocator, deps: RunDeps, opts: SessionListOptions) !RunResult {
     var store = session_adapter.Store.openFromEnv(alloc) catch |err| {
         try writeLookupFailure(alloc, deps, "sessions", session_adapter.commandError(err), opts.format);
@@ -2944,7 +2995,17 @@ fn runSessionRecovery(alloc: Allocator, deps: RunDeps, recovery: SessionRecovery
     };
     defer store.deinit(alloc);
     var recovered = session_adapter.recover(&store, alloc, recovery.session_id) catch |err| {
-        try writeLookupFailure(alloc, deps, "session", session_adapter.commandError(err), recovery.format);
+        const failure = session_adapter.commandError(err);
+        // A v1 folder others can write: the reason names it and its fix (D61).
+        if (failure == error.DurablePathUnsafe and store.problem.len > 0) {
+            const message = try alloc.print("session {s} can't be recovered safely: {s}", .{ recovery.session_id, store.problem.text() });
+            defer alloc.free(message);
+            if (recovery.format == .json) {
+                try writeJsonCommandFailure(alloc, deps, "session", failure, message);
+            } else try writeStderrLine(alloc, deps, "lia session: {s}\n", message);
+            return .handled_failure;
+        }
+        try writeLookupFailure(alloc, deps, "session", failure, recovery.format);
         return .handled_failure;
     };
     defer recovered.deinit(alloc);
@@ -2962,6 +3023,61 @@ fn runSessionRecovery(alloc: Allocator, deps: RunDeps, recovery: SessionRecovery
     };
     defer result.deinit(alloc);
     return writeSessionRecovery(alloc, deps, result, recovery.format);
+}
+
+/// `lia session fork <last|id>`: copies a saved or live root session up
+/// to its last finished turn. The result it prints borrows the source id and
+/// the fork's id and workspace root, which this function frees after printing.
+fn runSessionFork(alloc: Allocator, deps: RunDeps, fork: SessionForkOptions) !RunResult {
+    var store = session_adapter.Store.openFromEnv(alloc) catch |err| {
+        try writeLookupFailure(alloc, deps, "session", session_adapter.commandError(err), fork.format);
+        return .handled_failure;
+    };
+    defer store.deinit(alloc);
+    const source_id = (try resolveForkSource(alloc, deps, &store, fork.target, fork.format)) orelse return .handled_failure;
+    defer alloc.free(source_id);
+    var forked = session_adapter.forkSession(&store, alloc, source_id) catch |err| {
+        try writeSessionDetailFailure(alloc, deps, source_id, session_adapter.commandError(err), store.problem.text(), fork.format);
+        return .handled_failure;
+    };
+    defer forked.deinit(alloc);
+    return writeSessionFork(alloc, deps, .{
+        .source_session_id = source_id,
+        .fork_session_id = forked.id,
+        .workspace_root = forked.workspace_root,
+        .history_len = forked.history_len,
+        .copied_agents = forked.copied_agents,
+        .files_complete = forked.files_complete,
+    }, fork.format);
+}
+
+/// The saved session `fork` copies: the id given, or the newest one in this
+/// workspace for `last`. Null after a lookup failure has been written. Caller
+/// owns the id.
+fn resolveForkSource(
+    alloc: Allocator,
+    deps: RunDeps,
+    store: *session_adapter.Store,
+    target: SessionDetailTarget,
+    format: output_contracts.OutputFormat,
+) !?[]u8 {
+    switch (target) {
+        .id => |id| return try alloc.dupe(u8, id),
+        .last => {
+            const workspace_root = try io_mod.realpathAlloc(alloc, ".");
+            defer alloc.free(workspace_root);
+            var page = session_adapter.listPage(store, alloc, workspace_root, null, 1) catch |err| {
+                try writeLookupFailure(alloc, deps, "session", session_adapter.commandError(err), format);
+                return null;
+            };
+            defer page.deinit(alloc);
+            if (page.summaries.items.len == 0) {
+                try writeLookupFailure(alloc, deps, "session", session_adapter.noLatestError(store, alloc), format);
+                return null;
+            }
+            return try alloc.dupe(u8, page.summaries.items[0].id);
+        },
+    }
 }
 
 fn writeLookupFailure(
@@ -3058,6 +3174,11 @@ fn writeSessionDetailFailure(
             "session {s} uses an unsupported session version",
             .{session_id},
         ),
+        // A v1 folder others can write: the reason names it and its fix (D61).
+        error.DurablePathUnsafe => if (reason.len > 0) try alloc.print(
+            "session {s} can't be read safely: {s}",
+            .{ session_id, reason },
+        ) else return writeLookupFailure(alloc, deps, "session", err, format),
         else => return writeLookupFailure(
             alloc,
             deps,
@@ -3089,6 +3210,7 @@ fn commandFailureMessage(err: anyerror) ?[]const u8 {
         error.InvalidSessionDetailArgs,
         error.InvalidSessionMigrationArgs,
         error.InvalidSessionRecoveryArgs,
+        error.InvalidSessionForkArgs,
         error.InvalidConfigArgs,
         => "invalid arguments",
         error.UnknownConfigSetting => "unknown setting",
@@ -3566,6 +3688,13 @@ fn writeStderrLine(alloc: Allocator, deps: RunDeps, comptime format: []const u8,
     try writeStderr(deps, line);
 }
 
+/// The `models` arguments that name the list action. `lia models` lists by
+/// default, and `lia models ls` names the same action.
+fn modelsListArgs(rest: []const [:0]const u8) []const [:0]const u8 {
+    if (rest.len > 0 and std.mem.eql(u8, rest[0], "ls")) return rest[1..];
+    return rest;
+}
+
 fn parseLocalSurfaceArgs(args: []const [:0]const u8) !LocalSurfaceOptions {
     var options = LocalSurfaceOptions{};
     var parser: cli_flags.Parser = .init(&builtin_commands.json_only_options, args);
@@ -3579,8 +3708,9 @@ fn parseLocalSurfaceArgs(args: []const [:0]const u8) !LocalSurfaceOptions {
 const DoctorOptions = struct {
     format: output_contracts.OutputFormat = .text,
     fix: bool = false,
+    deep: bool = false,
 };
-const DoctorFlag = enum { json, fix };
+const DoctorFlag = enum { json, fix, deep };
 const doctor_flag_ids = cli_flags.idTable(DoctorFlag, &builtin_commands.doctor_options);
 
 fn parseDoctorArgs(args: []const [:0]const u8) !DoctorOptions {
@@ -3591,6 +3721,7 @@ fn parseDoctorArgs(args: []const [:0]const u8) !DoctorOptions {
         .option => |match| switch (doctor_flag_ids[match.index].?) {
             .json => options.format = .json,
             .fix => options.fix = true,
+            .deep => options.deep = true,
         },
     };
     return options;
@@ -3673,8 +3804,8 @@ const DoctorProbes = struct {
 
     /// One line on a terminal's stderr while doctor waits on its network
     /// checks, so a slow one does not look like a hang.
-    fn writeWaitNotice(self: *const DoctorProbes, alloc: Allocator, deps: RunDeps, provider: model_provider.ProviderId, deadline_ms: i64) !void {
-        if (builtin.is_test or !stderrIsTerminal()) return;
+    fn writeWaitNotice(self: *const DoctorProbes, alloc: Allocator, progress: *DoctorProgress, provider: model_provider.ProviderId, deadline_ms: i64) !void {
+        if (!progress.enabled) return;
         var servers: usize = 0;
         for (self.processes.items[0..self.server_children]) |probe| {
             if (!probe.not_started and probe.spawn_error == null) servers += 1;
@@ -3684,7 +3815,7 @@ const DoctorProbes = struct {
             .mcp_servers = servers,
         }, deadline_ms) orelse return;
         defer alloc.free(notice);
-        try writeStderr(deps, notice);
+        progress.line(notice);
     }
 
     /// The probe check lines, and what doctor found for each MCP server.
@@ -3717,6 +3848,7 @@ const LogoutWaitLine = struct {
     /// Before a retry of sign-outs that earlier logouts kept
     /// (`pending_revocation.retry`), which sends one sign-out after another.
     const lia_login_kept = std.fmt.comptimePrint("revoking earlier lia sign-outs at Vercel (up to {d} s each)...\n", .{3 * request_s});
+    const mcp_kept = std.fmt.comptimePrint("revoking earlier MCP sign-outs at their servers (up to {d} s each)...\n", .{request_s});
 
     fn notice(self: *const LogoutWaitLine) ?oauth.BeforeRevocation {
         if (builtin.is_test or !stderrIsTerminal()) return null;
@@ -3783,6 +3915,15 @@ fn mergeDoctorChecks(
 fn runDoctor(alloc: Allocator, cfg: Config, deps: RunDeps, opts: DoctorOptions) !RunResult {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
     defer alloc.free(workspace_root);
+    var progress: DoctorProgress = .{
+        .deps = deps,
+        .enabled = opts.format == .text and !builtin.is_test and stderrIsTerminal(),
+        .erase = !terminal_env.dumbTerminal(),
+    };
+    if (progress.enabled) progress.columns = terminal_env.stderrColumns();
+    // Never leaves a progress line above the report, or above an error.
+    defer progress.clear();
+    if (progress.erase) progress.line("checking lia setup...\n");
     var mcp_inspection = try cfg.inspect_mcp_local_config(alloc, workspace_root);
     defer mcp_inspection.deinit(alloc);
     var snapshot = try doctor_runtime.collect(
@@ -3793,23 +3934,43 @@ fn runDoctor(alloc: Allocator, cfg: Config, deps: RunDeps, opts: DoctorOptions) 
         mcp_inspection.profile_diagnostic,
         mcp_inspection.snapshot.configuration_issues,
         .{
-            .orphans = if (opts.fix) .remove else .count,
             .version = cfg.version,
             .channel = cfg.build_channel,
             .skill_root_policy = cfg.skill_root_policy,
         },
     );
     defer snapshot.deinit(alloc);
+    progress.clear();
 
     const deadline_ms = doctor_probes.deadlineMs();
     var probes: DoctorProbes = .{ .deadline = io_mod.milliTimestamp() + deadline_ms, .limit_ms = deadline_ms };
     const started = probes.start(cfg, deps, &snapshot, workspace_root);
-    if (opts.format == .text) probes.writeWaitNotice(alloc, deps, snapshot.provider, deadline_ms) catch |err| {
+    probes.writeWaitNotice(alloc, &progress, snapshot.provider, deadline_ms) catch |err| {
         debug_trace.logf("doctor", "wait notice not written err={s}", .{@errorName(err)});
     };
+
+    var state_checks: std.ArrayList(doctor_runtime.Check) = .empty;
+    defer {
+        for (state_checks.items) |*entry| entry.deinit(alloc);
+        state_checks.deinit(alloc);
+    }
+    var stop: DoctorSessionStop = .{ .deadline = if (opts.deep) null else probes.deadline, .probes = if (opts.deep) null else &probes };
+    const state_options: doctor_runtime.StateOptions = .{
+        .orphans = if (opts.fix) .remove else .count,
+        .blobs = if (opts.deep) .hash else .exists,
+        .stop = .{ .context = &stop, .requested = DoctorSessionStop.requested },
+        .progress = .{ .context = &progress, .report = DoctorProgress.sessions },
+        .limit_ms = if (opts.deep) null else deadline_ms,
+    };
+    // Plain doctor checks the sessions while the network checks run, within
+    // their deadline. `--deep` has no limit, so it checks them after.
+    const state_result: anyerror!void = if (opts.deep) {} else doctor_runtime.appendStateChecks(&state_checks, alloc, state_options);
     // Runs on every path, so nothing doctor started outlives it.
     if (probes.wait()) |sig| doctor_probes.endBySignal(sig);
     try started;
+    try state_result;
+    if (opts.deep) try doctor_runtime.appendStateChecks(&state_checks, alloc, state_options);
+    progress.clear();
 
     var probe_checks: std.ArrayList(doctor_runtime.Check) = .empty;
     defer {
@@ -3820,11 +3981,15 @@ fn runDoctor(alloc: Allocator, cfg: Config, deps: RunDeps, opts: DoctorOptions) 
     defer server_results.deinit(alloc);
     try probes.checks(alloc, snapshot.provider, deadline_ms, &probe_checks, &server_results);
 
+    var local: std.ArrayList(doctor_runtime.Check) = .empty;
+    defer local.deinit(alloc);
+    try local.appendSlice(alloc, snapshot.checks);
+    try local.appendSlice(alloc, state_checks.items);
     var checks: std.ArrayList(doctor_runtime.Check) = .empty;
     defer checks.deinit(alloc);
     var unconfirmed: ?[]u8 = null;
     defer if (unconfirmed) |detail| alloc.free(detail);
-    try mergeDoctorChecks(alloc, snapshot.checks, probe_checks.items, probes.catalog != null, &checks, &unconfirmed);
+    try mergeDoctorChecks(alloc, local.items, probe_checks.items, probes.catalog != null, &checks, &unconfirmed);
 
     var failed = false;
     for (checks.items) |entry| failed = failed or entry.status == .fail;
@@ -3841,15 +4006,114 @@ fn runDoctor(alloc: Allocator, cfg: Config, deps: RunDeps, opts: DoctorOptions) 
     return if (failed) .handled_failure else .handled_success;
 }
 
+/// Stops doctor's session check at its deadline, or when an ending signal
+/// reached doctor while its handler was in place. Each time it is asked, it
+/// also starts the queued MCP server checks a free slot allows, as `wait`
+/// does, so the session check costs them none of the limit.
+const DoctorSessionStop = struct {
+    deadline: ?i64,
+    /// Null once `wait` has stopped the probes, as for `--deep`.
+    probes: ?*DoctorProbes,
+
+    fn requested(context: *anyopaque) bool {
+        const self: *DoctorSessionStop = @ptrCast(@alignCast(context));
+        if (self.probes) |probes| probes.servers.startMore(&probes.waiters, probes.deadline);
+        if (doctor_probes.stopRequested()) return true;
+        const deadline = self.deadline orelse return false;
+        return io_mod.milliTimestamp() >= deadline;
+    }
+};
+
+/// What doctor is doing, on a terminal's stderr while it works: whole lines,
+/// then one line it rewrites in place. `clear` erases them all, so the
+/// report starts on a clean screen. Each line is cut to fit one row, since
+/// `clear` erases one row per line. Pipes and unit tests get none of it, and
+/// a `TERM=dumb` terminal, which cannot move the cursor, gets only the whole
+/// lines, which stay.
+const DoctorProgress = struct {
+    deps: RunDeps,
+    enabled: bool,
+    erase: bool,
+    /// The terminal's width, when known. The lines are ASCII, so a byte is
+    /// a column.
+    columns: ?usize = null,
+    /// Whole lines written since the last `clear`.
+    lines: usize = 0,
+    /// Whether the cursor is at the end of a line `rewrite` wrote.
+    open_line: bool = false,
+
+    /// `text` ends with a newline.
+    fn line(self: *DoctorProgress, text: []const u8) void {
+        if (!self.enabled) return;
+        self.closeOpenLine();
+        self.write(self.fit(text[0 .. text.len - 1]));
+        self.write("\n");
+        self.lines += 1;
+    }
+
+    fn rewrite(self: *DoctorProgress, text: []const u8) void {
+        if (!self.enabled or !self.erase) return;
+        self.write(if (self.open_line) "\r\x1b[2K" else "");
+        self.write(self.fit(text));
+        self.open_line = true;
+    }
+
+    /// `text` cut short of the last column, so it never wraps.
+    fn fit(self: *const DoctorProgress, text: []const u8) []const u8 {
+        const columns = self.columns orelse return text;
+        return text[0..@min(text.len, columns -| 1)];
+    }
+
+    fn sessions(context: *anyopaque, done: usize, total: usize) void {
+        const self: *DoctorProgress = @ptrCast(@alignCast(context));
+        if (!self.enabled or total == 0) return;
+        var buf: [96]u8 = undefined;
+        const text = std.mem.print(&buf, "checking saved sessions ({d} of {d})...", .{ @min(done + 1, total), total }) catch return;
+        self.rewrite(text);
+    }
+
+    fn clear(self: *DoctorProgress) void {
+        if (!self.enabled or !self.erase) return;
+        if (self.open_line) self.write("\r\x1b[2K");
+        self.open_line = false;
+        while (self.lines > 0) : (self.lines -= 1) self.write("\x1b[1A\x1b[2K");
+    }
+
+    fn closeOpenLine(self: *DoctorProgress) void {
+        if (!self.open_line) return;
+        self.write("\n");
+        self.open_line = false;
+        self.lines += 1;
+    }
+
+    fn write(self: *const DoctorProgress, text: []const u8) void {
+        if (text.len == 0) return;
+        writeStderr(self.deps, text) catch |err| {
+            debug_trace.logf("doctor", "progress line not written err={s}", .{@errorName(err)});
+        };
+    }
+};
+
 fn writeDoctorReport(alloc: Allocator, deps: RunDeps, snapshot: output_contracts.DoctorSnapshot, format: output_contracts.OutputFormat) !void {
     if (format == .json) return writeDoctorJsonLine(alloc, deps, snapshot);
-    const text = try snapshot.render(alloc, format);
+    const terminal = !builtin.is_test and terminal_env.stdoutIsTerminal();
+    const text = try snapshot.renderTextStyled(alloc, .{
+        .color = terminal and !terminal_env.colorDisabled(),
+        .columns = if (terminal) terminal_env.stdoutColumns() else null,
+    });
     defer alloc.free(text);
     try writeFormattedOutput(deps, text, format);
 }
 
 const SessionListFlag = enum { live, all, limit, cursor, json };
 const session_list_flag_ids = cli_flags.idTable(SessionListFlag, &builtin_commands.sessions_options);
+
+/// The `sessions` arguments that name the list action. `lia sessions` lists by
+/// default, and `lia sessions ls` names the same action.
+fn sessionListArgs(rest: []const [:0]const u8) []const [:0]const u8 {
+    if (rest.len > 0 and std.mem.eql(u8, rest[0], "ls")) return rest[1..];
+    return rest;
+}
 
 fn parseSessionListArgs(args: []const [:0]const u8) !SessionListOptions {
     var options = SessionListOptions{};
@@ -3874,6 +4138,18 @@ fn parseSessionListArgs(args: []const [:0]const u8) !SessionListOptions {
         },
     };
     return options;
+}
+
+test "lia sessions ls names the default list action" {
+    try std.testing.expectEqual(@as(usize, 0), sessionListArgs(&.{"ls"}).len);
+    try std.testing.expectEqualStrings("--json", sessionListArgs(&.{ "ls", "--json" })[0]);
+    try std.testing.expectEqualStrings("--json", sessionListArgs(&.{"--json"})[0]);
+}
+
+test "lia models ls names the default list action" {
+    try std.testing.expectEqual(@as(usize, 0), modelsListArgs(&.{"ls"}).len);
+    try std.testing.expectEqualStrings("--json", modelsListArgs(&.{ "ls", "--json" })[0]);
+    try std.testing.expectEqualStrings("--json", modelsListArgs(&.{"--json"})[0]);
 }
 
 test "lia sessions --live reads through the shared parser and names the paging flag it refuses" {
@@ -4057,6 +4333,23 @@ fn parseSessionRecoveryArgs(
     return .{
         .format = parsed.format,
         .session_id = try alloc.dupe(u8, target),
+    };
+}
+
+fn parseSessionForkArgs(
+    alloc: Allocator,
+    args: []const [:0]const u8,
+) !SessionForkOptions {
+    const parsed = parseSessionTargetArgs(args) catch return error.InvalidSessionForkArgs;
+    // A fork copies up to a turn boundary; it shows no turns to tail.
+    if (parsed.tail != null) return error.InvalidSessionForkArgs;
+    const target = parsed.target orelse return error.InvalidSessionForkArgs;
+    return .{
+        .format = parsed.format,
+        .target = if (!parsed.exact_id and std.mem.eql(u8, target, "last"))
+            .last
+        else
+            .{ .id = try alloc.dupe(u8, target) },
     };
 }
 
@@ -4699,6 +4992,38 @@ test "parse session detail args treats last after id flag as exact id" {
         .last => return error.TestExpectedExactResumeId,
         .id => |id| try std.testing.expectEqualStrings("last", id),
     }
+}
+
+test "parse session fork args takes an id, last, or the exact id flag and rejects bad input" {
+    const alloc = std.testing.allocator;
+
+    var by_id = try parseSessionForkArgs(alloc, &.{ "release.2026.06", "--json" });
+    defer by_id.deinit(alloc);
+    try std.testing.expectEqual(output_contracts.OutputFormat.json, by_id.format);
+    switch (by_id.target) {
+        .last => return error.TestExpectedExactId,
+        .id => |id| try std.testing.expectEqualStrings("release.2026.06", id),
+    }
+
+    var newest = try parseSessionForkArgs(alloc, &.{ "last", "--json" });
+    defer newest.deinit(alloc);
+    switch (newest.target) {
+        .last => {},
+        .id => return error.TestExpectedLast,
+    }
+
+    var exact = try parseSessionForkArgs(alloc, &.{ "--id", "last" });
+    defer exact.deinit(alloc);
+    switch (exact.target) {
+        .last => return error.TestExpectedExactId,
+        .id => |id| try std.testing.expectEqualStrings("last", id),
+    }
+
+    try std.testing.expectError(error.InvalidSessionForkArgs, parseSessionForkArgs(alloc, &.{"--json"}));
+    try std.testing.expectError(error.InvalidSessionForkArgs, parseSessionForkArgs(alloc, &.{ "id", "--tail", "5" }));
+    try std.testing.expectError(error.InvalidSessionForkArgs, parseSessionForkArgs(alloc, &.{ "id", "--jsno" }));
+    try std.testing.expectError(error.InvalidSessionForkArgs, parseSessionForkArgs(alloc, &.{ "a", "--id", "b" }));
+    try std.testing.expectError(error.InvalidSessionForkArgs, parseSessionForkArgs(alloc, &.{ "a", "b" }));
 }
 
 test "parse session recovery args accepts exact ids and rejects ambiguity" {
@@ -5410,6 +5735,30 @@ test "runIfRequested models passes startup team to fetch seam" {
     deps.load_startup_state = stubLoadStartupState;
 
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{ @constCast("models"), @constCast("--json") }, cfg, deps);
+    try std.testing.expectEqual(RunResult.handled_success, result);
+    try std.testing.expect(probe.called);
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"models\",\"count\":1,\"shown_count\":1,\"more_count\":0,\"private_models_hidden\":false,\"ids\":[\"private/blue-hornbill\"]}\n",
+        capture.stdout.written(),
+    );
+}
+
+test "runIfRequested models ls lists the same catalog as models" {
+    var capture = CaptureOutput.init(std.testing.allocator);
+    defer capture.deinit();
+    var probe = ModelFetchProbe{};
+    var cfg = testConfig();
+    cfg.provider_set.gateway.cli_model_catalog = probe.provider();
+
+    var deps = capture.deps();
+    deps.load_startup_state = stubLoadStartupState;
+
+    const result = try runIfRequestedWithDeps(
+        std.testing.allocator,
+        &.{ @constCast("models"), @constCast("ls"), @constCast("--json") },
+        cfg,
+        deps,
+    );
     try std.testing.expectEqual(RunResult.handled_success, result);
     try std.testing.expect(probe.called);
     try std.testing.expectEqualStrings(

@@ -26,9 +26,9 @@ pub fn noteReapBeforeJoin() void {
 
 fn controls() ?Controls {
     return controlsFromPaths(
-        io_mod.getenv("LIA_TEST_ACP_PROMPT_TERMINAL_READY"),
-        io_mod.getenv("LIA_TEST_ACP_PROMPT_REAP_READY"),
-        io_mod.getenv("LIA_TEST_ACP_PROMPT_RELEASE"),
+        io_mod.getenvAbsolutePath("LIA_TEST_ACP_PROMPT_TERMINAL_READY"),
+        io_mod.getenvAbsolutePath("LIA_TEST_ACP_PROMPT_REAP_READY"),
+        io_mod.getenvAbsolutePath("LIA_TEST_ACP_PROMPT_RELEASE"),
     );
 }
 

@@ -2,7 +2,7 @@
 // that works, fails, or hangs on purpose.
 import { afterEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, readFileSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { createConfiguredProviderFixture } from "./fixtures/chat-completions";
 import { join } from "node:path";
 import { cleanupIsolatedTestHome, createIsolatedTestHome, LIA_BIN } from "../evals/eval-helpers";
@@ -68,10 +68,20 @@ function env(r: Root, extra: Record<string, string | undefined> = {}): Record<st
   return Object.fromEntries(Object.entries(merged).filter(([, v]) => v !== undefined)) as Record<string, string>;
 }
 
+/** doctor's text report: a check line is two spaces, its mark, its name in
+ * a column, and its detail; its fix, when it has one, is the next line. */
+const MARK = { ok: "\u2713", warn: "!", fail: "\u2717" } as const;
+const FIX = `${" ".repeat(15)}fix: `;
+
+/** A RegExp source for the start of a check line, up to its detail. */
+function rowStart(status: keyof typeof MARK, name: string): string {
+  return `^  ${MARK[status]} ${name} +`;
+}
+
 /** The warn and fail lines in text output that no `fix:` line follows. */
 function problemsWithoutFix(stdout: string): string[] {
   const lines = stdout.split("\n");
-  return lines.filter((line, i) => /^\[(warn|fail)\] /.test(line) && !(lines[i + 1] ?? "").startsWith("  fix: "));
+  return lines.filter((line, i) => /^  (!|✗) /.test(line) && !(lines[i + 1] ?? "").startsWith(FIX));
 }
 
 async function doctor(r: Root, environment: Record<string, string>, args: string[] = [], cwd = r.workspace) {
@@ -125,7 +135,7 @@ describe("lia doctor provider", () => {
     const r = makeRoot();
     const g = gateway((req) => req.headers.get("authorization") ? new Response("unauthorized", { status: 401 }) : models([MODEL]));
     const result = await doctor(r, env(r, { ...g, AI_GATEWAY_API_KEY: "doctor-refused-key" }));
-    expect(result.stdout).toMatch(/^\[fail\] auth: /m);
+    expect(result.stdout).toMatch(/^  ✗ auth +/m);
     expect(result.stdout).toContain("lia login");
     expect(result.stdout).not.toContain("doctor-refused-key");
     expect(result.code).toBe(1);
@@ -133,25 +143,25 @@ describe("lia doctor provider", () => {
 
   test("a gateway error, a rate limit, and an unreadable answer each say what happened", async () => {
     const cases: Array<[() => Response, number, RegExp, string]> = [
-      [() => new Response("boom", { status: 500 }), 1, /^\[fail\] provider: AI Gateway answered the check with an error$/m, "run lia doctor again later"],
-      [() => new Response("slow down", { status: 429 }), 0, /^\[warn\] provider: AI Gateway rate-limited the check/m, "run lia doctor again in a minute"],
-      [() => new Response("not json", { status: 200, headers: { "content-type": "application/json" } }), 1, /^\[fail\] provider: AI Gateway sent a model list lia cannot read$/m, "run lia doctor again later"],
+      [() => new Response("boom", { status: 500 }), 1, /^  ✗ provider +AI Gateway answered the check with an error$/m, "run lia doctor again later"],
+      [() => new Response("slow down", { status: 429 }), 0, /^  ! provider +AI Gateway rate-limited the check/m, "run lia doctor again in a minute"],
+      [() => new Response("not json", { status: 200, headers: { "content-type": "application/json" } }), 1, /^  ✗ provider +AI Gateway sent a model list lia cannot read$/m, "run lia doctor again later"],
     ];
     for (const [answer, code, line, fix] of cases) {
       const r = makeRoot();
       const result = await doctor(r, env(r, { ...gateway(answer), AI_GATEWAY_API_KEY: "doctor-key" }));
       expect(result.code).toBe(code);
       expect(result.stdout).toMatch(line);
-      expect(result.stdout).toContain(`  fix: ${fix}`);
-      expect(result.stdout).toMatch(/^\[warn\] auth: .*the provider did not confirm it$/m);
+      expect(result.stdout).toContain(`${FIX}${fix}`);
+      expect(result.stdout).toMatch(/^  ! auth +.*the provider did not confirm it$/m);
     }
   }, 60_000);
 
   test("a model the provider does not list fails", async () => {
     const r = makeRoot();
     const result = await doctor(r, env(r, { ...acceptingGateway(), AI_GATEWAY_API_KEY: "doctor-key", LIA_MODEL: "nope/missing" }));
-    expect(result.stdout).toMatch(/^\[ok\] auth: /m);
-    expect(result.stdout).toMatch(/^\[fail\] model: .*nope\/missing/m);
+    expect(result.stdout).toMatch(/^  ✓ auth +/m);
+    expect(result.stdout).toMatch(/^  ✗ model +.*nope\/missing/m);
     expect(result.stdout).toContain("lia models");
     expect(result.code).toBe(1);
   }, TIMEOUT);
@@ -161,7 +171,7 @@ describe("lia doctor provider", () => {
     const g = gateway(() => new Promise<Response>(() => {}));
     const result = await doctor(r, env(r, { ...g, AI_GATEWAY_API_KEY: "doctor-key", LIA_TEST_DOCTOR_DEADLINE_MS: "1000" }));
     expect(result.ms).toBeLessThan(4_000);
-    expect(result.stdout).toMatch(/^\[fail\] provider: could not reach AI Gateway in 1 s$/m);
+    expect(result.stdout).toMatch(/^  ✗ provider +could not reach AI Gateway in 1 s$/m);
     expect(result.code).toBe(1);
   }, TIMEOUT);
 
@@ -172,8 +182,8 @@ describe("lia doctor provider", () => {
       return models([MODEL]);
     });
     const inside = await doctor(early, env(early, { ...fast, AI_GATEWAY_API_KEY: "doctor-key", LIA_TEST_DOCTOR_DEADLINE_MS: "1500" }));
-    expect(inside.stdout).toMatch(/^\[ok\] auth: /m);
-    expect(inside.stdout).toMatch(/^\[ok\] model: /m);
+    expect(inside.stdout).toMatch(/^  ✓ auth +/m);
+    expect(inside.stdout).toMatch(/^  ✓ model +/m);
 
     const late = makeRoot();
     const slow = gateway(async () => {
@@ -181,8 +191,8 @@ describe("lia doctor provider", () => {
       return models([MODEL]);
     });
     const past = await doctor(late, env(late, { ...slow, AI_GATEWAY_API_KEY: "doctor-key", LIA_TEST_DOCTOR_DEADLINE_MS: "1000" }));
-    expect(past.stdout).toMatch(/^\[fail\] provider: .*could not reach/m);
-    expect(past.stdout).not.toMatch(/^\[ok\] auth: /m);
+    expect(past.stdout).toMatch(/^  ✗ provider +.*could not reach/m);
+    expect(past.stdout).not.toMatch(/^  ✓ auth +/m);
   }, TIMEOUT);
 
   test("a public list does not confirm the credential, and a team-less lia login is told to pick a team", async () => {
@@ -199,7 +209,7 @@ describe("lia doctor provider", () => {
     expect(authorized).toBe(0);
     expect(anonymous).toBe(1);
     expect(result.stdout).not.toContain("accepted the credential");
-    expect(result.stdout).toMatch(/^\[warn\] auth: AI Gateway sent only its public model list, so the credential is not confirmed\n  fix: lia teams$/m);
+    expect(result.stdout).toMatch(/^  ! auth +AI Gateway sent only its public model list, so the credential is not confirmed\n               fix: lia teams$/m);
     expect(result.stdout).not.toContain("doctor-teamless-token");
   }, TIMEOUT);
 
@@ -213,8 +223,8 @@ describe("lia doctor provider", () => {
     const result = await doctor(r, env(r, { LIA_MODEL: undefined, LIA_TEST_PROVIDER_TOKEN: "wrong-token" }));
     expect(f.requests).toEqual([]);
     expect(result.stdout).not.toContain("accepted the credential");
-    expect(result.stdout).not.toMatch(/^\[\w+\] (provider|model): /m);
-    expect(result.stdout).toMatch(/^\[ok\] auth: /m);
+    expect(result.stdout).not.toMatch(/^  [✓!✗] (provider|model) +/m);
+    expect(result.stdout).toMatch(/^  ✓ auth +/m);
   }, TIMEOUT);
 
   test("with no credential the auth check fails without any request", async () => {
@@ -225,7 +235,7 @@ describe("lia doctor provider", () => {
       return models([MODEL]);
     });
     const result = await doctor(r, env(r, { ...g }));
-    expect(result.stdout).toMatch(/^\[fail\] auth: /m);
+    expect(result.stdout).toMatch(/^  ✗ auth +/m);
     expect(result.stdout).toContain("lia login");
     expect(hits).toBe(0);
     expect(result.code).toBe(1);
@@ -236,8 +246,8 @@ describe("lia doctor exit code and output", () => {
   test("warnings alone exit 0", async () => {
     const r = makeRoot();
     const result = await doctor(r, env(r, { ...acceptingGateway(), AI_GATEWAY_API_KEY: "doctor-key" }));
-    expect(result.stdout).not.toMatch(/^\[fail\]/m);
-    expect(result.stdout).toMatch(/^\[warn\] /m);
+    expect(result.stdout).not.toMatch(/^  ✗ /m);
+    expect(result.stdout).toMatch(/^  ! /m);
     expect(result.code).toBe(0);
   }, TIMEOUT);
 
@@ -253,10 +263,33 @@ describe("lia doctor exit code and output", () => {
     expect(result.code).toBe(1);
   }, TIMEOUT);
 
-  test("--help names --fix and a bad flag still exits 2, named as the flag that is wrong", async () => {
+  test("the text report shows what doctor ran with, each check under its group, and the totals, with no color in a pipe", async () => {
+    const r = makeRoot();
+    gitRepo(r);
+    const result = await doctor(r, env(r, { ...acceptingGateway(), AI_GATEWAY_API_KEY: "doctor-key" }));
+    const out = result.stdout;
+    expect(out).toMatch(/^lia doctor  lia \S+\n\n/);
+    expect(out).toContain(`  Workspace    ${realpathSync(r.workspace)}\n`);
+    expect(out).toContain(`  Model        ${MODEL}\n`);
+    expect(out).toContain("  Auth         AI_GATEWAY_API_KEY\n");
+    expect(out).toMatch(/^  Permissions  \S+$/m);
+    expect(out).toMatch(/^  Step limit   \S+$/m);
+    // Groups come in a fixed order, each under its own heading.
+    const headings = out.split("\n").filter((line) => /^[A-Z]/.test(line));
+    expect(headings).toEqual(["Install", "Config", "Auth and model", "Sessions", "Tools"]);
+    const tools = out.slice(out.indexOf("\nTools\n"));
+    expect(tools).toMatch(/^  ✓ git +/m);
+    expect(out).toMatch(/\n\n\d+ ok \u00b7 \d+ warnings? \u00b7 0 failures\n$/);
+    expect(out).not.toContain("[doctor]");
+    expect(out).not.toContain("\x1b");
+    expect(result.code).toBe(0);
+  }, TIMEOUT);
+
+  test("--help names --fix and --deep, and a bad flag still exits 2, named as the flag that is wrong", async () => {
     const r = makeRoot();
     const help = await doctor(r, env(r), ["--help"]);
     expect(help.stdout).toContain("--fix");
+    expect(help.stdout).toContain("--deep");
     const bad = await doctor(r, env(r), ["--nope"]);
     expect(bad.code).toBe(2);
     const afterFix = await doctor(r, env(r), ["--fix", "--bogus"]);
@@ -274,10 +307,10 @@ describe("lia doctor local checks", () => {
     const r = makeRoot();
     writeFileSync(join(r.home, ".lia", "settings.json"), "{not json");
     const result = await doctor(r, env(r, { ...acceptingGateway(), AI_GATEWAY_API_KEY: "doctor-key", LIA_PERMISSION_MODE: "garbage", LIA_MAX_AGENT_STEPS: "abc" }));
-    expect(result.stdout).toMatch(/^\[fail\] config: .*settings\.json/m);
+    expect(result.stdout).toMatch(/^  ✗ config +.*settings\.json/m);
     expect(result.stdout).not.toMatch(/no config files found/);
-    expect(result.stdout).toMatch(/^\[warn\] env: LIA_PERMISSION_MODE=garbage .*auto/m);
-    expect(result.stdout).toMatch(/^\[warn\] env: LIA_MAX_AGENT_STEPS=abc /m);
+    expect(result.stdout).toMatch(/^  ! env +LIA_PERMISSION_MODE=garbage .*auto/m);
+    expect(result.stdout).toMatch(/^  ! env +LIA_MAX_AGENT_STEPS=abc /m);
     expect(result.code).toBe(1);
   }, TIMEOUT);
 
@@ -287,11 +320,11 @@ describe("lia doctor local checks", () => {
     const sub = join(r.workspace, "src", "deep");
     mkdirSync(sub, { recursive: true });
     const inside = await doctor(r, env(r, { ...acceptingGateway(), AI_GATEWAY_API_KEY: "doctor-key" }), [], sub);
-    expect(inside.stdout).toMatch(/^\[ok\] git: /m);
+    expect(inside.stdout).toMatch(/^  ✓ git +/m);
 
     const outside = makeRoot();
     const away = await doctor(outside, env(outside, { ...acceptingGateway(), AI_GATEWAY_API_KEY: "doctor-key" }));
-    expect(away.stdout).toMatch(/^\[warn\] git: /m);
+    expect(away.stdout).toMatch(/^  ! git +/m);
   }, TIMEOUT);
 
   test("lia has no GitHub CLI check: a gh on PATH is never run", async () => {
@@ -300,7 +333,7 @@ describe("lia doctor local checks", () => {
     const ran = join(r.root, "gh-ran");
     writeScript(join(r.bin, "gh"), `: > '${ran}'`);
     const result = await doctor(r, env(r, { ...acceptingGateway(), AI_GATEWAY_API_KEY: "doctor-key" }));
-    expect(result.stdout).toMatch(/^\[ok\] git: /m);
+    expect(result.stdout).toMatch(/^  ✓ git +/m);
     expect(result.stdout).not.toMatch(/^\[(ok|warn|fail)\] gh: /m);
     expect(existsSync(ran)).toBe(false);
   }, TIMEOUT);
@@ -309,8 +342,8 @@ describe("lia doctor local checks", () => {
     const r = makeRoot();
     writeScript(join(r.bin, "lia"), "exit 0");
     const result = await doctor(r, env(r, { ...acceptingGateway(), AI_GATEWAY_API_KEY: "doctor-key" }));
-    expect(result.stdout).toMatch(/^\[ok\] install: lia \S+ at /m);
-    expect(result.stdout).toMatch(new RegExp(`^\\[warn\\] install: .*${r.bin.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/lia`, "m"));
+    expect(result.stdout).toMatch(/^  ✓ install +lia \S+ at /m);
+    expect(result.stdout).toMatch(new RegExp(`${rowStart("warn", "install")}.*${r.bin.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/lia`, "m"));
   }, TIMEOUT);
 
   test("a skill file that does not load shows with its path", async () => {
@@ -319,7 +352,7 @@ describe("lia doctor local checks", () => {
     mkdirSync(skill, { recursive: true });
     writeFileSync(join(skill, "SKILL.md"), "---\nname: not a safe name/../x\n---\nbody\n");
     const result = await doctor(r, env(r, { ...acceptingGateway(), AI_GATEWAY_API_KEY: "doctor-key" }));
-    expect(result.stdout).toMatch(/^\[warn\] skills: .*broken/m);
+    expect(result.stdout).toMatch(/^  ! skills +.*broken/m);
   }, TIMEOUT);
 });
 
@@ -345,9 +378,9 @@ describe("lia doctor MCP", () => {
     const started = readFileSync(trace, "utf8");
     expect(started).toContain("starting check ready1");
     expect(started).not.toContain("starting check project");
-    expect(result.stdout).toMatch(/^\[ok\] mcp: ready1\b/m);
-    expect(result.stdout).toMatch(/^\[fail\] mcp: hang1 did not answer in \d+\.\d s, when doctor's 3 s limit ended$/m);
-    expect(result.stdout).toMatch(/^\[warn\] mcp: project .*approv/m);
+    expect(result.stdout).toMatch(/^  ✓ mcp +ready1\b/m);
+    expect(result.stdout).toMatch(/^  ✗ mcp +hang1 did not answer in \d+\.\d s, when doctor's 3 s limit ended$/m);
+    expect(result.stdout).toMatch(/^  ! mcp +project .*approv/m);
     await Bun.sleep(300);
     expect(existsSync(marker)).toBe(false);
     expect(result.code).toBe(1);
@@ -390,15 +423,15 @@ describe("lia doctor MCP", () => {
     const trace = join(r.root, "trace.log");
     const result = await doctor(r, env(r, { ...acceptingGateway(), AI_GATEWAY_API_KEY: "doctor-key", LIA_TEST_DOCTOR_DEADLINE_MS: "3000", LIA_TRACE_LOG: trace, LIA_TRACE_SCOPES: "doctor" }));
     for (const name of ["--help", "-x"]) {
-      expect(result.stdout).toContain(`[warn] mcp: ${name} was not checked: lia mcp show reads a name that starts with "-" as an option\n  fix: rename the server in ~/.lia/mcp.json so its name does not start with "-"\n`);
+      expect(result.stdout).toContain(`  ! mcp        ${name} was not checked: lia mcp show reads a name that starts with "-" as an option\n               fix: rename the server in ~/.lia/mcp.json so its name does not start with "-"\n`);
       expect(readFileSync(trace, "utf8")).not.toContain(`starting check ${name}`);
     }
-    expect(result.stdout).toContain('[warn] mcp: -s uses a transport lia does not support\n  fix: rename the server in ~/.lia/mcp.json so its name does not start with "-"\n');
+    expect(result.stdout).toContain('  ! mcp        -s uses a transport lia does not support\n               fix: rename the server in ~/.lia/mcp.json so its name does not start with "-"\n');
     // Also in a state whose fix would otherwise name the variable to set.
-    expect(result.stdout).toContain('[fail] mcp: -h needs NOPE_TOKEN_1677\n  fix: rename the server in ~/.lia/mcp.json so its name does not start with "-"\n');
-    expect(result.stdout).toContain('[warn] mcp: -w is waiting for approval\n  fix: rename the server in .mcp.json so its name does not start with "-"\n');
+    expect(result.stdout).toContain('  ✗ mcp        -h needs NOPE_TOKEN_1677\n               fix: rename the server in ~/.lia/mcp.json so its name does not start with "-"\n');
+    expect(result.stdout).toContain('  ! mcp        -w is waiting for approval\n               fix: rename the server in .mcp.json so its name does not start with "-"\n');
     expect(result.stdout).not.toMatch(/fix: lia mcp \w+ -/);
-    expect(result.stdout).toMatch(/^\[ok\] mcp: normal ready, 1 tool$/m);
+    expect(result.stdout).toMatch(/^  ✓ mcp +normal ready, 1 tool$/m);
     expect(result.code).toBe(1);
   }, TIMEOUT);
 
@@ -410,7 +443,7 @@ describe("lia doctor MCP", () => {
       mcpServers: Object.fromEntries(names.map((name) => [name, { command: "/bin/sh", args: ["-c", "exit 0"] }])),
     }));
     const result = await doctor(r, env(r));
-    const fixes = result.stdout.split("\n").filter((line) => line.startsWith("  fix: lia mcp approve ")).map((line) => line.slice("  fix: ".length));
+    const fixes = result.stdout.split("\n").filter((line) => line.startsWith(`${FIX}lia mcp approve `)).map((line) => line.slice(FIX.length));
     expect(fixes).toHaveLength(names.length);
     // A stand-in lia records the words a shell hands it.
     const fake = join(r.root, "fake-bin");
@@ -470,14 +503,14 @@ describe("lia doctor MCP", () => {
     const unreadable = makeRoot();
     writeFileSync(join(unreadable.workspace, ".mcp.json"), "{not json\n");
     const whole = await doctor(unreadable, env(unreadable, { ...acceptingGateway(), AI_GATEWAY_API_KEY: "doctor-key" }));
-    expect(whole.stdout).toContain("[fail] mcp_config: .mcp.json server 'unknown' was skipped: invalid_json.\n  fix: fix .mcp.json, then run lia doctor again\n");
+    expect(whole.stdout).toContain("  ✗ mcp_config .mcp.json server 'unknown' was skipped: invalid_json.\n               fix: fix .mcp.json, then run lia doctor again\n");
     expect(whole.code).toBe(1);
 
     const oneBad = makeRoot();
     writeFileSync(join(oneBad.workspace, ".mcp.json"), JSON.stringify({ mcpServers: { odd: { type: "weird", url: "x" }, docs: { command: "/bin/sh", args: ["-c", "exit 0"] } } }));
     const entry = await doctor(oneBad, env(oneBad, { ...acceptingGateway(), AI_GATEWAY_API_KEY: "doctor-key" }));
-    expect(entry.stdout).toContain("[fail] mcp_config: .mcp.json server 'odd' was skipped: its \"type\" isn't valid.\n  fix: fix .mcp.json, then run lia doctor again\n");
-    expect(entry.stdout).toMatch(/^\[warn\] mcp: docs is waiting for approval$/m);
+    expect(entry.stdout).toContain("  ✗ mcp_config .mcp.json server 'odd' was skipped: its \"type\" isn't valid.\n               fix: fix .mcp.json, then run lia doctor again\n");
+    expect(entry.stdout).toMatch(/^  ! mcp +docs is waiting for approval$/m);
     expect(entry.code).toBe(1);
   }, TIMEOUT);
 
@@ -498,8 +531,8 @@ describe("lia doctor MCP", () => {
     const cutoff = "was not checked: too little of doctor's 1 s limit was left to start it";
     const atLimit = "was not checked: doctor reached its 1 s limit before it could start the check";
     const notChecked = names.filter((name) => {
-      expect(result.stdout).toMatch(new RegExp(`^\\[fail\\] mcp: ${name} (${cutoff}|${atLimit}|did not answer in \\d+\\.\\d s, when doctor's 1 s limit ended)\\n  fix: lia mcp show ${name}$`, "m"));
-      return result.stdout.includes(`[fail] mcp: ${name} was not checked`);
+      expect(result.stdout).toMatch(new RegExp(`${rowStart("fail", "mcp")}${name} (${cutoff}|${atLimit}|did not answer in \\d+\\.\\d s, when doctor's 1 s limit ended)\\n               fix: lia mcp show ${name}$`, "m"));
+      return result.stdout.includes(`  ✗ mcp        ${name} was not checked`);
     });
     expect(notChecked.length).toBeGreaterThanOrEqual(names.length - 16);
     for (const name of notChecked) expect(existsSync(join(r.root, name))).toBe(false);
@@ -507,7 +540,7 @@ describe("lia doctor MCP", () => {
     // the reason its line gives.
     const traced = readFileSync(trace, "utf8");
     for (const name of notChecked) {
-      const why = result.stdout.includes(`[fail] mcp: ${name} ${cutoff}`) ? "too little of doctor's limit was left to start it" : "doctor's limit came while it waited for a slot";
+      const why = result.stdout.includes(`  ✗ mcp        ${name} ${cutoff}`) ? "too little of doctor's limit was left to start it" : "doctor's limit came while it waited for a slot";
       expect(traced.split(`check ${name} was never started, since ${why}; dropping it`).length).toBe(2);
     }
     spawnSync("/usr/bin/pkill", ["-KILL", "-f", `${r.root}/late`]);
@@ -519,7 +552,7 @@ describe("lia doctor MCP", () => {
     for (let i = 0; i < 24; i++) mcp[`queued${i}`] = { command: [process.execPath, MODERN_FIXTURE] };
     writeFileSync(join(r.home, ".lia", "mcp.json"), JSON.stringify({ mcp }));
     const result = await doctor(r, env(r, { ...acceptingGateway(), AI_GATEWAY_API_KEY: "doctor-key", LIA_TEST_DOCTOR_DEADLINE_MS: "30000" }));
-    expect((result.stdout.match(/^\[ok\] mcp: queued\d+ ready, 1 tool$/gm) ?? []).length).toBe(24);
+    expect((result.stdout.match(/^  ✓ mcp +queued\d+ ready, 1 tool$/gm) ?? []).length).toBe(24);
     expect(result.code).toBe(0);
   }, TIMEOUT);
 
@@ -542,13 +575,13 @@ describe("lia doctor MCP", () => {
     expect(shown.status).toBe(0);
     expect(shown.stdout.length).toBeGreaterThan(64 * 1024);
     const result = await doctor(r, e);
-    expect(result.stdout).toMatch(/^\[ok\] mcp: many ready, 3000 tools$/m);
+    expect(result.stdout).toMatch(/^  ✓ mcp +many ready, 3000 tools$/m);
   }, TIMEOUT);
 
   test("no MCP servers configured adds no MCP line", async () => {
     const r = makeRoot();
     const result = await doctor(r, env(r, { ...acceptingGateway(), AI_GATEWAY_API_KEY: "doctor-key" }));
-    expect(result.stdout).not.toMatch(/^\[(ok|warn|fail)\] mcp: /m);
+    expect(result.stdout).not.toMatch(/^  [✓!✗] mcp +/m);
   }, TIMEOUT);
 });
 

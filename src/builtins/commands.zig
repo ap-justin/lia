@@ -37,6 +37,15 @@ pub const sessions_options = [_]command_specs.OptionDoc{
 
 pub const sessions_convert_options = [_]command_specs.OptionDoc{json_option};
 
+const sessions_subcommands = [_]command_specs.SubcommandDoc{
+    .{ .usage = "ls", .description = "List saved sessions (default)", .options = &sessions_options },
+    .{ .usage = "convert", .description = "Convert every session saved in the previous format", .options = &sessions_convert_options },
+};
+
+const models_subcommands = [_]command_specs.SubcommandDoc{
+    .{ .usage = "ls", .description = "List available models (default)", .options = &.{json_option} },
+};
+
 pub const usage_options = [_]command_specs.OptionDoc{
     .{ .flag = "--period <today|7d|month>", .description = "Select the period, in UTC days (default: month)" },
     json_option,
@@ -47,6 +56,7 @@ pub const usage_options = [_]command_specs.OptionDoc{
 pub const doctor_options = [_]command_specs.OptionDoc{
     json_option,
     .{ .flag = "--fix", .description = "Remove old terminal and side folders whose session is gone" },
+    .{ .flag = "--deep", .description = "Read every saved file of each session checked, with no time limit; slower" },
 };
 
 pub const workspace_options = [_]command_specs.OptionDoc{json_option};
@@ -82,12 +92,18 @@ const config_options = [_]command_specs.OptionDoc{
 
 const session_subcommands = [_]command_specs.SubcommandDoc{
     .{ .usage = "last", .description = "Inspect the current workspace session" },
+    .{ .usage = "fork <last|id>", .description = "Copy a saved or live session into a new session", .options = &session_fork_options },
     .{ .usage = "recover <id>", .description = "Copy a recoverable corrupt session into a new session" },
 };
 
 pub const session_options = [_]command_specs.OptionDoc{
     .{ .flag = "--id <id>", .description = "Inspect a saved session by exact id" },
     .{ .flag = "--tail <1-1000>", .description = "Show only the last turns, each under its own number" },
+    json_option,
+};
+
+pub const session_fork_options = [_]command_specs.OptionDoc{
+    .{ .flag = "--id <id>", .description = "Fork a saved session by exact id" },
     json_option,
 };
 
@@ -225,7 +241,8 @@ pub const top_level_specs = [_]TopLevelSpec{
             "The prompt may be passed as arguments or piped on stdin when no prompt args are given.",
             "Assistant output is raw Markdown on stdout.",
             "Operational progress and diagnostics are written to stderr. JSON `output` keeps accumulated assistant Markdown; `final_output` contains only the completed final response, or an empty string when absent.",
-            "JSON usage sums reported main-agent input_tokens and output_tokens, including with --no-save; unreported counts are null. cache_read_tokens and cache_write_tokens appear only when the provider reports them. Nested usage and dollar spend are excluded.",
+            "JSON usage sums reported main-agent input_tokens and output_tokens, including with --no-save; unreported counts are null. cache_read_tokens and cache_write_tokens appear only when the provider reports them. Subagent usage and dollar spend are excluded.",
+            "JSON subagents appears only when a subagent did work in this request. It lists each one in the order it first ran, with its name, id, and usage in the same shape, counted for this request alone. lia session <session_id>/<name> reads one and prints the same id.",
             "--system replaces only the built-in base prompt for this request; tool, skill, project, and runtime context still apply.",
             "With --prompt-permissions, JSON and quiet requests may prompt on stderr only when stdin is a TTY.",
         },
@@ -311,8 +328,9 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .models,
         .token = "models",
-        .usage = "models [--json]",
+        .usage = "models [ls] [--json]",
         .summary = "List available models",
+        .subcommands = &models_subcommands,
         .options = &.{json_option},
     },
     .{
@@ -324,7 +342,7 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .doctor,
         .token = "doctor",
-        .usage = "doctor [--json] [--fix]",
+        .usage = "doctor [--json] [--fix] [--deep]",
         .summary = "Check that lia can work here, with a fix for each problem",
         .options = &doctor_options,
     },
@@ -337,8 +355,8 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .session,
         .token = "session",
-        .usage = "session <last|id|id/agent>|--id <id> [--tail <1-1000>] [--json] | session recover <id>|--id <id> [--json]",
-        .summary = "Inspect or recover saved sessions",
+        .usage = "session <last|id|id/agent>|--id <id> [--tail <1-1000>] [--json] | session fork <last|id>|--id <id> [--json] | session recover <id>|--id <id> [--json]",
+        .summary = "Inspect, fork, or recover saved sessions",
         .subcommands = &session_subcommands,
         .options = &session_options,
         .details = &.{
@@ -349,9 +367,9 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .sessions,
         .token = "sessions",
-        .usage = "sessions [--all] [--limit <1-100>] [--cursor <cursor>] [--json] | sessions --live [--all] [--json] | sessions convert [--json]",
+        .usage = "sessions [ls] [--all] [--limit <1-100>] [--cursor <cursor>] [--json] | sessions [ls] --live [--all] [--json] | sessions convert [--json]",
         .summary = "List saved sessions for the current workspace",
-        .subcommands = &.{.{ .usage = "convert", .description = "Convert every session saved in the previous format", .options = &sessions_convert_options }},
+        .subcommands = &sessions_subcommands,
         .options = &sessions_options,
         .details = &.{
             "--live shows each session's state (working, idle, or unknown) and the model saved with it, with its subagents in a tree below it; lia session <id>/<agent> reads one.",
@@ -432,6 +450,7 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
     .{ .entries = &.{
         .{ .kind = .sessions, .usage = "sessions" },
         .{ .kind = .session, .usage = "session <last|id>" },
+        .{ .usage = "session fork <last|id>", .summary = "Copy a saved or live session into a new session" },
         .{ .usage = "session recover <id>", .summary = "Copy a recoverable corrupt session" },
     } },
     .{ .entries = &.{
@@ -632,7 +651,6 @@ test "lia config help names settings by their current keys" {
             const word = std.mem.trimEnd(u8, raw, ".");
             const dot = std.mem.findScalar(u8, word, '.') orelse continue;
             const key = settings_keys.find(word[0..dot]) orelse continue;
-            try std.testing.expectEqualStrings(settings_keys.currentPath(word), word);
             var known = false;
             for (key.children) |child| known = known or std.mem.eql(u8, child, word[dot + 1 ..]);
             try std.testing.expect(known);

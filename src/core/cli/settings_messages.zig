@@ -32,7 +32,9 @@ pub fn formatUnknownSetting(alloc: Allocator, key: settings_keys.UnknownKey, dis
 }
 
 /// `notifications and sound are both set in ~/.lia/settings.json; lia uses
-/// sound where they differ, so remove notifications`. Caller owns the result.
+/// sound where they differ, so remove notifications`, or, with the older name
+/// alone, `notifications in ~/.lia/settings.json is deprecated and stops
+/// working in lia 0.2.0; rename it to sound`. Caller owns the result.
 pub fn formatOlderName(alloc: Allocator, twice: settings_keys.OlderName, display_path: []const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();

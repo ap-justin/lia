@@ -75,6 +75,8 @@ pub const Settings = struct {
     notification_turn_end: ?bool = null,
     notification_attention_required: ?bool = null,
     notification_max: ?bool = null,
+    /// `experimental.workspace_capture`, profile-only.
+    experimental_workspace_capture: ?bool = null,
     permission_rules: types.PermissionRuleSet = .{},
     has_permission_rules: bool = false,
     /// Owned absolute directories whose contents symlinked skills may resolve
@@ -1948,9 +1950,9 @@ fn parseProfileOnlyFields(
     }
 
     // `sound` was `notifications`. The older name is read first, so the
-    // current one wins any value both set. The current name was an unknown
-    // key before, which startup ignores, so a value under it that isn't an
-    // object is still ignored.
+    // current one wins any value both set. Before the rename, the current name
+    // was an unknown key, which startup ignores, so a value under it that
+    // isn't an object is still ignored.
     for ([_]?std.json.Value{ root.object.get("notifications"), root.object.get("sound") }, 0..) |group, index| {
         if (group) |sound_value| {
             if (sound_value != .object) {
@@ -1970,6 +1972,15 @@ fn parseProfileOnlyFields(
                 if (value != .bool) return error.InvalidNotificationMaxType;
                 settings.notification_max = value.bool;
             }
+        }
+    }
+
+    if (root.object.get("experimental")) |experimental_value| {
+        if (experimental_value != .object) {
+            debug_trace.logf("config", "ignoring experimental: not an object", .{});
+        } else if (experimental_value.object.get("workspace_capture")) |value| {
+            if (value != .bool) return error.InvalidExperimentalWorkspaceCaptureType;
+            settings.experimental_workspace_capture = value.bool;
         }
     }
 
@@ -2137,6 +2148,7 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) !void
     if (incoming.notification_turn_end) |value| target.notification_turn_end = value;
     if (incoming.notification_attention_required) |value| target.notification_attention_required = value;
     if (incoming.notification_max) |value| target.notification_max = value;
+    if (incoming.experimental_workspace_capture) |value| target.experimental_workspace_capture = value;
 
     if (incoming.has_permission_rules) {
         target.permission_rules.deinit(alloc);
@@ -3042,9 +3054,10 @@ test "renamed groups read either spelling and the current one wins" {
     defer both.deinit(alloc);
     try std.testing.expect(both.notification_max.? and both.notification_turn_end.?);
 
-    var older = try parseSettingsJson(alloc, "{\"notifications\":{\"attention_required\":false}}");
+    var older = try parseSettingsJson(alloc, "{\"notifications\":{\"attention_required\":false,\"max\":true}}");
     defer older.deinit(alloc);
     try std.testing.expect(!older.notification_attention_required.?);
+    try std.testing.expect(older.notification_max.?);
 
     // The current name was an unknown key before the rename, so a stray value
     // of another type under it is ignored, not a startup failure.
@@ -3980,12 +3993,12 @@ test "notification settings default off parse and merge by field" {
 
     var global = try parseSettingsJson(
         std.testing.allocator,
-        "{\"notifications\":{\"turn_end\":true,\"attention_required\":false}}",
+        "{\"sound\":{\"turn_end\":true,\"attention_required\":false}}",
     );
     defer global.deinit(std.testing.allocator);
     var workspace = try parseSettingsJson(
         std.testing.allocator,
-        "{\"notifications\":{\"attention_required\":true,\"max\":true}}",
+        "{\"sound\":{\"attention_required\":true,\"max\":true}}",
     );
     defer workspace.deinit(std.testing.allocator);
     try mergeSettings(&global, &workspace, std.testing.allocator);
@@ -3995,19 +4008,15 @@ test "notification settings default off parse and merge by field" {
     try std.testing.expectEqual(true, global.notification_max.?);
     try std.testing.expectError(
         error.InvalidNotificationTurnEndType,
-        parseSettingsJson(std.testing.allocator, "{\"notifications\":{\"turn_end\":1}}"),
-    );
-    try std.testing.expectError(
-        error.InvalidNotificationsType,
-        parseSettingsJson(std.testing.allocator, "{\"notifications\":true}"),
+        parseSettingsJson(std.testing.allocator, "{\"sound\":{\"turn_end\":1}}"),
     );
     try std.testing.expectError(
         error.InvalidNotificationAttentionRequiredType,
-        parseSettingsJson(std.testing.allocator, "{\"notifications\":{\"attention_required\":\"yes\"}}"),
+        parseSettingsJson(std.testing.allocator, "{\"sound\":{\"attention_required\":\"yes\"}}"),
     );
     try std.testing.expectError(
         error.InvalidNotificationMaxType,
-        parseSettingsJson(std.testing.allocator, "{\"notifications\":{\"max\":\"yes\"}}"),
+        parseSettingsJson(std.testing.allocator, "{\"sound\":{\"max\":\"yes\"}}"),
     );
 }
 
@@ -4022,7 +4031,7 @@ test "notification settings merge global and workspace while project values are 
     defer std.testing.allocator.free(workspace_root);
 
     const user_settings = try std.testing.allocator.print(
-        "{{\"notifications\":{{\"turn_end\":true,\"attention_required\":false}},\"workspaces\":{{\"{s}\":{{\"notifications\":{{\"attention_required\":true}}}}}}}}",
+        "{{\"sound\":{{\"turn_end\":true,\"attention_required\":false}},\"workspaces\":{{\"{s}\":{{\"sound\":{{\"attention_required\":true}}}}}}}}",
         .{workspace_root},
     );
     defer std.testing.allocator.free(user_settings);
@@ -4030,7 +4039,7 @@ test "notification settings merge global and workspace while project values are 
     try writeFixtureFile(
         tmp.dir,
         "workspace/.lia.json",
-        "{\"notifications\":{\"turn_end\":false,\"attention_required\":false}}",
+        "{\"sound\":{\"turn_end\":false,\"attention_required\":false}}",
     );
 
     var ordinary = try loadMergedSettingsFromHome(std.testing.allocator, home_root, workspace_root);
@@ -4044,7 +4053,7 @@ test "notification settings merge global and workspace while project values are 
     try std.testing.expectEqual(true, detailed.settings.notification_attention_required.?);
     try std.testing.expectEqual(ConfigSource.user_global, detailed.sources.notification_turn_end);
     try std.testing.expectEqual(ConfigSource.user_workspace, detailed.sources.notification_attention_required);
-    try expectIgnoredProjectKey(detailed.diagnostics, "notifications");
+    try expectIgnoredProjectKey(detailed.diagnostics, "sound");
 }
 
 test "detailed settings diagnose legacy workspace preferences" {
@@ -4123,7 +4132,7 @@ test "detailed settings expose target sources and permission views" {
 
     const user_settings = try std.testing.allocator.print(
         "{{\"model\":\"user/model\",\"permission_mode\":\"ask\",\"fast_mode\":true,\"input_appearance\":\"tint\",\"startup_scrollback\":false," ++
-            "\"prompt_history\":{{\"enabled\":false}},\"statusLine\":{{\"sandbox\":true,\"context\":false,\"session\":true}}," ++
+            "\"prompt_history\":{{\"enabled\":false}},\"status_line\":{{\"sandbox\":true,\"context\":false,\"session\":true}}," ++
             "\"permission\":{{\"bash\":{{\"user *\":\"allow\"}}}},\"workspaces\":{{\"{s}\":{{" ++
             "\"model\":\"workspace/model\",\"permission_mode\":\"auto\",\"input_appearance\":\"lines\",\"sandbox\":\"none\",\"permission\":{{\"bash\":{{\"local *\":\"allow\"}}}}" ++
             "}}}}}}\n",
@@ -4512,7 +4521,7 @@ test "detailed settings remove loose write access, load, and note it once" {
         const diagnostic = result.diagnostics[0];
         try std.testing.expectEqual(ConfigDiagnosticCause.private_state_permissions_tightened, diagnostic.cause);
         try std.testing.expect(!diagnostic.reportAtStartup());
-        try std.testing.expect(std.mem.indexOf(u8, diagnostic.note().?, "~/.lia/settings.json") != null);
+        try std.testing.expect(std.mem.find(u8, diagnostic.note().?, "~/.lia/settings.json") != null);
         try std.testing.expect(result.prompt_history_store_allowed);
     }
     const tightened = try root_dir.statFile(io_mod.getIo(), "settings.json", .{});
@@ -4922,4 +4931,20 @@ test "modelNotSelectedMessage names the provider and both ways to recover" {
     try std.testing.expect(std.mem.find(u8, configured, "\"models\" in ~/.lia/settings.json") != null);
     try std.testing.expect(std.mem.find(u8, configured, "--model or LIA_MODEL") != null);
     try std.testing.expect(modelNotSelectedMessage(error.OutOfMemory) == null);
+}
+
+test "experimental.workspace_capture is read from the profile only and stays off by default" {
+    const alloc = std.testing.allocator;
+    var absent = try parseSettingsJson(alloc, "{}");
+    defer absent.deinit(alloc);
+    try std.testing.expectEqual(@as(?bool, null), absent.experimental_workspace_capture);
+    var on = try parseSettingsJson(alloc, "{\"experimental\":{\"workspace_capture\":true}}");
+    defer on.deinit(alloc);
+    try std.testing.expect(on.experimental_workspace_capture.?);
+    // A repository's committed .lia.json can never turn it on.
+    var project = try parseSettingsJsonForLayer(alloc, "{\"experimental\":{\"workspace_capture\":true}}", .project);
+    defer project.deinit(alloc);
+    try std.testing.expectEqual(@as(?bool, null), project.experimental_workspace_capture);
+    // A value of another type is refused, as for every other switch.
+    try std.testing.expectError(error.InvalidExperimentalWorkspaceCaptureType, parseSettingsJson(alloc, "{\"experimental\":{\"workspace_capture\":\"yes\"}}"));
 }

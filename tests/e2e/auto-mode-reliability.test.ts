@@ -14,6 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LIA_BIN, runLia } from "../evals/eval-helpers";
 import { logLines, rootSessionIds } from "./saved-sessions";
+import { type TraceReport, traceReportNames, waitForNewTraceReport } from "./trace-report";
 import {
   fakeGatewayFinalText,
   fakeGatewayHeldDecision,
@@ -298,7 +299,16 @@ describe("lean auto mode reliability", () => {
             } });
           },
           (body) => {
-            expect(toolResultText(body, "finished_input", "execution-denied")).toContain("review_evidence_incomplete");
+            // Input to a finished receiver says the session ended; it is
+            // not held as a safety review.
+            const finished = JSON.stringify(
+              JSON.parse(body).prompt
+                .flatMap((message: { content?: unknown }) => (Array.isArray(message.content) ? message.content : []))
+                .find((part: { type?: string; toolCallId?: string }) => part.type === "tool-result" && part.toolCallId === "finished_input")
+                ?.output,
+            );
+            expect(finished).toContain("is no longer running, so it can't take input");
+            expect(finished).not.toContain("review_evidence_incomplete");
             return fakeGatewayFinalText("Finished receiver could not receive input.");
           },
         ],

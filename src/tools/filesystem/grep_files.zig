@@ -154,7 +154,7 @@ pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput)
 // names exists, so the test can cancel the turn while the tool is still
 // running.
 fn holdForTest() void {
-    const release_path = io_mod.getenv("LIA_TEST_GREP_RELEASE") orelse return;
+    const release_path = io_mod.getenvAbsolutePath("LIA_TEST_GREP_RELEASE") orelse return;
     while (true) : (io_mod.sleep(std.time.ns_per_ms)) {
         std.Io.Dir.accessAbsolute(io_mod.getIo(), release_path, .{}) catch continue;
         return;

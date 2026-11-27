@@ -453,17 +453,21 @@ class Checker:
             self.report(None, "names", f'run_options names ACP config option "{config_id}", which set_config_option in {ACP_SERVER} doesn\'t take')
 
     def check_removal(self) -> None:
-        """Old spellings, such as `lia setup`, keep working with a warning until
-        old_spelling_removal; once lia reaches that version they must go."""
+        """A spelling that warns it stops working at a release is named by
+        old_spelling_removal; once lia reaches that version it must be gone. With
+        no such constant, no spelling is scheduled, so there is nothing to check."""
+        command_specs = (self.root / COMMAND_SPECS).read_text()
+        if OLD_SPELLING_REMOVAL.search(command_specs) is None:
+            return
         version = version_tuple(VERSION, (self.root / MAIN).read_text(), MAIN)
-        removal = version_tuple(OLD_SPELLING_REMOVAL, (self.root / COMMAND_SPECS).read_text(), COMMAND_SPECS)
+        removal = version_tuple(OLD_SPELLING_REMOVAL, command_specs, COMMAND_SPECS)
         if version >= removal:
             shown = ".".join(str(part) for part in removal)
             self.report(
                 None,
                 "removal",
-                f"lia {shown} drops the old spellings that warn they stop working in it: remove them, then old_spelling_removal "
-                f"(see decided-names.md in .lia/skills/lia-cli-shape/references)",
+                f"lia {shown} drops the old spellings that warn they stop working in it: remove them, then move or delete "
+                f"old_spelling_removal (see decided-names.md in .lia/skills/lia-cli-shape/references)",
                 COMMAND_SPECS,
             )
 

@@ -8,7 +8,8 @@ const testing = std.testing;
 
 /// A 2025 MCP server in sh: discovery gets an error, so the engine falls back
 /// to `initialize`; it lists one `echo` tool and answers calls, except a call
-/// that mentions "slow", which never answers. A call that mentions
+/// that mentions "slow", which never answers but is noted in a file (`Fixture.slowCalls`).
+/// A call that mentions
 /// "withdraw" asks form question Q1, withdraws it, asks Q2, and once Q2 is
 /// answered, returns what reached each: "e1 " if Q1 got an answer, then
 /// "e2=" and Q2's `name`. A call that mentions "confirm" asks question c1
@@ -138,7 +139,7 @@ const open_object_list =
 ;
 
 const calls =
-    \\    *'"method":"tools/call"'*slow*) ;;
+    \\    *'"method":"tools/call"'*slow*) printf x >> "$0.slow" ;;
     \\    *'"method":"tools/call"'*withdraw*)
     \\      call=$id
     \\      printf '{"jsonrpc":"2.0","id":"e1","method":"elicitation/create","params":{"mode":"form","message":"Q1","requestedSchema":{"type":"object","properties":{"name":{"type":"string"}}}}}\n'
@@ -335,6 +336,18 @@ pub const Fixture = struct {
         testing.allocator.free(f.server);
         testing.allocator.free(f.home);
         f.tmp.cleanup();
+    }
+
+    /// How many calls that mention "slow" the servers have received, which a test waits for
+    /// before it acts on a call that is out. Each call appends one byte to the file, so its
+    /// size is the count, and the file is never read while a server still writes it.
+    pub fn slowCalls(f: *const Fixture) usize {
+        const path = testing.allocator.print("{s}.slow", .{f.server}) catch return 0;
+        defer testing.allocator.free(path);
+        var file = std.Io.Dir.openFileAbsolute(testing.io, path, .{}) catch return 0;
+        defer file.close(testing.io);
+        const stat = file.stat(testing.io) catch return 0;
+        return @intCast(stat.size);
     }
 
     pub fn options(f: *const Fixture) Options {

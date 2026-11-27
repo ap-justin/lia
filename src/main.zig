@@ -6,9 +6,21 @@ const io_mod = @import("core/shared/io.zig");
 const profile_paths = @import("core/shared/profile_paths.zig");
 const terminal_env = @import("core/shared/terminal_env.zig");
 pub const version = "0.1.3";
+
+/// Panics save a crash record for `/trace`, except in tests, which keep the
+/// default handler.
+pub const panic = if (builtin.is_test) std.debug.FullPanic(std.debug.defaultPanic) else std.debug.FullPanic(crash_panic.handle);
+/// Zig's segfault handler calls this override. It saves the crash record and then
+/// calls Zig's default handler, which prints the signal and its address, adds a
+/// stack trace only in builds with debug info, and aborts. Test builds keep that
+/// default handler.
+pub const debug = struct {
+    pub const handleSegfault = if (builtin.is_test) std.debug.defaultHandleSegfault else crash_panic.handleSegfault;
+};
 const auth_runtime = @import("core/auth/auth_runtime.zig");
 const credentials = @import("core/auth/credentials.zig");
 const app_entry_runtime = @import("core/app/app_entry_runtime.zig");
+const crash_panic = @import("core/app/crash_panic.zig");
 const acp_runner = @import("core/cli/acp_runner.zig");
 const acp_server = @import("acp/server.zig");
 const context_contract = @import("core/workspace/context_contract.zig");
@@ -30,6 +42,8 @@ const command_runner = @import("core/execution/command_runner.zig");
 const shell_process_provider = @import("tools/shell/process_provider.zig");
 const process_provider = @import("core/execution/process_provider.zig");
 const terminal_native_session = @import("core/terminal/native_session.zig");
+const mcp_owner = @import("core/mcp_host/owner.zig");
+const debug_trace = @import("core/shared/debug_trace.zig");
 const builtin_tools = @import("builtins/tools.zig");
 const url_opener = @import("core/hosts/url_opener.zig");
 
@@ -62,6 +76,9 @@ comptime {
 }
 
 pub fn main(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) callconv(.c) c_int {
+    // lia exports its own C main, so Zig's start code does not set up the signal stack or the segfault handler.
+    std.Thread.maybeAttachSignalStack();
+    std.debug.maybeEnableSegfaultHandler();
     io_mod.reserveClosedStandardStreams();
     mainC(c_argc, c_argv, c_envp) catch return 1;
     return 0;
@@ -72,6 +89,19 @@ fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !v
     const raw_env: RawEnviron = @ptrCast(c_envp);
     // Before any mode runs, since terminal helpers write under lia's folder too.
     try useLiaHomeFromEnv(raw_env);
+
+    if (mcp_owner.isModeRaw(raw_args)) {
+        io_mod.setRawEnviron(raw_env);
+        const process_args = argsFromRaw(raw_args);
+        var threaded = std.Io.Threaded.init(processAllocator(), processIoOptions(process_args, environBlockFromRaw(raw_env)));
+        defer threaded.deinit();
+        io_mod.setIo(threaded.io());
+        // The servers run here now, so a session's trace asks this process
+        // for them; it starts in the session's directory.
+        debug_trace.configureFromEnv(processAllocator(), ".");
+        try mcp_owner.run(processAllocator(), std.mem.sliceTo(raw_args[2], 0), build_options.app_version);
+        return;
+    }
 
     if (comptime terminal_native_session.isSupported()) {
         if (terminal_native_session.isControlModeRaw(raw_args)) {
@@ -231,6 +261,7 @@ fn runNonBenchmark(raw_args: []const [*:0]const u8, raw_env: RawEnviron, cli_arg
         if (early_threaded) |*threaded| io_mod.setIo(threaded.io());
     }
 
+    app_entry_runtime.armCrashRecord(cfg, cli_args);
     const before = try app_entry_runtime.runBeforeInteractive(alloc, cli_args, cfg);
     switch (before) {
         .returned => exitFast(0),
@@ -781,6 +812,16 @@ test {
     _ = @import("core/mcp_host/mcp_call_bridge.zig");
     _ = @import("core/mcp_host/mcp_call_client.zig");
     _ = @import("core/mcp_host/verbs.zig");
+    _ = @import("core/mcp_host/login_words.zig");
+    _ = @import("core/mcp_host/kept_sign_outs.zig");
+    _ = @import("core/mcp_host/owner.zig");
+    _ = @import("core/mcp_host/owner_core.zig");
+    _ = @import("core/mcp_host/owner_wire.zig");
+    _ = @import("core/mcp_host/owner_client.zig");
+    _ = @import("core/mcp_host/idle_control.zig");
+    _ = @import("core/mcp_host/shared_servers.zig");
+    _ = @import("core/mcp_host/share_key.zig");
+    _ = @import("core/mcp_host/config.zig");
     _ = @import("core/mcp/tool_lookup.zig");
     _ = @import("core/recovery/recovery.zig");
     _ = @import("core/config/model_provider.zig");
@@ -810,6 +851,7 @@ test {
     _ = @import("core/workspace/subagent_turn_metrics.zig");
     _ = @import("core/workspace/workspace_access.zig");
     _ = @import("core/workspace/tool_call_metrics.zig");
+    _ = @import("core/workspace/auto_review_metrics.zig");
     _ = @import("core/workspace/workspace_commands.zig");
     _ = @import("core/app/usage_host.zig");
     _ = @import("core/app/app_entry_runtime.zig");
@@ -837,6 +879,7 @@ test {
     _ = @import("core/cli/doctor_runtime.zig");
     _ = @import("core/cli/doctor_probes.zig");
     _ = @import("core/cli/doctor_child_status.zig");
+    _ = @import("core/cli/settings_messages.zig");
     _ = @import("core/auth/login_flow.zig");
     _ = @import("core/auth/provider_catalog.zig");
     _ = @import("gateway/responses_protocol.zig");
@@ -844,9 +887,16 @@ test {
     _ = @import("core/auth/oauth_session.zig");
     _ = @import("core/auth/pending_revocation.zig");
     _ = @import("core/workspace/file_index.zig");
+    _ = @import("core/workspace/workspace_capture.zig");
+    _ = @import("core/workspace/capture_store.zig");
+    _ = @import("core/agent/runtime/deps.zig");
+    _ = @import("core/workspace/capture_retention.zig");
+    _ = @import("core/workspace/turn_capture.zig");
+    _ = @import("core/shared/repo_path.zig");
     _ = @import("core/indexer/indexer.zig");
     _ = @import("core/agents/agents.zig");
     _ = @import("core/profiles/profiles.zig");
+    _ = @import("core/profiles/started_with.zig");
     _ = @import("gateway/vercel_protocol.zig");
     _ = @import("core/gateway/provider_set.zig");
     _ = @import("core/gateway/model_catalog.zig");
@@ -881,6 +931,7 @@ test {
     _ = @import("core/output/session_list_text.zig");
     _ = @import("core/workspace/pathing.zig");
     _ = @import("core/workspace/current_branch.zig");
+    _ = @import("core/workspace/repo_root.zig");
     _ = @import("core/permissions/permission_gate.zig");
     _ = @import("core/permissions/permissions.zig");
     _ = @import("core/execution/process_identity.zig");

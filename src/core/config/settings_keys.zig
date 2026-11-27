@@ -98,6 +98,10 @@ const sound_child_descriptions = [_][]const u8{
     "Play extra interaction sounds when sound is on",
     "Play a sound when a turn finishes",
 };
+const experimental_children = [_][]const u8{"workspace_capture"};
+const experimental_child_descriptions = [_][]const u8{
+    "Record the repository's state at each turn's start and end in the session, for evals",
+};
 const retired_description = "No longer used; lia ignores it";
 
 pub const keys = [_]Key{
@@ -115,6 +119,7 @@ pub const keys = [_]Key{
     .{ .name = "effort", .where = .profile, .kind = .string_or_null, .description = "Reasoning effort: auto or a name the model supports; null means auto" },
     .{ .name = "enableAllProjectMcpServers", .where = .profile, .kind = .boolean, .workspace_only = true, .description = "Approve every server in this workspace's .mcp.json; manage it with lia mcp approve and reject" },
     .{ .name = "enabledMcpjsonServers", .where = .profile, .kind = .strings, .workspace_only = true, .description = "Project MCP servers approved in this workspace; manage them with lia mcp approve and reject" },
+    .{ .name = "experimental", .where = .profile, .kind = .switches, .children = &experimental_children, .child_descriptions = &experimental_child_descriptions, .description = "Unfinished features, off by default" },
     .{ .name = "fast_mode", .where = .profile, .kind = .boolean, .description = "Use faster inference when the model supports it" },
     .{ .name = "fast_mode_model_bound", .where = .profile, .kind = .boolean, .description = "Managed by lia alongside fast_mode" },
     .{ .name = "first_call_tool_choice", .where = .profile, .kind = .string, .values = &.{ "auto", "none" }, .description = "Tool choice for the first request of a turn" },
@@ -206,15 +211,17 @@ pub const OlderName = struct {
     current: []const u8,
     /// Whether the current name is set beside it.
     both: bool = true,
-    /// The workspace override holding both, borrowed from the parsed
+    /// The workspace override that sets it, borrowed from the parsed
     /// settings, or null at the top level.
     workspace: ?[]const u8 = null,
 };
 
-/// Lists the renamed settings that `root` sets under both their older and
-/// their current name, where the current one wins. A profile `settings.json`
+/// Lists the renamed settings that `root` sets under their older name, and
+/// whether it sets the current name too. A pair where lia ignores the current
+/// group and keeps reading the older one is left out. A profile `settings.json`
 /// is also checked inside each `workspaces` override. Caller owns the
-/// returned slice; its strings borrow from `root` and the list.
+/// returned slice; `workspace` borrows from `root`, and `older` and `current`
+/// are static.
 pub fn findOlderNames(alloc: Allocator, root: std.json.Value, file: File) ![]OlderName {
     var found: std.ArrayList(OlderName) = .empty;
     errdefer found.deinit(alloc);
@@ -384,14 +391,27 @@ test "keys are unique and sorted so the list stays easy to scan" {
     }
 }
 
+/// Whether following `key`'s rename keeps the setting working: the target is a
+/// listed key lia reads, not retired and not renamed itself, stored where the
+/// older name is and with the same children.
+fn renamesToCurrentKey(key: Key) bool {
+    const current = find(key.renamed_to orelse return false) orelse return false;
+    if (key.where == .retired or current.where == .retired) return false;
+    if (current.renamed_to != null or current.where != key.where) return false;
+    if (current.children.len != key.children.len) return false;
+    for (key.children) |child| if (!current.hasChild(child)) return false;
+    return true;
+}
+
 test "renamed settings point to a current key with the same children" {
     for (keys) |key| {
-        const current = find(key.renamed_to orelse continue).?;
-        try std.testing.expect(current.renamed_to == null);
-        try std.testing.expectEqual(key.where, current.where);
-        try std.testing.expectEqual(key.children.len, current.children.len);
-        for (key.children) |child| try std.testing.expect(current.hasChild(child));
+        if (key.renamed_to == null) continue;
+        errdefer std.debug.print("key {s}\n", .{key.name});
+        try std.testing.expect(renamesToCurrentKey(key));
     }
+    // A rename onto a retired or renamed key sends users to a key lia ignores.
+    try std.testing.expect(!renamesToCurrentKey(.{ .name = "statusLine", .where = .retired, .kind = .any, .renamed_to = "status_line", .description = "old" }));
+    try std.testing.expect(!renamesToCurrentKey(.{ .name = "older_sound", .where = .profile, .kind = .switches, .children = &sound_children, .child_descriptions = &sound_child_descriptions, .renamed_to = "notifications", .description = "old" }));
 }
 
 test "older names map to the current ones, in paths and in files" {
@@ -421,7 +441,7 @@ test "older names map to the current ones, in paths and in files" {
     try std.testing.expectEqualStrings("notifications", twice[1].older);
     try std.testing.expectEqualStrings("/w", twice[1].workspace.?);
 
-    // A top-level older name is reported alone too, so lia doctor can say when
+    // An older name set alone is reported too, so lia doctor can say when
     // it stops working.
     var alone = try std.json.parseFromSlice(std.json.Value, alloc,
         \\{"notifications":{"max":true}}
@@ -469,6 +489,10 @@ test "the terminal UI settings load as retired, not unknown" {
     const unknown = try findUnknown(alloc, parsed.value, .profile);
     defer alloc.free(unknown);
     try std.testing.expectEqual(@as(usize, 0), unknown.len);
+    // status_line is retired too, so lia doctor names no rename for statusLine.
+    const older = try findOlderNames(alloc, parsed.value, .profile);
+    defer alloc.free(older);
+    try std.testing.expectEqual(@as(usize, 0), older.len);
     inline for (&.{ "collapse_tool_calls", "slash_menu_categories", "startup_scrollback", "status_line", "statusLine" }) |name| {
         try std.testing.expectEqual(Where.retired, find(name).?.where);
         try std.testing.expect(!ignoredInProject(name));
@@ -529,7 +553,7 @@ test "a project file is checked at its top level only" {
 }
 
 test "dotted paths name listed keys, fixed children, and paths into maps" {
-    for ([_][]const u8{ "fast_mode", "sound", "sound.max", "notifications.max", "models", "models.gateway", "providers.local.base_url" }) |path| {
+    for ([_][]const u8{ "fast_mode", "sound", "sound.max", "notifications.max", "experimental.workspace_capture", "models", "models.gateway", "providers.local.base_url" }) |path| {
         try std.testing.expect(unknownPart(path) == null);
     }
 

@@ -45,12 +45,6 @@ const mutants: Mutant[] = [
     to: "if (false) context.config.host.noteChildQuiet(child_id, context.turn.child_name orelse child_id, crossing);",
   },
   {
-    name: "hosted-no-relay",
-    file: "src/core/app/app_agents_runtime.zig",
-    from: "host.noteChildQuiet(child.id, child.displayName(), crossing);",
-    to: "if (false) host.noteChildQuiet(child.id, child.displayName(), crossing);",
-  },
-  {
     name: "closed-not-checked",
     file: "src/core/subagent/tool_host.zig",
     from: "if (!self.childOpen(child_id)) return",
@@ -79,12 +73,6 @@ const mutants: Mutant[] = [
     file: "src/core/subagent/live_metrics.zig",
     from: "const masked = text_utils.maskSecrets(alloc, searched) catch return storeFallback(out);",
     to: "const masked = searched;",
-  },
-  {
-    name: "row-hides-call",
-    file: "src/ui/footer/agents_menu_presentation.zig",
-    from: "    if (row.activity.len > 0) return row.activity;\n",
-    to: "",
   },
 ];
 

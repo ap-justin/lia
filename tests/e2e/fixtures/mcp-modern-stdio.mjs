@@ -32,6 +32,14 @@ const catalogDelayMs = Math.max(
   0,
   Number(process.env.LIA_MCP_CATALOG_DELAY_MS ?? "0") || 0,
 );
+const rawFormSchema = process.env.LIA_MCP_RAW_FORM_SCHEMA;
+// LIA_MCP_LIST_REPLY is raw JSON text that goes out as written after the id of every tools/list reply: `"result":{...}`
+// or `"error":{...}`. A test gives lia a list it refuses, with a repeated or escaped key that JSON.stringify cannot write.
+const rawListReply = process.env.LIA_MCP_LIST_REPLY;
+// LIA_MCP_LIST_LINE is a whole tools/list reply line as written, with `{id}` standing for the request's id: a test puts the
+// id after a part lia cannot read, so that the line names no request.
+const rawListLine = process.env.LIA_MCP_LIST_LINE;
+const rawFormSchemaMark = "raw-form-schema-mark";
 const compactField = process.env.LIA_MCP_COMPACT_FIELD ? JSON.parse(process.env.LIA_MCP_COMPACT_FIELD) : null;
 // LIA_MCP_CALL_DELAY_MS holds each tools/call that long before answering it,
 // so a test with a short operation_timeout_ms can land just before or just
@@ -40,6 +48,21 @@ const callDelayMs = Math.max(
   0,
   Number(process.env.LIA_MCP_CALL_DELAY_MS ?? "0") || 0,
 );
+// In mode subscription_cache the tool is renamed 50 ms after lia listens, unless
+// LIA_MCP_LIST_CHANGE_RELEASE_PATH is set: then the rename waits until that file
+// exists, so a test can change the list at a moment it picks.
+const listChangeReleasePath = process.env.LIA_MCP_LIST_CHANGE_RELEASE_PATH;
+// LIA_MCP_CALL_RELEASE_PATH holds each tools/call until that file exists, and
+// LIA_MCP_CALL_STARTED_PATH gets this process's pid when a call arrives, so a
+// test can act while a call is out and then let it end.
+const callReleasePath = process.env.LIA_MCP_CALL_RELEASE_PATH;
+const callStartedPath = process.env.LIA_MCP_CALL_STARTED_PATH;
+// A held call ends with its input: lia closing a stopped server's input must
+// still let the process exit.
+const heldCalls = new Set();
+process.stdin.on("end", () => {
+  for (const timer of heldCalls) clearInterval(timer);
+});
 const elicitationUrl = process.env.LIA_MCP_ELICITATION_URL ?? "https://example.test/connect";
 const collidingChoices = [
   { const: "Skip", title: "Skip" },
@@ -95,8 +118,22 @@ if (process.env.LIA_MCP_ENV_NAMES_CAPTURE) {
 }
 if (stallRecovery) setInterval(() => {}, 1000);
 
+// LIA_MCP_ESCAPE_KEYS=mode,url: write each of these keys with one \uXXXX escape (mode becomes m\u006fde) in every
+// message this server sends. The bytes still mean the same key to any JSON reader that decodes keys.
+const escapedKeys = (process.env.LIA_MCP_ESCAPE_KEYS ?? "").split(",").filter(Boolean);
+function writeEscapedKeys(line) {
+  for (const key of escapedKeys) {
+    const escaped = `${key[0]}\\u${key.charCodeAt(1).toString(16).padStart(4, "0")}${key.slice(2)}`;
+    line = line.replaceAll(`"${key}":`, `"${escaped}":`);
+  }
+  return line;
+}
+
 function send(message) {
-  process.stdout.write(`${JSON.stringify(message)}\n`);
+  let line = writeEscapedKeys(JSON.stringify(message));
+  // A form schema given as raw JSON text goes out as written, with its escapes.
+  if (rawFormSchema !== undefined) line = line.replace(`"${rawFormSchemaMark}"`, () => rawFormSchema);
+  process.stdout.write(`${line}\n`);
 }
 
 function sendCatalogResponse(message) {
@@ -152,13 +189,23 @@ function elicitationCapabilities() {
 
 function hasModernMetadata(message) {
   const meta = message.params?._meta;
-  const capabilities = JSON.stringify(meta?.["io.modelcontextprotocol/clientCapabilities"]);
-  const advertiseElicitation = ["tools/call", "resources/read", "prompts/get"]
-    .includes(message.method);
-  const declared = JSON.stringify(elicitationCapabilities());
-  const capabilitiesMatch = advertiseElicitation
-    ? capabilities === declared
-    : capabilities === "{}" || capabilities === declared;
+  const capabilities = meta?.["io.modelcontextprotocol/clientCapabilities"];
+  const capabilityNames = capabilities && typeof capabilities === "object"
+    ? Object.keys(capabilities)
+    : [];
+  const elicitation = capabilityNames.includes("elicitation") ? capabilities.elicitation : null;
+  const declaredModes = elicitation && typeof elicitation === "object"
+    ? Object.keys(elicitation)
+    : [];
+  const neededModes = Object.keys(elicitationCapabilities().elicitation ?? {});
+  // A session that shares its server runs it in one owner for every session
+  // that wants it, so the server hears the union of their question UIs: a
+  // session can ask for less than what reached the wire, never more. The
+  // fixture still refuses a client that leaves out a mode it needs, and one
+  // that declares anything besides form and url.
+  const capabilitiesMatch = capabilityNames.every((name) => name === "elicitation") &&
+    neededModes.every((mode) => declaredModes.includes(mode)) &&
+    declaredModes.every((mode) => mode === "form" || mode === "url");
   return meta?.["io.modelcontextprotocol/protocolVersion"] === protocolVersion &&
     meta?.["io.modelcontextprotocol/clientInfo"]?.name === "lia" &&
     typeof meta?.["io.modelcontextprotocol/clientInfo"]?.version === "string" &&
@@ -225,6 +272,8 @@ function handle(message) {
     }
     return;
   }
+  // stall_list: discovery and initialize are answered, tools/list never is.
+  if (mode === "stall_list" && message.method === "tools/list") return;
   if (
     (mode === "stall_startup" || stallRecovery) &&
     ["server/discover", "initialize", "tools/list"].includes(message.method)
@@ -314,7 +363,7 @@ function handle(message) {
       },
     });
     if (mode === "subscription_cache") {
-      setTimeout(() => {
+      const changeList = () => {
         currentToolName = recoveredToolName;
         for (let index = 0; index < 10; index += 1) {
           send({
@@ -327,8 +376,25 @@ function handle(message) {
             },
           });
         }
-      }, 50);
+      };
+      if (listChangeReleasePath) {
+        const releasePoll = setInterval(() => {
+          if (!existsSync(listChangeReleasePath)) return;
+          clearInterval(releasePoll);
+          changeList();
+        }, 10);
+      } else {
+        setTimeout(changeList, 50);
+      }
     }
+    return;
+  }
+  if (message.method === "tools/list" && rawListLine !== undefined) {
+    process.stdout.write(`${rawListLine.replaceAll("{id}", JSON.stringify(message.id))}\n`);
+    return;
+  }
+  if (message.method === "tools/list" && rawListReply !== undefined) {
+    process.stdout.write(`{"jsonrpc":"2.0","id":${JSON.stringify(message.id)},${rawListReply}}\n`);
     return;
   }
   if (message.method === "tools/list") {
@@ -636,6 +702,11 @@ function handle(message) {
   }
   if (message.method === "tools/call") {
     if (mode === "stall_operation") return;
+    // unreadable_operation: a line that is no JSON-RPC at all, and no answer.
+    if (mode === "unreadable_operation") {
+      process.stdout.write("this line is not JSON-RPC at all\n");
+      return;
+    }
     if (mode === "typed_arguments") {
       const args = message.params?.arguments ?? {};
       const mismatch = typedArgumentMismatch(args);
@@ -777,7 +848,10 @@ function handle(message) {
       mode === "mrtr_unsafe_form"
     ) {
       if (message.params?.inputResponses === undefined) {
-        const params = compactField ? {
+        const params = rawFormSchema !== undefined ? {
+          message: "Fill in the form",
+          requestedSchema: rawFormSchemaMark,
+        } : compactField ? {
           message: "Choose the next step",
           requestedSchema: { type: "object", properties: { answer: compactField }, required: ["answer"] },
         } : mode === "mrtr_url_required"
@@ -951,7 +1025,16 @@ process.stdin.on("data", (chunk) => {
     buffer = buffer.subarray(lineEnd + 1);
     if (line.length === 0) continue;
     const message = JSON.parse(line);
-    if (callDelayMs > 0 && message.method === "tools/call") {
+    if (callReleasePath && message.method === "tools/call") {
+      if (callStartedPath) appendFileSync(callStartedPath, `${process.pid}\n`);
+      const timer = setInterval(() => {
+        if (!existsSync(callReleasePath)) return;
+        clearInterval(timer);
+        heldCalls.delete(timer);
+        handle(message);
+      }, 20);
+      heldCalls.add(timer);
+    } else if (callDelayMs > 0 && message.method === "tools/call") {
       setTimeout(() => handle(message), callDelayMs);
     } else {
       handle(message);
