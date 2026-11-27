@@ -362,12 +362,14 @@ fn readExact(io: std.Io, stream: std.Io.net.Stream, buffer: []u8) !void {
 
 const testing = std.testing;
 
-/// The most a session queues from the owner: the same byte cap as the owner's
-/// per-connection queue (`Owner.enqueue`), two of the largest payloads the
-/// owner can send, so a third goes past it. Past it the session closes its
-/// connection to the owner, which ends its calls in flight, and the next need
-/// finds or starts an owner or runs the server here, so a session that stops
-/// taking frames (in a permission question, say) is not grown without end.
+/// The most a session queues from the owner, counted in payload bytes: two of
+/// the largest payloads the owner can send, so a third goes past it. The owner
+/// caps its per-connection queue at the same number (`Owner.enqueue`) but also
+/// counts each frame's length header. Past the cap the session stops reading
+/// and marks its owner connection closed, which ends its calls in flight; the
+/// next need closes the socket and finds or starts an owner or runs the server
+/// here, so a session that stops taking frames (in a permission question, say)
+/// is not grown without end.
 const max_queue_bytes = 2 * wire.max_frame_bytes;
 
 /// Removes a test's folder. Cleanup only: a folder that won't go leaves

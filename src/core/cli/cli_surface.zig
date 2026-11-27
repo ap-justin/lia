@@ -3026,8 +3026,8 @@ fn runSessionRecovery(alloc: Allocator, deps: RunDeps, recovery: SessionRecovery
 }
 
 /// `lia session fork <last|id>`: copies a saved or live root session up
-/// to its last finished turn. The record it writes borrows the source id and
-/// the fork, which this function frees after writing.
+/// to its last finished turn. The result it prints borrows the source id and
+/// the fork's id and workspace root, which this function frees after printing.
 fn runSessionFork(alloc: Allocator, deps: RunDeps, fork: SessionForkOptions) !RunResult {
     var store = session_adapter.Store.openFromEnv(alloc) catch |err| {
         try writeLookupFailure(alloc, deps, "session", session_adapter.commandError(err), fork.format);
